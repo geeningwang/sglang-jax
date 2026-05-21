@@ -1,0 +1,77 @@
+# Headless service for coordinator discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: flex-tpu7-8ch-smoke
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: flex-tpu7-8ch-smoke
+  ports:
+  - name: jax-dist
+    port: 6006
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: flex-tpu7-8ch-smoke
+  namespace: default
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      subdomain: flex-tpu7-8ch-smoke
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: smoke
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        imagePullPolicy: IfNotPresent
+        command: [bash, -lc]
+        args:
+        - |
+          export PATH="/opt/venv/bin:${PATH}"
+          NODE_RANK=${JOB_COMPLETION_INDEX}
+          COORDINATOR="flex-tpu7-8ch-smoke-0.flex-tpu7-8ch-smoke.default.svc.cluster.local:6006"
+          python3 -c "
+          import jax, os
+          rank = int(os.environ['NODE_RANK'])
+          coordinator = os.environ['COORDINATOR']
+          print(f'[rank{rank}] Initializing JAX distributed: coordinator={coordinator}')
+          jax.distributed.initialize(coordinator_address=coordinator, num_processes=2, process_id=rank)
+          print(f'[rank{rank}] JAX version: {jax.__version__}')
+          print(f'[rank{rank}] Global device count: {jax.device_count()}')
+          print(f'[rank{rank}] Local device count: {jax.local_device_count()}')
+          print(f'[rank{rank}] Devices: {jax.devices()}')
+          "
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: NODE_RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: COORDINATOR
+          value: "flex-tpu7-8ch-smoke-0.flex-tpu7-8ch-smoke.default.svc.cluster.local:6006"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"

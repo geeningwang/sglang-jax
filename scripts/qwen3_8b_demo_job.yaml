@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-8b-demo
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: qwen3-8b-demo
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        imagePullPolicy: IfNotPresent
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+
+          echo "=== Installing sglang-jax ==="
+          git clone https://github.com/sgl-project/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+
+          echo "=== Starting Qwen3-8B inference server ==="
+          JAX_COMPILATION_CACHE_DIR=/tmp/jax_compilation_cache \
+          python3 -m sgl_jax.launch_server \
+            --model-path Qwen/Qwen3-8B \
+            --trust-remote-code \
+            --tp-size 8 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.8 \
+            --page-size 128 \
+            --chunked-prefill-size 2048 \
+            --max-running-requests 32 \
+            --skip-server-warmup \
+            --host 0.0.0.0 \
+            --port 8080 &
+          SERVER_PID=$!
+
+          echo "=== Waiting for server to be ready ==="
+          for i in $(seq 1 120); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "Server is ready after ${i}s"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "ERROR: Server process died"
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "=== Demo Inference ==="
+          echo "Input prompt: 'Explain what a transformer model is in one sentence.'"
+          echo ""
+
+          RESPONSE=$(curl -sf http://localhost:8080/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "Qwen/Qwen3-8B",
+              "messages": [{"role": "user", "content": "Explain what a transformer model is in one sentence."}],
+              "max_tokens": 128,
+              "temperature": 0.7
+            }')
+
+          echo "Output:"
+          echo "$RESPONSE" | python3 -c "
+          import sys, json
+          resp = json.load(sys.stdin)
+          text = resp['choices'][0]['message']['content']
+          usage = resp['usage']
+          print(text)
+          print()
+          print(f'[tokens: prompt={usage[\"prompt_tokens\"]}, completion={usage[\"completion_tokens\"]}]')
+          "
+
+          echo ""
+          echo "=== Demo complete ==="
+          kill $SERVER_PID
+        env:
+        - name: JAX_COMPILATION_CACHE_DIR
+          value: /tmp/jax_compilation_cache
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            google.com/tpu: "4"
