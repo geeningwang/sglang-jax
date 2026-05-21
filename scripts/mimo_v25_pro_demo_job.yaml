@@ -101,8 +101,8 @@ spec:
               --dist-init-addr ${COORDINATOR}:6006 &
             SERVER_PID=$!
 
-            echo "=== [rank0] Waiting for server to be ready (up to 3 hours) ==="
-            for i in $(seq 1 2160); do
+            echo "=== [rank0] Waiting for server to be ready (up to 12 hours) ==="
+            for i in $(seq 1 8640); do
               if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
                 echo "Server is ready after $((i * 5))s"
                 break
