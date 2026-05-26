@@ -144,7 +144,7 @@ spec:
               --tp-size 16 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.92 \
+              --mem-fraction-static 0.95 \
               --page-size 16 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
@@ -210,7 +210,7 @@ spec:
               --tp-size 16 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.92 \
+              --mem-fraction-static 0.95 \
               --page-size 16 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
