@@ -1,3 +1,50 @@
+# PodTemplate used by DWS ProvisioningRequest to estimate resource requirements
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v25-pro-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x2
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v25-pro-demo
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+# DWS ProvisioningRequest: provisions 2x2x2 TPU slice for 24 hours.
+# Pods must carry the consume-provisioning-request annotation to bind to this capacity.
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v25-pro-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "86400"
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: mimo-v25-pro-dws-template
+---
 # Headless service for rank-0 pod discovery
 apiVersion: v1
 kind: Service
@@ -27,11 +74,17 @@ spec:
   completionMode: Indexed
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v25-pro-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        # Prevent cluster autoscaler from evicting these pods after DWS booking expires.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       restartPolicy: Never
       subdomain: mimo-v25-pro-demo
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-flex-tpu7-8ch
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x2
         cloud.google.com/gke-accelerator-count: "4"
@@ -80,8 +133,10 @@ spec:
             jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
           echo "=== [rank${INDEX}] GCS mount ready: $(ls /mnt/gcs/hf-weights/*.safetensors | wc -l) safetensors files ==="
 
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
           if [ "$INDEX" = "0" ]; then
-            echo "=== [rank0] Starting MiMo-V2.5-Pro server ==="
+            echo "$(ts) [rank0] PHASE: launching server"
             JAX_COMPILATION_CACHE_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache \
             python3 -m sgl_jax.launch_server \
               --model-path /mnt/gcs/hf-weights \
@@ -89,37 +144,40 @@ spec:
               --tp-size 16 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.85 \
-              --page-size 128 \
-              --chunked-prefill-size 2048 \
-              --max-running-requests 8 \
-              --skip-server-warmup \
+              --mem-fraction-static 0.92 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 2 \
               --host 0.0.0.0 \
               --port 8080 \
               --nnodes 2 \
               --node-rank 0 \
               --dist-init-addr ${COORDINATOR}:6006 &
             SERVER_PID=$!
+            echo "$(ts) [rank0] PHASE: waiting for /health (server PID=$SERVER_PID)"
 
-            echo "=== [rank0] Waiting for server to be ready (up to 12 hours) ==="
-            for i in $(seq 1 8640); do
+            for i in $(seq 1 17280); do
               if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-                echo "Server is ready after $((i * 5))s"
+                echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s"
                 break
               fi
               if ! kill -0 $SERVER_PID 2>/dev/null; then
-                echo "ERROR: Server process died"
+                echo "$(ts) [rank0] ERROR: server process died after $((i * 5))s"
                 exit 1
+              fi
+              # Heartbeat every 5 min
+              if [ $((i % 60)) -eq 0 ]; then
+                echo "$(ts) [rank0] still waiting for /health (${i} ticks = $((i * 5))s elapsed)"
               fi
               sleep 5
             done
 
             echo ""
-            echo "=== Demo Inference ==="
+            echo "$(ts) [rank0] PHASE: sending demo inference request"
             echo "Input: 'What is mixture-of-experts and why is it useful for large language models?'"
             echo ""
 
-            RESPONSE=$(curl -sf http://localhost:8080/v1/chat/completions \
+            RESPONSE=$(curl -sf --max-time 300 http://localhost:8080/v1/chat/completions \
               -H "Content-Type: application/json" \
               -d '{
                 "model": "MiMo-V2.5-Pro",
@@ -127,6 +185,7 @@ spec:
                 "max_tokens": 256,
                 "temperature": 0.7
               }')
+            echo "$(ts) [rank0] PHASE: inference response received"
 
             echo "Output:"
             echo "$RESPONSE" | python3 -c "
@@ -143,7 +202,7 @@ spec:
             echo "=== Demo complete ==="
             kill $SERVER_PID
           else
-            echo "=== [rank1] Starting MiMo-V2.5-Pro server (worker) ==="
+            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rank1] PHASE: launching worker server"
             JAX_COMPILATION_CACHE_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache \
             python3 -m sgl_jax.launch_server \
               --model-path /mnt/gcs/hf-weights \
@@ -151,11 +210,10 @@ spec:
               --tp-size 16 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.85 \
-              --page-size 128 \
-              --chunked-prefill-size 2048 \
-              --max-running-requests 8 \
-              --skip-server-warmup \
+              --mem-fraction-static 0.92 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 2 \
               --host 0.0.0.0 \
               --port 8080 \
               --nnodes 2 \
