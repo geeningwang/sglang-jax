@@ -8,9 +8,9 @@ template:
   spec:
     restartPolicy: Never
     nodeSelector:
-      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
       cloud.google.com/gke-tpu-accelerator: tpu7x
-      cloud.google.com/gke-tpu-topology: 2x2x2
+      cloud.google.com/gke-tpu-topology: 2x2x4
     tolerations:
     - key: google.com/tpu
       operator: Equal
@@ -29,7 +29,7 @@ template:
           memory: 900Gi
           google.com/tpu: "4"
 ---
-# DWS ProvisioningRequest: provisions 2x2x2 TPU slice for 24 hours.
+# DWS ProvisioningRequest: provisions 2x2x4 TPU slice for 36 hours.
 # Pods must carry the consume-provisioning-request annotation to bind to this capacity.
 apiVersion: autoscaling.x-k8s.io/v1
 kind: ProvisioningRequest
@@ -41,7 +41,7 @@ spec:
   parameters:
     maxRunDurationSeconds: "129600"
   podSets:
-  - count: 2
+  - count: 4
     podTemplateRef:
       name: mimo-v25-pro-dws-template
 ---
@@ -61,16 +61,16 @@ spec:
   - name: http
     port: 8080
 ---
-# Single indexed job: index 0 = coordinator, index 1 = worker
-# completionMode: Indexed ensures gang scheduling on the same 2x2x2 TPU slice.
+# Single indexed job: index 0 = coordinator, index 1-3 = workers
+# completionMode: Indexed ensures gang scheduling on the same 2x2x4 TPU slice.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: mimo-v25-pro-demo
   namespace: default
 spec:
-  completions: 2
-  parallelism: 2
+  completions: 4
+  parallelism: 4
   completionMode: Indexed
   backoffLimit: 0
   template:
@@ -84,9 +84,9 @@ spec:
       restartPolicy: Never
       subdomain: mimo-v25-pro-demo
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
         cloud.google.com/gke-tpu-accelerator: tpu7x
-        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/gke-tpu-topology: 2x2x4
         cloud.google.com/gke-accelerator-count: "4"
       tolerations:
       - key: google.com/tpu
@@ -141,16 +141,16 @@ spec:
             python3 -m sgl_jax.launch_server \
               --model-path /mnt/gcs/hf-weights \
               --trust-remote-code \
-              --tp-size 16 \
+              --tp-size 32 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.95 \
+              --mem-fraction-static 0.92 \
               --page-size 16 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
               --port 8080 \
-              --nnodes 2 \
+              --nnodes 4 \
               --node-rank 0 \
               --dist-init-addr ${COORDINATOR}:6006 &
             SERVER_PID=$!
@@ -202,22 +202,22 @@ spec:
             echo "=== Demo complete ==="
             kill $SERVER_PID
           else
-            echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rank1] PHASE: launching worker server"
+            echo "$(ts) [rank${INDEX}] PHASE: launching worker server"
             JAX_COMPILATION_CACHE_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache \
             python3 -m sgl_jax.launch_server \
               --model-path /mnt/gcs/hf-weights \
               --trust-remote-code \
-              --tp-size 16 \
+              --tp-size 32 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.95 \
+              --mem-fraction-static 0.92 \
               --page-size 16 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
               --port 8080 \
-              --nnodes 2 \
-              --node-rank 1 \
+              --nnodes 4 \
+              --node-rank ${INDEX} \
               --dist-init-addr ${COORDINATOR}:6006
           fi
         env:
