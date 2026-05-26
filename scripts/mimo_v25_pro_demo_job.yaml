@@ -39,7 +39,7 @@ metadata:
 spec:
   provisioningClassName: queued-provisioning.gke.io
   parameters:
-    maxRunDurationSeconds: "86400"
+    maxRunDurationSeconds: "129600"
   podSets:
   - count: 2
     podTemplateRef:
@@ -156,7 +156,7 @@ spec:
             SERVER_PID=$!
             echo "$(ts) [rank0] PHASE: waiting for /health (server PID=$SERVER_PID)"
 
-            for i in $(seq 1 17280); do
+            for i in $(seq 1 25920); do
               if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
                 echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s"
                 break
