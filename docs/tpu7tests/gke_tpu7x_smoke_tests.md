@@ -138,28 +138,62 @@ All 16 devices are visible from both ranks. Coords `(x,y,0)` are on node 0;
 
 ---
 
-## Test 4 — MiMo-V2.5-Pro inference demo (`jingnw-flex-tpu7-8ch`)
+## Test 4 — MiMo-V2.5-Pro inference demo (`jingnw-dws-tpu7-16ch`)
 
-**What it does:** Copies FP8 weights from GCS, starts the sglang-jax server with
-`--tp-size 16 --nnodes 2`, sends a chat completion request from rank 0, and exits.
+**What it does:** Mounts FP8 weights from GCS via gcsfuse, starts the sglang-jax server
+with `--tp-size 32 --nnodes 4` across a 2x2x4 DWS TPU slice, sends a chat completion
+request from rank 0, and exits. Node provisioning is fully automatic via DWS
+ProvisioningRequest — no manual resize needed.
 
 **Script:** `scripts/mimo_v25_pro_demo_job.yaml`
 
-### Step 1 — Provision nodes (same as Test 3 Step 1)
+**Key parameters:**
+- Node pool: `jingnw-dws-tpu7-16ch` (2x2x4, 16 chips, 32 TensorCores)
+- `--tp-size 32`, `--nnodes 4`, `--mem-fraction-static 0.92`
+- Health-check timeout: 36 hours (covers ~2h MoE weight load + 15h+ XLA compilation)
+- XLA compilation cache: `gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache/`
+  (kernels cached incrementally — each restart is faster)
 
-Nodes must be pre-provisioned via resize request (see above). Reuse existing nodes
-if they are still Ready.
+**Why 4 nodes instead of 2:** The model weights fill ~93% of HBM at tp-size=16 (2 nodes),
+leaving insufficient room for KV cache. Doubling to tp-size=32 halves the per-TensorCore
+weight footprint, making `--mem-fraction-static 0.92` safe.
 
-```bash
-kubectl get nodes -l cloud.google.com/gke-nodepool=jingnw-flex-tpu7-8ch
-```
-
-### Step 2 — Run the demo
+### Run the demo
 
 ```bash
 kubectl apply -f scripts/mimo_v25_pro_demo_job.yaml
+
+# Watch all 4 pods
 kubectl logs -f -l job-name=mimo-v25-pro-demo --prefix
+
+# Monitor via Cloud Logging
+gcloud logging read \
+  'resource.type="k8s_container" AND resource.labels.cluster_name="jingnw-tpu7-cluster" AND labels."k8s-pod/job-name"="mimo-v25-pro-demo"' \
+  --project=tpu-launchpad-playground --format="value(timestamp,textPayload)" --limit=30
+
 kubectl delete -f scripts/mimo_v25_pro_demo_job.yaml
+```
+
+**Loading sequence and expected timing:**
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| gcsfuse mount + sglang-jax install | ~5 min | All 4 ranks in parallel |
+| Regular weights → TPU HBM | ~3 min | 557 tensors |
+| MoE weights → TPU HBM | ~2 h | 414 groups × 4 nodes |
+| KV cache profiling | ~1 min | |
+| XLA warmup compilation | 15 h+ (first run) | Cached to GCS; subsequent runs faster |
+| `/health` passes | — | Only after XLA compilation completes |
+| Inference curl | ~30 s | |
+
+**Expected output (rank 0 tail):**
+```
+[rank0] PHASE: server healthy after Xs
+[rank0] PHASE: sending demo inference request
+Output:
+Mixture-of-experts (MoE) is a neural network architecture ...
+[tokens: prompt=24, completion=256]
+=== Demo complete ===
 ```
 
 ---
@@ -173,6 +207,7 @@ kubectl delete -f scripts/mimo_v25_pro_demo_job.yaml
 | `jingnw-flex-tpu7-8ch` | tpu7x-standard-4t | 2x2x2 | Flex Start (**manual resize**) | 4 |
 | `jingnw-cpu-highmem` | n2-highmem-96 | — | Standard | — |
 | `jingnw-dws-tpu7-8ch` | tpu7x-standard-4t | 2x2x2 | DWS (ProvisioningRequest) | 2 |
+| `jingnw-dws-tpu7-16ch` | tpu7x-standard-4t | 2x2x4 | DWS (ProvisioningRequest) | 4 |
 
 ## TPU v7x architecture
 
