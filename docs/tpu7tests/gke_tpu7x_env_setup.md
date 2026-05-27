@@ -176,11 +176,15 @@ The MiMo-V2.5-Pro demo reads weights from GCS:
 | Bucket | Contents |
 |---|---|
 | `gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights/` | 34 safetensors files (~962 GB FP8) |
-| `gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache/` | XLA compiled kernels (incremental) |
+| `gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache/` | XLA compiled kernels (~85 MB after first run) |
 
 The XLA compilation cache accumulates across job restarts. The cache key encodes the
 model hash, TPU topology, and XLA version — changing `--tp-size` or the container image
-invalidates cached entries.
+invalidates cached entries. With a warm cache, XLA warmup takes ~55 seconds instead of
+15+ hours.
+
+See [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) for full
+GCS, RAM, HBM, and disk allocation details.
 
 ---
 
@@ -193,4 +197,5 @@ invalidates cached entries.
 | `gcloud container node-pools create --flex-start` creates pool but DWS ignores it | `--flex-start` sets `flexStart: true` but not `queuedProvisioning.enabled: true` | Use GKE REST API |
 | `gcloud compute resource-policies create group-placement --tpu-topology` fails | Creates `groupPlacementPolicy` (COLLOCATED), rejected by tpu7x | Use Compute Engine REST API to create `workloadPolicy` type |
 | `OOM: Not enough memory. Please try to increase --mem-fraction-static` in `_profile_available_bytes` | Model weights fill >92% of HBM at current tp-size | Increase tp-size (more nodes) rather than raising mem-fraction-static |
+| XLA temp OOM during KV cache profiling at higher `--mem-fraction-static` | 384-expert MoE forward pass needs ~24 GB/TensorCore scratch; `0.92` leaves only 8% (~7.7 GB) | Use `--mem-fraction-static 0.75` (25% XLA scratch = ~24 GB/TensorCore) |
 | DWS nodes evicted ~10 min after provisioning | `BookingExpired` event triggers cluster autoscaler | Add `safe-to-evict: "false"` pod annotation |

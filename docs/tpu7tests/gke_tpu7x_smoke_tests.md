@@ -149,10 +149,11 @@ ProvisioningRequest — no manual resize needed.
 
 **Key parameters:**
 - Node pool: `jingnw-dws-tpu7-16ch` (2x2x4, 16 chips, 32 TensorCores)
-- `--tp-size 32`, `--nnodes 4`, `--mem-fraction-static 0.92`
-- Health-check timeout: 36 hours (covers ~2h MoE weight load + 15h+ XLA compilation)
+- `--tp-size 32`, `--nnodes 4`, `--mem-fraction-static 0.75`
+- Health-check timeout: 36 hours (covers ~2h MoE weight load + ~55s cached XLA compilation)
 - XLA compilation cache: `gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache/`
   (kernels cached incrementally — each restart is faster)
+- See [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) for full HBM/RAM/GCS breakdown
 
 **Why 4 nodes instead of 2:** The model weights fill ~93% of HBM at tp-size=16 (2 nodes),
 leaving insufficient room for KV cache. Doubling to tp-size=32 halves the per-TensorCore
@@ -180,9 +181,9 @@ kubectl delete -f scripts/mimo_v25_pro_demo_job.yaml
 |-------|----------|-------|
 | gcsfuse mount + sglang-jax install | ~5 min | All 4 ranks in parallel |
 | Regular weights → TPU HBM | ~3 min | 557 tensors |
-| MoE weights → TPU HBM | ~2 h | 414 groups × 4 nodes |
+| MoE weights → TPU HBM | ~1.5–2 h | 414 groups × 4 nodes |
 | KV cache profiling | ~1 min | |
-| XLA warmup compilation | 15 h+ (first run) | Cached to GCS; subsequent runs faster |
+| XLA warmup compilation | ~55 s (cached) / 15 h+ (first run) | Cached to GCS; subsequent runs ~55s |
 | `/health` passes | — | Only after XLA compilation completes |
 | Inference curl | ~30 s | |
 
