@@ -199,6 +199,65 @@ Mixture-of-experts (MoE) is a neural network architecture ...
 
 ---
 
+## Test 5 — MiMo-V2.5-Pro inference demo, 2-node (`jingnw-dws-tpu7-8ch`)
+
+**What it does:** Same as Test 4 but on a 2x2x2 DWS slice (2 nodes, 16 TensorCores,
+tp-size=16). Weights double per TensorCore (~60 GB vs ~30 GB), so KV cache is
+minimal (~12 GB/TC) — sufficient for a single-request smoke test only.
+
+**Script:** `scripts/mimo_v25_pro_2node_demo_job.yaml`
+
+**Key parameters:**
+- Node pool: `jingnw-dws-tpu7-8ch` (2x2x2, 8 chips, 16 TensorCores)
+- `--tp-size 16`, `--nnodes 2`, `--mem-fraction-static 0.75`
+- `--max-running-requests 1` (minimal KV cache budget)
+- XLA compilation cache: `gs://jingnw-mimo-v2-5-pro-us-central1/jax-compilation-cache/`
+  (**separate cache key** from the 4-node run — expect a cold-cache first run of 15+ h)
+- See [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) for full HBM/RAM breakdown
+
+**HBM budget per TensorCore (96 GB):**
+
+| Pool | Size | Notes |
+|------|------|-------|
+| Model weights | ~60 GB | 962 GB ÷ 16 TCs |
+| KV cache | ~12 GB | Minimal; single-request only |
+| XLA temporaries | ~24 GB | 25%; required for 384-expert MoE GEMM |
+
+### Run the demo
+
+```bash
+kubectl apply -f scripts/mimo_v25_pro_2node_demo_job.yaml
+
+# Watch both pods
+kubectl logs -f -l job-name=mimo-v25-pro-2node-demo --prefix
+
+kubectl delete -f scripts/mimo_v25_pro_2node_demo_job.yaml
+```
+
+**Loading sequence and expected timing:**
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| gcsfuse mount + sglang-jax install | ~5 min | Both ranks in parallel |
+| Regular weights → TPU HBM | ~3 min | 557 tensors |
+| MoE weights → TPU HBM | ~2–2.5 h | 414 groups × 2 nodes via gcsfuse |
+| KV cache profiling | ~1 min | Minimal cache; fast profile |
+| XLA warmup compilation | ~55 s (cached) / 15 h+ (first run) | **Different cache key than 4-node** |
+| `/health` passes | — | Only after XLA compilation completes |
+| Inference curl | ~30 s | |
+
+**Expected output (rank 0 tail):**
+```
+[rank0] PHASE: server healthy after Xs
+[rank0] PHASE: sending demo inference request
+Output:
+Mixture-of-experts (MoE) is a neural network architecture ...
+[tokens: prompt=24, completion=256]
+=== Demo complete ===
+```
+
+---
+
 ## Cluster reference
 
 | Pool | Machine | Topology | Provisioning | Max nodes |
