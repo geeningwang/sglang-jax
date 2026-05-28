@@ -108,7 +108,7 @@ spec:
           COORDINATOR="mimo-v25-pro-demo-0.mimo-v25-pro-demo.default.svc.cluster.local"
 
           echo "=== [rank${INDEX}] Installing sglang-jax ==="
-          git clone https://github.com/sgl-project/sglang-jax.git /workspace
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
           cd /workspace
           uv pip install -e "python[all]"
 
