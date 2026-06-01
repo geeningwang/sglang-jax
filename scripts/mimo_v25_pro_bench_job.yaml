@@ -171,40 +171,9 @@ spec:
               --n-requests 20
 
             echo ""
-            echo "$(ts) [rank0] PHASE: benchmark complete — printing results"
-            python3 -c "
-import json, sys
-r = json.load(open('/tmp/perf_benchmark_results.json'))
-
-print()
-print('=== FINAL RESULTS ===')
-if 'phase2' in r:
-    rows = r['phase2']
-    base = rows[0]['decode_tok_per_s']
-    print()
-    print('Phase 2 — Concurrent request scaling (input=512tok, output=256tok):')
-    print(f\"  {'conc':>4}  {'tok/s':>8}  {'lat_p50':>8}  {'lat_p90':>8}  {'vs_base':>8}  {'eff':>6}\")
-    for row in rows:
-        vs = row['decode_tok_per_s'] / base
-        eff = row['decode_tok_per_s'] / (base * row['concurrency']) * 100
-        print(f\"  {row['concurrency']:>4}  {row['decode_tok_per_s']:>8.1f}  {row['latency_p50_s']:>7.3f}s  {row['latency_p90_s']:>7.3f}s  {vs:>7.2f}x  {eff:>5.0f}%\")
-
-if 'phase3' in r:
-    rows = r['phase3']
-    print()
-    print('Phase 3 — Prefill length sweep (output=1tok, conc=1):')
-    print(f\"  {'in_tok':>7}  {'TTFT_p50':>10}  {'prefill_tok/s':>14}\")
-    for row in rows:
-        print(f\"  {row['input_tokens']:>7}  {row['latency_p50_s']:>10.3f}s  {row['prefill_tok_per_s']:>14.1f}\")
-
-if 'phase4' in r:
-    rows = r['phase4']
-    print()
-    print(f\"Phase 4 — Output length sweep (input=512tok):\")
-    print(f\"  {'out_tok':>7}  {'tok/s':>8}  {'lat_p50':>10}\")
-    for row in rows:
-        print(f\"  {row['max_tokens']:>7}  {row['decode_tok_per_s']:>8.1f}  {row['latency_p50_s']:>10.3f}s\")
-"
+            echo "$(ts) [rank0] PHASE: benchmark complete"
+            echo "Results JSON:"
+            cat /tmp/perf_benchmark_results.json
             echo ""
             echo "=== Benchmark complete ==="
             kill $SERVER_PID
