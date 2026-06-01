@@ -1,6 +1,6 @@
-# MiMo-V2.5-Pro Performance Test Plan — 4-Node TPU v7x
+# MiMo-V2.5-Pro Performance Benchmark — 4-Node TPU v7x
 
-## Status: Draft
+## Status: Running (2026-06-01)
 
 ---
 
@@ -8,11 +8,11 @@
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| **1** | Baseline measurement — single request, record TP/EP config, prefill and decode tok/s | ⬜ Planned |
-| **2** | Concurrent request sweep — vary `--max-running-requests`, measure decode throughput scaling | ⬜ Planned |
-| **3** | Prefill length sweep — vary input length, measure prefill tok/s and TTFT | ⬜ Planned |
-| **4** | Output length sweep — vary output length at optimal concurrency, measure decode tok/s | ⬜ Planned |
-| **5** | Identify throughput-optimal concurrency; record final TP/EP/prefill/decode numbers | ⬜ Planned |
+| **1** | Baseline measurement — single request, record TP/EP config, prefill and decode tok/s | ✅ Done |
+| **2** | Concurrent request sweep — vary client concurrency, measure decode throughput scaling | 🔄 Running |
+| **3** | Prefill length sweep — vary input length, measure prefill tok/s and TTFT | 🔄 Running |
+| **4** | Output length sweep — vary output length at optimal concurrency, measure decode tok/s | 🔄 Running |
+| **5** | Identify throughput-optimal concurrency; record final TP/EP/prefill/decode numbers | ⬜ Pending results |
 
 **Primary metrics**: output tok/s (decode throughput), prefill tok/s, TTFT (time to first token).
 
@@ -57,20 +57,22 @@ EP (expert parallelism) is derived from the MoE sub-mesh within the TP-32 mesh.
 
 ---
 
-## Baseline (Phase 1)
+## Baseline (Phase 1) ✅
 
-Already measured from smoke test runs (2026-05-28, 2026-06-01):
+Measured from smoke test runs (2026-05-28, 2026-06-01):
 
 | Metric | Measured value | Notes |
 |--------|---------------|-------|
-| `--max-running-requests` | 2 | Server config |
+| TP | 32 | `--tp-size 32`, 4 nodes × 4 chips × 2 TCs |
+| EP | implicit (from model `ep_size`) | Sub-mesh `("expert", "tensor")` |
+| `--max-running-requests` | 2 | Smoke test config |
 | Concurrent requests | 1 (single demo request) | Load level during measurement |
 | Prefill tokens | 272 | Demo prompt length |
-| Prefill throughput | — | Not directly measured yet |
-| Decode throughput | **10.81 tok/s** | Steady-state single-request |
+| Prefill throughput | — | Not isolated in smoke test |
+| Decode throughput | **10.81 tok/s** | Steady-state, single request |
 | Time to first token | ~5 s | Prefill 272 tokens |
 | Max output tokens | 256 | Demo cap |
-| Server startup | ~2h15m (warm XLA) | Weight loading dominates |
+| Server startup (warm XLA) | ~2h15m | Weight loading dominates; XLA ~55s |
 
 The 10.81 tok/s baseline is a **single-sequence** result. sglang-jax batches multiple
 concurrent requests, so throughput is expected to scale with concurrency up to the
@@ -78,7 +80,7 @@ hardware saturation point (weight-bandwidth-bound → compute-bound transition).
 
 ---
 
-## Phase 2 — Concurrent Request Sweep
+## Phase 2 — Concurrent Request Sweep 🔄
 
 ### Hypothesis
 
@@ -91,18 +93,18 @@ decoded. Throughput should scale near-linearly with concurrency until:
 
 ### Sweep plan
 
-Vary `--max-running-requests` and drive the server to saturation with a parallel
-request script. For each concurrency level, measure steady-state decode throughput
-and TTFT.
+The benchmark server is launched with `--max-running-requests 32`. Client-side
+concurrency is varied from 1 to 32 via `perf_sweep.py`, which drives N parallel
+async requests for each step.
 
-| Step | `--max-running-requests` | Effective batch | Notes |
-|------|--------------------------|-----------------|-------|
-| A | 1 | 1 | Single-request baseline |
-| B | 2 | 2 | Current smoke test config |
-| C | 4 | 4 | First scaling point |
-| D | 8 | 8 | Monitor step latency growth |
-| E | 16 | 16 | May enter mixed regime |
-| F | 32 | 32 | Run only if E is still near-linear |
+| Step | Client concurrency | Fixed input | Fixed output | Notes |
+|------|--------------------|-------------|--------------|-------|
+| A | 1 | 512 tok | 256 tok | Single-request baseline |
+| B | 2 | 512 tok | 256 tok | |
+| C | 4 | 512 tok | 256 tok | First scaling point |
+| D | 8 | 512 tok | 256 tok | Monitor step latency growth |
+| E | 16 | 512 tok | 256 tok | May enter mixed regime |
+| F | 32 | 512 tok | 256 tok | Run only if E is still near-linear |
 
 ### KV cache capacity estimate
 
@@ -112,88 +114,50 @@ $$\text{KV per TC per sequence} \approx 2 \times 70 \times \frac{8}{32} \times L
 
 where L is the sequence length. At L=512 tokens: ~46 MB per sequence per TC.
 With ~43 GB KV cache per TC, this supports ~930 concurrent sequences at 512 tokens.
-KV cache is not the limiting factor in this sweep — HBM temporaries during XLA
-compilation and compute are more likely to bind first.
+KV cache is not the limiting factor in this sweep — compute and ICI bandwidth are
+more likely to bind first.
 
-### Load generation
+### Metrics recorded per step
 
-For each step, saturate the server with N parallel clients, each sending a request
-with fixed input and output length:
-
-```bash
-# Set CONCURRENCY and SERVER for each sweep step
-CONCURRENCY=4   # ← match --max-running-requests
-SERVER="http://<rank0-pod-ip>:8080"
-INPUT_TOKENS=512
-OUTPUT_TOKENS=256
-
-python3 scripts/perf_sweep.py \
-  --server ${SERVER} \
-  --concurrency ${CONCURRENCY} \
-  --input-tokens ${INPUT_TOKENS} \
-  --output-tokens ${OUTPUT_TOKENS} \
-  --num-requests 50 \
-  --output bench_concurrent_${CONCURRENCY}.json
-```
-
-### Metrics to record per step
-
-1. **Decode throughput** (tok/s): total output tokens / total wall time across all requests
-2. **TTFT** (ms): time from request submission to first output token, median and p90
-3. **Decode step latency** (ms): per-step latency in the decode loop, derived from server logs
-4. **Scaling efficiency**: `throughput_at_N / (baseline_throughput × N)`
+1. **Decode throughput** (tok/s): total output tokens / wall time across all requests
+2. **Latency p50 / p90** (s): per-request end-to-end latency percentiles
+3. **Scaling efficiency**: `throughput_at_N / (baseline_throughput × N)`
 
 ---
 
-## Phase 3 — Prefill Length Sweep
+## Phase 3 — Prefill Length Sweep 🔄
 
-Fix `--max-running-requests 2`, vary input prompt length. Measures how prefill
-throughput and TTFT change with prompt size.
+Concurrency=1, output=1 token (isolates prefill). Varies input length to measure
+TTFT and prefill tok/s across prompt sizes.
 
-| Step | Input tokens | Expected TTFT | Notes |
-|------|-------------|---------------|-------|
-| A | 128 | ~1–2 s | Short prompt |
-| B | 256 | ~2–4 s | |
-| C | 512 | ~4–8 s | |
-| D | 1024 | ~8–15 s | Chunked prefill active (`--chunked-prefill-size 512`) |
-| E | 2048 | ~15–30 s | 4 prefill chunks |
-| F | 4096 | ~30–60 s | 8 prefill chunks |
+| Step | Input tokens | Notes |
+|------|-------------|-------|
+| A | 128 | Short prompt |
+| B | 256 | |
+| C | 512 | |
+| D | 1024 | Chunked prefill active (`--chunked-prefill-size 512`) |
+| E | 2048 | 4 prefill chunks |
 
-**Prefill tok/s** = `input_tokens / TTFT`. Record at each step.
+**Prefill tok/s** = `input_tokens / TTFT_p50`. Chunked prefill (>512 tokens) may
+reduce throughput slightly due to chunk coordination overhead.
 
-**Chunked prefill note**: prompts longer than `--chunked-prefill-size` (512) are
-split into chunks. Prefill tok/s may decrease slightly for very long prompts due to
-chunk coordination overhead.
-
-```bash
-INPUT_LEN=512   # ← change per step
-OUTPUT_LEN=1    # fix output to 1 token to isolate prefill
-
-python3 scripts/perf_sweep.py \
-  --server ${SERVER} \
-  --concurrency 1 \
-  --input-tokens ${INPUT_LEN} \
-  --output-tokens ${OUTPUT_LEN} \
-  --num-requests 20 \
-  --output bench_prefill_${INPUT_LEN}.json
-```
+**TTFT** = time from request submission to first output token (includes prefill + first decode step).
 
 ---
 
-## Phase 4 — Output Length Sweep
+## Phase 4 — Output Length Sweep 🔄
 
-Fix `--max-running-requests` at the throughput-optimal level found in Phase 2.
-Vary output length to characterize decode throughput at different generation budgets.
+Client concurrency fixed at throughput-optimal level from Phase 2. Varies max output
+tokens to characterize decode tok/s across generation budgets.
 
 | Step | Output tokens | Notes |
 |------|--------------|-------|
 | A | 64 | Short generation |
 | B | 128 | |
-| C | 256 | Current smoke test setting |
+| C | 256 | Smoke test setting |
 | D | 512 | |
-| E | 1024 | Long generation |
 
-For each step record: decode tok/s, TTFT, total request latency.
+Records per step: decode tok/s, latency p50/p90, total request latency.
 
 ---
 
@@ -237,37 +201,39 @@ Fill in as sweep runs complete.
 
 ## Infrastructure
 
-### Benchmark server YAML
+### Benchmark job
 
-The benchmark requires the server to stay alive after the demo inference completes.
-Use a modified job that removes `kill $SERVER_PID` from the rank0 script and adds
-a long sleep, then access via `kubectl port-forward`.
+`scripts/mimo_v25_pro_bench_job.yaml` — 4-node DWS job that:
+1. Mounts weights via gcsfuse, launches server with `--max-running-requests 32`
+2. Waits for `/health`
+3. Runs `scripts/perf_sweep.py` (all 3 phases automatically)
+4. Prints results to stdout and writes `/tmp/perf_benchmark_results.json`
 
 ```bash
-# Port-forward rank0 HTTP server to localhost
-kubectl port-forward pod/mimo-v25-pro-demo-0-<suffix> 8080:8080
+# Submit
+kubectl apply -f scripts/mimo_v25_pro_bench_job.yaml
 
-# Test health
-curl http://localhost:8080/health
+# Watch progress
+kubectl logs -f -l job-name=mimo-v25-pro-bench --prefix
 
-# Send a request
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "MiMo-V2.5-Pro", "messages": [{"role": "user", "content": "..."}],
-       "max_tokens": 256}'
+# Clean up
+kubectl delete -f scripts/mimo_v25_pro_bench_job.yaml
 ```
 
-### Benchmark script (to be created)
+### Benchmark script
 
-`scripts/perf_sweep.py` — parallel request driver with configurable:
-- `--concurrency`: number of parallel requests
-- `--input-tokens`: prompt length (padded with synthetic tokens if needed)
-- `--output-tokens`: max tokens to generate
-- `--num-requests`: total requests to send
-- `--output`: JSON file for results
+`scripts/perf_sweep.py` — async request driver using `aiohttp`:
 
-Records per-request: TTFT, total latency, output tokens, decode tok/s.
-Aggregates: throughput, latency percentiles (p50, p90, p99).
+```
+--server        server URL (default: http://localhost:8080)
+--n-requests    requests per sweep step (default: 20)
+--phase         0=all phases, 2/3/4=single phase
+```
+
+Output: formatted tables to stdout + `/tmp/perf_benchmark_results.json`.
+
+Prompt generation: synthetic English technical text padded to ~target token count
+(~3.5 chars/token), varied by request index to avoid cache hits.
 
 ---
 
@@ -310,12 +276,11 @@ It is fixed by the model config and cannot be swept without code changes.
 
 ## Next Steps
 
-1. Create `scripts/perf_sweep.py` — parallel request driver
-2. Modify `scripts/mimo_v25_pro_demo_job.yaml` to keep server alive for benchmarking (long-running variant)
-3. Run Phase 2 sweep (concurrency 1→32)
-4. Run Phase 3 sweep (prefill length 128→4096)
-5. Run Phase 4 sweep (output length 64→1024) at optimal concurrency
-6. Record results and identify throughput-optimal `--max-running-requests`
+1. ✅ `scripts/perf_sweep.py` — created (commit `02e2980`)
+2. ✅ `scripts/mimo_v25_pro_bench_job.yaml` — created (commit `fcc418e`)
+3. 🔄 Benchmark job `mimo-v25-pro-bench` submitted (2026-06-01); awaiting results
+4. ⬜ Fill in results tables (Phases 2–4) from job logs once complete
+5. ⬜ Identify throughput-optimal concurrency and record final numbers in Phase 5
 
 ---
 
