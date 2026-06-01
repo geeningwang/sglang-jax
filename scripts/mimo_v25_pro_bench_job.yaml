@@ -1,0 +1,249 @@
+# PodTemplate for DWS ProvisioningRequest
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v25-pro-bench-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v25-pro-bench
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+# DWS ProvisioningRequest: 2x2x4 slice for 36 hours
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v25-pro-bench-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "129600"
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: mimo-v25-pro-bench-dws-template
+---
+# Headless service for rank-0 pod discovery
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-v25-pro-bench
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-v25-pro-bench
+  ports:
+  - name: dist-init
+    port: 6006
+  - name: http
+    port: 8080
+---
+# Benchmark job: server stays alive, rank0 runs perf_sweep.py after /health.
+# --max-running-requests 32 to cover the full concurrency sweep (1..32).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-bench
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v25-pro-bench-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: mimo-v25-pro-bench
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v25-pro-bench
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="mimo-v25-pro-bench-0.mimo-v25-pro-bench.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          MODEL_PATH="/mnt/gcs/hf-weights"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "=== [rank${INDEX}] Installing sglang-jax ==="
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+
+          echo "=== [rank${INDEX}] Mounting GCS weights via gcsfuse ==="
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          mkdir -p /mnt/gcs /mnt/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=800000 \
+            --cache-dir=/mnt/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          echo "$(ts) [rank${INDEX}] GCS mount ready: $(ls /mnt/gcs/hf-weights/*.safetensors | wc -l) safetensors files"
+
+          if [ "${INDEX}" = "0" ]; then
+            echo "$(ts) [rank0] PHASE: launching server (max-running-requests=32 for full sweep)"
+            JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+            python3 -m sgl_jax.launch_server \
+              --model-path ${MODEL_PATH} \
+              --trust-remote-code \
+              --tp-size 32 \
+              --device tpu \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.75 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 32 \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --nnodes 4 \
+              --node-rank 0 \
+              --dist-init-addr ${COORDINATOR}:6006 &
+            SERVER_PID=$!
+            echo "$(ts) [rank0] PHASE: waiting for /health (PID=$SERVER_PID)"
+
+            for i in $(seq 1 25920); do
+              if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s"
+                break
+              fi
+              if ! kill -0 $SERVER_PID 2>/dev/null; then
+                echo "$(ts) [rank0] ERROR: server process died after $((i * 5))s"
+                exit 1
+              fi
+              if [ $((i % 60)) -eq 0 ]; then
+                echo "$(ts) [rank0] still waiting for /health ($((i * 5))s elapsed)"
+              fi
+              sleep 5
+            done
+
+            echo ""
+            echo "$(ts) [rank0] PHASE: running performance benchmark sweep"
+            python3 /workspace/scripts/perf_sweep.py \
+              --server http://localhost:8080 \
+              --n-requests 20
+
+            echo ""
+            echo "$(ts) [rank0] PHASE: benchmark complete — printing results"
+            python3 -c "
+import json, sys
+r = json.load(open('/tmp/perf_benchmark_results.json'))
+
+print()
+print('=== FINAL RESULTS ===')
+if 'phase2' in r:
+    rows = r['phase2']
+    base = rows[0]['decode_tok_per_s']
+    print()
+    print('Phase 2 — Concurrent request scaling (input=512tok, output=256tok):')
+    print(f\"  {'conc':>4}  {'tok/s':>8}  {'lat_p50':>8}  {'lat_p90':>8}  {'vs_base':>8}  {'eff':>6}\")
+    for row in rows:
+        vs = row['decode_tok_per_s'] / base
+        eff = row['decode_tok_per_s'] / (base * row['concurrency']) * 100
+        print(f\"  {row['concurrency']:>4}  {row['decode_tok_per_s']:>8.1f}  {row['latency_p50_s']:>7.3f}s  {row['latency_p90_s']:>7.3f}s  {vs:>7.2f}x  {eff:>5.0f}%\")
+
+if 'phase3' in r:
+    rows = r['phase3']
+    print()
+    print('Phase 3 — Prefill length sweep (output=1tok, conc=1):')
+    print(f\"  {'in_tok':>7}  {'TTFT_p50':>10}  {'prefill_tok/s':>14}\")
+    for row in rows:
+        print(f\"  {row['input_tokens']:>7}  {row['latency_p50_s']:>10.3f}s  {row['prefill_tok_per_s']:>14.1f}\")
+
+if 'phase4' in r:
+    rows = r['phase4']
+    print()
+    print(f\"Phase 4 — Output length sweep (input=512tok):\")
+    print(f\"  {'out_tok':>7}  {'tok/s':>8}  {'lat_p50':>10}\")
+    for row in rows:
+        print(f\"  {row['max_tokens']:>7}  {row['decode_tok_per_s']:>8.1f}  {row['latency_p50_s']:>10.3f}s\")
+"
+            echo ""
+            echo "=== Benchmark complete ==="
+            kill $SERVER_PID
+          else
+            echo "$(ts) [rank${INDEX}] PHASE: launching worker server"
+            JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+            python3 -m sgl_jax.launch_server \
+              --model-path ${MODEL_PATH} \
+              --trust-remote-code \
+              --tp-size 32 \
+              --device tpu \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.75 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 32 \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --nnodes 4 \
+              --node-rank ${INDEX} \
+              --dist-init-addr ${COORDINATOR}:6006
+          fi
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: gcsfuse-cache
+          mountPath: /mnt/gcsfuse-cache
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+      volumes:
+      - name: gcsfuse-cache
+        emptyDir:
+          medium: Memory
+          sizeLimit: 850Gi
