@@ -102,7 +102,7 @@ Measured from smoke test runs (2026-05-28, 2026-06-01) and confirmed in benchmar
 
 3. **Optimal concurrency: 2** — max throughput (~20.2 tok/s) at minimum latency (25.6s p50). Higher concurrency only increases latency without improving throughput.
 
-4. Contrast with MaxText MiMo-V2-Flash (v6e-32): that achieved 4.7× throughput at batch=11 (2,724 tok/s). The sglang-jax ceiling of ~20 tok/s points to a kernel-level bottleneck — likely the FP8 EPMoE GEMM not fully utilizing TPU v7x MXU at small batch sizes.
+4. **Root cause: only bs=1 and bs=2 were precompiled.** The XLA warmup compiled decode kernels for `bs=[1,2]` only. Regardless of queue depth, the scheduler never runs more than 2 requests at once. Fix: `--precompile-bs-paddings 1,2,4,8,16,32` to compile larger batch shapes and unlock the scheduler.
 
 ---
 
@@ -170,16 +170,47 @@ Measured from smoke test runs (2026-05-28, 2026-06-01) and confirmed in benchmar
 ### Throughput ceiling analysis
 
 The ~20 tok/s ceiling is ~54× lower than MaxText MiMo-V2-Flash (2,724 tok/s on v6e-32).
-Contributing factors:
+Root causes in order of impact:
 
-| Factor | Impact |
-|--------|--------|
-| Different hardware (TPU v7x vs v6e) | v7x has higher HBM bandwidth per chip |
-| EP=1 vs EP=8 in MaxText | EP=8 distributes expert GEMMs across 8 parallel chips; EP=1 serializes them |
-| FP8 EPMoE kernel efficiency | Small-batch FP8 GEMM may not fully utilize MXU at tp-size=32 |
-| sglang-jax batch scheduling | Server may not overlap prefill/decode at the same level as MaxText |
+#### Root cause 1 (most impactful, immediately fixable): Only bs=1 and bs=2 compiled
 
-The most impactful lever is likely **EP**: enabling EP > 1 in sglang-jax would distribute the 384-expert MoE GEMMs across multiple chips, increasing effective MoE throughput proportionally.
+JAX/XLA requires **static shapes** — a separate kernel must be compiled for each batch
+size. The benchmark server precompiled only `bs=[1, 2]` for decode:
+
+```
+[DECODE] PRECOMPILE: 100%|██████████| 2/2  bs=2
+```
+
+Regardless of how many requests are queued, the scheduler can only run **2 at a time**.
+Server logs confirm: `#running-req: 2, #queue-req: 8` even with 8 concurrent clients —
+requests are serialized in pairs, not truly batched together.
+
+**Fix**: add `--precompile-bs-paddings 1,2,4,8,16,32` at server launch. This compiles
+decode kernels for each batch size during XLA warmup, allowing the scheduler to fill
+batches of up to 32 simultaneous requests.
+**Expected gain: 4–16× throughput improvement.**
+
+#### Root cause 2: HBM bandwidth floor
+
+Even with large batches, there is a per-decode-step hardware floor:
+
+| Item | Value |
+|------|-------|
+| Weights per TC | ~30 GB FP8 |
+| TPU v7x HBM bandwidth | ~600 GB/s per TC |
+| Min time to read all weights | 30 GB ÷ 600 GB/s = **50ms** |
+| Actual step time at bs=1 | ~92ms → **54% HBM utilization** |
+
+To reach 1,000 tok/s total, the scheduler needs ~1,000 tokens/step at ~1 step/s —
+i.e. ~50–100 concurrent requests decoding simultaneously. With ~930-sequence KV cache
+capacity, this is theoretically reachable once the batch size precompilation is fixed.
+
+#### Root cause 3: EP=1
+
+With EP=1, all 32 TCs collaborate on every MoE expert GEMM for every token. With EP=8
+(MaxText approach), 8 independent groups of 4 TCs each handle 48 of the 384 experts
+in parallel — 8× more expert compute throughput per step. Requires changing `ep_size`
+in the model config and corresponding mesh wiring in the weight loader.
 
 ---
 
@@ -220,12 +251,39 @@ Output: formatted tables to stdout + `/tmp/perf_benchmark_results.json`.
 
 ---
 
-## Next Steps / Optimization Opportunities
+## Optimization Roadmap
 
-1. **Enable EP > 1** — most impactful lever; requires changing `ep_size` in model config and verifying the EP sub-mesh wiring in the weight loader
-2. **Larger batch sizes** — investigate whether sglang-jax scheduler can be tuned to fill larger XLA batch shapes (the `precompile_bs_paddings` flag)
-3. **Prefill/decode overlap** — profile whether rank0 overlaps prefill and decode phases
-4. **FP8 GMM kernel tuning** — block sizes for the EPMoE GEMM (`[GMM kernel] using default block sizes`) may not be optimal for tp-size=32 on v7x; sweep `tm`, `tn`, `tk`
+| # | Optimization | Expected gain | Effort | Status |
+|---|-------------|--------------|--------|--------|
+| **Opt-1** | `--precompile-bs-paddings 1,2,4,8,16,32` | **4–16×** decode tok/s | Low — one flag | 🔄 In progress |
+| Opt-2 | Enable EP > 1 (`ep_size` in model config + mesh wiring) | Up to 8× MoE throughput | High — code change | ⬜ Planned |
+| Opt-3 | FP8 GMM block size tuning (`tm`, `tn`, `tk`) | ~10–30% per step | Medium | ⬜ Planned |
+| Opt-4 | Prefill/decode overlap scheduling | Latency reduction | Medium | ⬜ Planned |
+
+### Opt-1 detail: precompile-bs-paddings (in progress)
+
+Add to server launch:
+
+```bash
+python3 -m sgl_jax.launch_server \
+  ...
+  --precompile-bs-paddings 1,2,4,8,16,32
+```
+
+This triggers XLA compilation for decode batch sizes 1, 2, 4, 8, 16, 32 during server
+warmup (~additional 5–10 min). Once compiled, the scheduler can fill any of those
+batch sizes when enough requests are queued. XLA compilation artifacts are written to
+the GCS cache and reused on future restarts.
+
+**Expected results** (to be measured):
+
+| Concurrency | Projected tok/s | Notes |
+|-------------|----------------|-------|
+| 2 | ~20 | Unchanged (already hitting bs=2) |
+| 4 | ~40 | If bs=4 compiles and scheduler fills it |
+| 8 | ~80 | If bs=8 compiles |
+| 16 | ~120–160 | Compute-bound regime likely |
+| 32 | TBD | HBM/ICI limit |
 
 ---
 
