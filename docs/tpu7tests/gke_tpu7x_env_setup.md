@@ -3,6 +3,29 @@
 How to set up the GKE cluster, node pools, and supporting infrastructure for TPU v7x
 readiness tests. Covers discovered pitfalls and the workarounds required.
 
+## Current test environment (as of 2026-06)
+
+All active tests use **DWS (Dynamic Workload Scheduler)** with `jingnw-dws-tpu7-16ch`
+(4-node 2x2x4) or `jingnw-dws-tpu7-8ch` (2-node 2x2x2).
+
+| Test | Script | Node pool | Provisioning |
+|------|--------|-----------|--------------|
+| MiMo-V2.5-Pro smoke (4-node) | `scripts/mimo_v25_pro_demo_job.yaml` | `jingnw-dws-tpu7-16ch` | DWS |
+| MiMo-V2.5-Pro benchmark | `scripts/mimo_v25_pro_bench_job.yaml` | `jingnw-dws-tpu7-16ch` | DWS |
+| MiMo-V2.5-Pro smoke (2-node) | `scripts/mimo_v25_pro_2node_demo_job.yaml` | `jingnw-dws-tpu7-8ch` | DWS |
+
+**Existing DWS node pools:**
+
+| Pool name | Topology | Max nodes | Policy |
+|-----------|----------|-----------|--------|
+| `jingnw-dws-tpu7-8ch` | 2x2x2 | 2 | `jingnw-tpu7-policy-8ch` |
+| `jingnw-dws-tpu7-16ch` | 2x2x4 | 4 | `jingnw-tpu7-workload-policy-16ch-v2` |
+
+No setup is needed to run tests — just `kubectl apply -f scripts/YAML`. DWS handles
+node provisioning automatically via the embedded `ProvisioningRequest`.
+
+---
+
 ---
 
 ## Prerequisites
@@ -159,6 +182,12 @@ kubectl get provisioningrequest PROVISIONING_REQUEST_NAME
 # ACCEPTED = capacity confirmed, PROVISIONED = nodes joined, FAILED = no capacity
 kubectl describe provisioningrequest PROVISIONING_REQUEST_NAME
 
+# Watch pods
+kubectl get pods -l job-name=JOB_NAME -o wide
+
+# Tail logs from all pods
+kubectl logs -f -l job-name=JOB_NAME --prefix
+
 # Cloud Logging (survives pod termination)
 gcloud logging read \
   'resource.type="k8s_container" AND resource.labels.cluster_name="jingnw-tpu7-cluster" AND labels."k8s-pod/job-name"="JOB_NAME"' \
@@ -166,6 +195,36 @@ gcloud logging read \
   --format="value(timestamp,textPayload)" \
   --limit=50
 ```
+
+### Resubmitting a failed job
+
+When a job fails or needs to be restarted, always delete the old PR before reapplying
+(otherwise the PR stays FAILED and blocks new pods from scheduling):
+
+```bash
+kubectl delete job JOB_NAME --ignore-not-found
+kubectl delete provisioningrequest PR_NAME --ignore-not-found
+kubectl delete service SERVICE_NAME --ignore-not-found
+kubectl apply -f scripts/JOB_YAML.yaml
+```
+
+### NodepoolSizeReached — waiting for nodes to drain
+
+If DWS returns `NodepoolSizeReached`, old nodes from a previous run are still allocated.
+Check and wait:
+
+```bash
+# Check node count — wait until it reaches 0
+kubectl get nodes -l cloud.google.com/gke-nodepool=POOL_NAME --no-headers | wc -l
+
+# Once 0: delete the FAILED PR and resubmit
+kubectl delete provisioningrequest PR_NAME
+kubectl apply -f scripts/JOB_YAML.yaml
+```
+
+Nodes typically drain 10–20 min after the last pod exits. GKE autoscaler does not
+scale down while any pod (even Completed/Error) remains on the node — ensure pods are
+fully terminated before expecting node drain.
 
 ---
 
@@ -199,3 +258,6 @@ GCS, RAM, HBM, and disk allocation details.
 | `OOM: Not enough memory. Please try to increase --mem-fraction-static` in `_profile_available_bytes` | Model weights fill >92% of HBM at current tp-size | Increase tp-size (more nodes) rather than raising mem-fraction-static |
 | XLA temp OOM during KV cache profiling at higher `--mem-fraction-static` | 384-expert MoE forward pass needs ~24 GB/TensorCore scratch; `0.92` leaves only 8% (~7.7 GB) | Use `--mem-fraction-static 0.75` (25% XLA scratch = ~24 GB/TensorCore) |
 | DWS nodes evicted ~10 min after provisioning | `BookingExpired` event triggers cluster autoscaler | Add `safe-to-evict: "false"` pod annotation |
+| `ProvisioningRequest FAILED: NodepoolSizeReached` immediately after resubmit | Old nodes from previous run still allocated; pool at max capacity | Wait for nodes to drain (10–20 min) then delete PR and reapply (see Resubmitting section) |
+| PR shows `FAILED=True` but was just created | Old FAILED PR was not deleted before `kubectl apply` — `apply` leaves existing resources unchanged | Always `kubectl delete provisioningrequest PR_NAME` before reapplying |
+| `--precompile-bs-paddings` argument error: `invalid int value: '1,2,4,8,16,32'` | Flag expects space-separated integers, not comma-separated | Use `--precompile-bs-paddings 1 2 4 8 16 32` |
