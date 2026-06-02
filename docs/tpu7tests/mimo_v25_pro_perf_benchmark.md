@@ -262,60 +262,47 @@ Output: formatted tables to stdout + `/tmp/perf_benchmark_results.json`.
 | # | Optimization | Expected gain | Effort | Status |
 |---|-------------|--------------|--------|--------|
 | Opt-1 | `--precompile-bs-paddings 1 2 4 8 16 32` | 4–16× decode tok/s | Low — one flag | ❌ No effect |
-| **Opt-1c** | `--chunked-prefill-size 4096` | 8× more requests/prefill step | Low — one flag | 🔄 Running |
+| Opt-1c | `--chunked-prefill-size 4096` | 8× more requests/prefill step | Low — one flag | ❌ No effect |
+| **Opt-1d** | Debug scheduler `batch_is_full` / `rem_total_tokens` logic | Unlock `#running-req > 2` | Medium — needs investigation | ⬜ Next |
 | Opt-2 | Enable EP > 1 (`ep_size` in model config + mesh wiring) | Up to 8× MoE throughput | High — code change | ⬜ Planned |
 | Opt-3 | FP8 GMM block size tuning (`tm`, `tn`, `tk`) | ~10–30% per step | Medium | ⬜ Planned |
 
-### Corrected root cause (from source code analysis)
+### Root cause — still unknown (2026-06-02)
 
-The `--precompile-bs-paddings` fix compiled larger batch sizes but the scheduler never
-filled them. Code analysis of `schedule_policy.py::PrefillAdder` revealed the actual
-bottleneck: **`--chunked-prefill-size 512` combined with 512-token prompts limits
-admission to exactly 1 request per prefill tick.**
+Three flags have been tested, all with zero effect on `#running-req`:
 
-```python
-# PrefillAdder budget per scheduler tick:
-rem_chunk_tokens = chunked_prefill_size  # = 512
+| Flag tested | Hypothesis | Result |
+|-------------|-----------|--------|
+| `--precompile-bs-paddings 1 2 4 8 16 32` | XLA batch sizes not compiled | ❌ Compiled OK, scheduler still caps at 2 |
+| `--disable-overlap-schedule` | Prefill/decode interleaving limits batch | ❌ No change |
+| `--chunked-prefill-size 4096` | Chunk budget limits 1 request/tick | ❌ Chunk budget expanded, still 2 |
 
-# Request 1: extend_input_len=512 → rem_chunk = 512 - 512 = 0
-# Request 2: trunc_len = 0 → AddReqResult.OTHER → break (stops admitting)
-```
+**Observed invariant across all runs**: `#running-req: 2, #queue-req: N` regardless of concurrency, with `#new-seq: 2` on every prefill tick. This is extraordinarily consistent, suggesting the limit is structural — likely either:
+1. A `batch_is_full` flag being set by a code path not reached by the flags above
+2. The `rem_total_tokens` budget check triggering NO_TOKEN for requests 3+ after 2 are running (despite seemingly having headroom)
+3. A JAX/XLA static-shape constraint that caps the decode batch at 2 at the compiled kernel level
 
-Every scheduler tick can prefill at most `chunked_prefill_size / extend_input_len`
-requests. At 512/512 = 1, only one 512-token request is admitted per tick. The
-overlap scheduler interleaves this with decode, resulting in a steady-state of 2
-requests running (the one currently decoding + the one just admitted).
+Next step (Opt-1d): add debug logging to `get_new_batch_prefill` to log `batch_is_full` state, `rem_total_tokens`, and `add_one_req` return codes for each rejected request.
 
-Note: `--disable-overlap-schedule` and `--schedule-conservativeness 0` do NOT fix this
-because they don't change the chunk budget admission logic.
+### Opt-1c result (❌ confirmed no effect, 2026-06-02)
 
-### Opt-1c — `--chunked-prefill-size 4096` (running)
+`--chunked-prefill-size 4096` with `--precompile-bs-paddings 1 2 4 8 16 32`.
+With 480 cached tokens per request, `extend_input_len ≈ 32`, chunk budget of 4096 should
+admit `4096 / 32 = 128 requests/tick`. Server still showed `#new-seq: 2` per prefill step.
 
-```bash
-python3 -m sgl_jax.launch_server \
-  ... \
-  --chunked-prefill-size 4096 \
-  --precompile-bs-paddings 1 2 4 8 16 32
-```
-
-With a 4096-token chunk budget: `4096 / 512 = 8 requests` admitted per prefill tick
-instead of 1. The decode batch should grow to 8+ concurrent requests.
-
-**Expected results** (to fill in after run):
-
-| Concurrency | Projected tok/s | Notes |
-|-------------|----------------|-------|
-| 1 | ~10.6 | Unchanged |
-| 2 | ~20 | Unchanged |
-| 4 | ~40 | If 4 admitted per tick |
-| 8 | ~80 | Chunk budget allows 8/tick |
-| 16 | ~120–160 | Compute-bound regime likely |
-| 32 | TBD | |
+| Concurrency | Decode tok/s | Lat p50 | vs baseline | Efficiency |
+|-------------|-------------|---------|-------------|------------|
+| 1 | 10.6 | 24.1s | 1.00× | 100% |
+| 2 | 20.1 | 25.6s | 1.89× | 95% |
+| 4 | 20.0 | 51.3s | 1.89× | 47% |
+| 8 | 20.0 | 102.6s | 1.89× | 24% |
+| 16 | 19.8 | 205.7s | 1.87× | 12% |
+| 32 | 20.0 | 406.4s | 1.88× | 6% |
 
 ### Opt-1 result (❌ confirmed no effect, 2026-06-02)
 
 `--precompile-bs-paddings 1 2 4 8 16 32` compiled the shapes correctly but the
-scheduler never filled batches larger than 2. Phase 2 results identical to baseline:
+scheduler never filled batches larger than 2.
 
 | Concurrency | Decode tok/s | Lat p50 | vs baseline | Efficiency |
 |-------------|-------------|---------|-------------|------------|
