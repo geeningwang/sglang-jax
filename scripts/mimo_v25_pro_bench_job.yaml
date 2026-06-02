@@ -142,6 +142,7 @@ spec:
               --chunked-prefill-size 512 \
               --max-running-requests 32 \
               --precompile-bs-paddings 1 2 4 8 16 32 \
+              --disable-overlap-schedule \
               --host 0.0.0.0 \
               --port 8080 \
               --nnodes 4 \
@@ -192,6 +193,7 @@ spec:
               --chunked-prefill-size 512 \
               --max-running-requests 32 \
               --precompile-bs-paddings 1 2 4 8 16 32 \
+              --disable-overlap-schedule \
               --host 0.0.0.0 \
               --port 8080 \
               --nnodes 4 \

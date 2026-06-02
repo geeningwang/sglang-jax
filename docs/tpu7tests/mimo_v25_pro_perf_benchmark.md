@@ -172,23 +172,29 @@ Measured from smoke test runs (2026-05-28, 2026-06-01) and confirmed in benchmar
 The ~20 tok/s ceiling is ~54× lower than MaxText MiMo-V2-Flash (2,724 tok/s on v6e-32).
 Root causes in order of impact:
 
-#### Root cause 1 (most impactful, immediately fixable): Only bs=1 and bs=2 compiled
+#### Root cause 1: Scheduler limits decode batch to 2 (regardless of compiled shapes)
 
-JAX/XLA requires **static shapes** — a separate kernel must be compiled for each batch
-size. The benchmark server precompiled only `bs=[1, 2]` for decode:
+Server logs consistently show `#running-req: 2, #queue-req: 14` even with 32 concurrent
+clients — the scheduler never runs more than 2 requests simultaneously.
 
-```
-[DECODE] PRECOMPILE: 100%|██████████| 2/2  bs=2
-```
+**Opt-1 attempt (❌ no effect)**: added `--precompile-bs-paddings 1 2 4 8 16 32` to
+compile decode kernels for larger batch sizes. Confirmed in server args
+(`precompile_bs_paddings=[1, 2, 4, 8, 16, 32]`), but throughput unchanged at 20.2 tok/s.
+The compiled shapes exist but the **scheduler never fills them**.
 
-Regardless of how many requests are queued, the scheduler can only run **2 at a time**.
-Server logs confirm: `#running-req: 2, #queue-req: 8` even with 8 concurrent clients —
-requests are serialized in pairs, not truly batched together.
+The bottleneck is the scheduler's admission policy, not the compiled shapes. Two candidate
+fixes (Opt-1a and Opt-1b below):
 
-**Fix**: add `--precompile-bs-paddings 1,2,4,8,16,32` at server launch. This compiles
-decode kernels for each batch size during XLA warmup, allowing the scheduler to fill
-batches of up to 32 simultaneous requests.
-**Expected gain: 4–16× throughput improvement.**
+**Opt-1a — `--disable-overlap-schedule`**: With overlap scheduling (default), the
+scheduler interleaves new prefill chunks between decode steps, which limits decode batch
+size to leave room for incoming prefills. Disabling overlap forces separate prefill and
+decode passes, potentially allowing decode to fill larger batches.
+
+**Opt-1b — `--schedule-conservativeness 0`**: At `1.0` (default), the scheduler is
+maximally conservative about admitting new sequences. At `0`, it packs as many sequences
+as the KV cache allows into each decode step.
+
+These are orthogonal — tested in two separate runs to isolate the effect of each.
 
 #### Root cause 2: HBM bandwidth floor
 
@@ -255,35 +261,54 @@ Output: formatted tables to stdout + `/tmp/perf_benchmark_results.json`.
 
 | # | Optimization | Expected gain | Effort | Status |
 |---|-------------|--------------|--------|--------|
-| **Opt-1** | `--precompile-bs-paddings 1,2,4,8,16,32` | **4–16×** decode tok/s | Low — one flag | 🔄 In progress |
+| Opt-1 | `--precompile-bs-paddings 1 2 4 8 16 32` | 4–16× decode tok/s | Low — one flag | ❌ No effect |
+| **Opt-1a** | `--disable-overlap-schedule` | Unlock scheduler batch size | Low — one flag | 🔄 Running |
+| **Opt-1b** | `--schedule-conservativeness 0` | Unlock scheduler batch size | Low — one flag | ⬜ Next |
 | Opt-2 | Enable EP > 1 (`ep_size` in model config + mesh wiring) | Up to 8× MoE throughput | High — code change | ⬜ Planned |
 | Opt-3 | FP8 GMM block size tuning (`tm`, `tn`, `tk`) | ~10–30% per step | Medium | ⬜ Planned |
-| Opt-4 | Prefill/decode overlap scheduling | Latency reduction | Medium | ⬜ Planned |
 
-### Opt-1 detail: precompile-bs-paddings (in progress)
+### Opt-1a — `--disable-overlap-schedule` (running)
 
-Add to server launch:
+With overlap scheduling (default), the scheduler interleaves new prefill chunks between
+ongoing decode steps. This limits decode batch size because the scheduler reserves budget
+for incoming prefills. Disabling overlap makes prefill and decode run in separate passes,
+potentially allowing the decode batch to fill larger compiled shapes.
 
 ```bash
 python3 -m sgl_jax.launch_server \
-  ...
-  --precompile-bs-paddings 1,2,4,8,16,32
+  ... \
+  --precompile-bs-paddings 1 2 4 8 16 32 \
+  --disable-overlap-schedule
 ```
 
-This triggers XLA compilation for decode batch sizes 1, 2, 4, 8, 16, 32 during server
-warmup (~additional 5–10 min). Once compiled, the scheduler can fill any of those
-batch sizes when enough requests are queued. XLA compilation artifacts are written to
-the GCS cache and reused on future restarts.
+**Expected**: if overlap scheduling is the blocker, `#running-req` should grow beyond 2.
 
-**Expected results** (to be measured):
+### Opt-1b — `--schedule-conservativeness 0` (next)
 
-| Concurrency | Projected tok/s | Notes |
-|-------------|----------------|-------|
-| 2 | ~20 | Unchanged (already hitting bs=2) |
-| 4 | ~40 | If bs=4 compiles and scheduler fills it |
-| 8 | ~80 | If bs=8 compiles |
-| 16 | ~120–160 | Compute-bound regime likely |
-| 32 | TBD | HBM/ICI limit |
+At `schedule_conservativeness=1.0` (default), the scheduler is maximally conservative
+about admitting new sequences into the running batch. At `0`, it packs as many as the
+KV cache allows. Tested separately from Opt-1a to isolate each flag's effect.
+
+```bash
+python3 -m sgl_jax.launch_server \
+  ... \
+  --precompile-bs-paddings 1 2 4 8 16 32 \
+  --schedule-conservativeness 0
+```
+
+### Opt-1 result (❌ confirmed no effect, 2026-06-02)
+
+`--precompile-bs-paddings 1 2 4 8 16 32` compiled the shapes correctly but the
+scheduler never filled batches larger than 2. Phase 2 results identical to baseline:
+
+| Concurrency | Decode tok/s | Lat p50 | vs baseline | Efficiency |
+|-------------|-------------|---------|-------------|------------|
+| 1 | 10.6 | 24.1s | 1.00× | 100% |
+| 2 | 20.2 | 25.6s | 1.91× | 96% |
+| 4 | 20.1 | 51.1s | 1.90× | 48% |
+| 8 | 20.2 | 101.2s | 1.91× | 24% |
+| 16 | 19.8 | 204.2s | 1.88× | 12% |
+| 32 | 19.8 | 409.6s | 1.87× | 6% |
 
 ---
 
