@@ -262,39 +262,55 @@ Output: formatted tables to stdout + `/tmp/perf_benchmark_results.json`.
 | # | Optimization | Expected gain | Effort | Status |
 |---|-------------|--------------|--------|--------|
 | Opt-1 | `--precompile-bs-paddings 1 2 4 8 16 32` | 4–16× decode tok/s | Low — one flag | ❌ No effect |
-| **Opt-1a** | `--disable-overlap-schedule` | Unlock scheduler batch size | Low — one flag | 🔄 Running |
-| **Opt-1b** | `--schedule-conservativeness 0` | Unlock scheduler batch size | Low — one flag | ⬜ Next |
+| **Opt-1c** | `--chunked-prefill-size 4096` | 8× more requests/prefill step | Low — one flag | 🔄 Running |
 | Opt-2 | Enable EP > 1 (`ep_size` in model config + mesh wiring) | Up to 8× MoE throughput | High — code change | ⬜ Planned |
 | Opt-3 | FP8 GMM block size tuning (`tm`, `tn`, `tk`) | ~10–30% per step | Medium | ⬜ Planned |
 
-### Opt-1a — `--disable-overlap-schedule` (running)
+### Corrected root cause (from source code analysis)
 
-With overlap scheduling (default), the scheduler interleaves new prefill chunks between
-ongoing decode steps. This limits decode batch size because the scheduler reserves budget
-for incoming prefills. Disabling overlap makes prefill and decode run in separate passes,
-potentially allowing the decode batch to fill larger compiled shapes.
+The `--precompile-bs-paddings` fix compiled larger batch sizes but the scheduler never
+filled them. Code analysis of `schedule_policy.py::PrefillAdder` revealed the actual
+bottleneck: **`--chunked-prefill-size 512` combined with 512-token prompts limits
+admission to exactly 1 request per prefill tick.**
+
+```python
+# PrefillAdder budget per scheduler tick:
+rem_chunk_tokens = chunked_prefill_size  # = 512
+
+# Request 1: extend_input_len=512 → rem_chunk = 512 - 512 = 0
+# Request 2: trunc_len = 0 → AddReqResult.OTHER → break (stops admitting)
+```
+
+Every scheduler tick can prefill at most `chunked_prefill_size / extend_input_len`
+requests. At 512/512 = 1, only one 512-token request is admitted per tick. The
+overlap scheduler interleaves this with decode, resulting in a steady-state of 2
+requests running (the one currently decoding + the one just admitted).
+
+Note: `--disable-overlap-schedule` and `--schedule-conservativeness 0` do NOT fix this
+because they don't change the chunk budget admission logic.
+
+### Opt-1c — `--chunked-prefill-size 4096` (running)
 
 ```bash
 python3 -m sgl_jax.launch_server \
   ... \
-  --precompile-bs-paddings 1 2 4 8 16 32 \
-  --disable-overlap-schedule
+  --chunked-prefill-size 4096 \
+  --precompile-bs-paddings 1 2 4 8 16 32
 ```
 
-**Expected**: if overlap scheduling is the blocker, `#running-req` should grow beyond 2.
+With a 4096-token chunk budget: `4096 / 512 = 8 requests` admitted per prefill tick
+instead of 1. The decode batch should grow to 8+ concurrent requests.
 
-### Opt-1b — `--schedule-conservativeness 0` (next)
+**Expected results** (to fill in after run):
 
-At `schedule_conservativeness=1.0` (default), the scheduler is maximally conservative
-about admitting new sequences into the running batch. At `0`, it packs as many as the
-KV cache allows. Tested separately from Opt-1a to isolate each flag's effect.
-
-```bash
-python3 -m sgl_jax.launch_server \
-  ... \
-  --precompile-bs-paddings 1 2 4 8 16 32 \
-  --schedule-conservativeness 0
-```
+| Concurrency | Projected tok/s | Notes |
+|-------------|----------------|-------|
+| 1 | ~10.6 | Unchanged |
+| 2 | ~20 | Unchanged |
+| 4 | ~40 | If 4 admitted per tick |
+| 8 | ~80 | Chunk budget allows 8/tick |
+| 16 | ~120–160 | Compute-bound regime likely |
+| 32 | TBD | |
 
 ### Opt-1 result (❌ confirmed no effect, 2026-06-02)
 
