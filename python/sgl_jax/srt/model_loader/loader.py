@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import glob
+import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -9,6 +10,7 @@ from typing import Any
 
 import huggingface_hub
 import jax
+import orbax.checkpoint as ocp
 from flax import nnx
 from safetensors import safe_open
 
@@ -225,6 +227,68 @@ class JAXModelLoader(DefaultModelLoader):
 
         return model_class
 
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    def _checkpoint_path(self, model_config: ModelConfig) -> str | None:
+        """Return GCS checkpoint path for this model/tp-size, or None if disabled.
+
+        Auto-derives from model_path when SGLANG_CHECKPOINT_DIR is set.
+        Format: {SGLANG_CHECKPOINT_DIR}/tp{tp_size}/{model_hash}/
+        """
+        checkpoint_dir = os.environ.get("SGLANG_CHECKPOINT_DIR", "")
+        if not checkpoint_dir:
+            return None
+        model_path = model_config.model_path
+        model_hash = hashlib.md5(model_path.encode()).hexdigest()[:8]
+        tp_size = self.mesh.size
+        dtype = str(model_config.dtype)
+        return f"{checkpoint_dir.rstrip('/')}/tp{tp_size}_{dtype}/{model_hash}/"
+
+    def _checkpoint_exists(self, path: str) -> bool:
+        """Check whether a saved checkpoint exists at `path`."""
+        try:
+            if path.startswith("gs://"):
+                import subprocess
+                result = subprocess.run(
+                    ["gsutil", "-q", "stat", f"{path}orbax_checkpoint_manifest"],
+                    capture_output=True,
+                )
+                return result.returncode == 0
+            else:
+                import pathlib
+                return (pathlib.Path(path) / "orbax_checkpoint_manifest").exists()
+        except Exception:
+            return False
+
+    def _save_checkpoint(self, model: nnx.Module, path: str) -> None:
+        """Save model state as sharded Orbax checkpoint to `path`.
+
+        Each JAX process writes only its local device shards concurrently.
+        Expected size: same as source weights (~962 GB), split across 32 files.
+        Expected time: ~5 min at NFS/GCS speeds.
+        """
+        logger.info("Saving checkpoint to %s (this takes ~5 min)...", path)
+        checkpointer = ocp.PyTreeCheckpointer()
+        state = nnx.state(model)
+        checkpointer.save(path, state)
+        logger.info("Checkpoint saved successfully to %s", path)
+
+    def _load_checkpoint(self, model: nnx.Module, path: str) -> None:
+        """Restore model state from Orbax checkpoint at `path`.
+
+        Each JAX process reads only its local device shards (~30 GB per TC).
+        Skips all CPU conversion (scale reshape, QKV fusion, etc.).
+        Expected time: ~5 min (vs ~40 min for full weight loading).
+        """
+        logger.info("Loading from checkpoint %s (~5 min)...", path)
+        checkpointer = ocp.PyTreeCheckpointer()
+        abstract_state = nnx.state(model)
+        state = checkpointer.restore(path, item=abstract_state)
+        nnx.update(model, state)
+        logger.info("Checkpoint loaded successfully from %s", path)
+
+    # ── Model initialization ──────────────────────────────────────────────────
+
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
         if not isinstance(model_config, ModelConfig):
             config = model_config
@@ -260,7 +324,20 @@ class JAXModelLoader(DefaultModelLoader):
                 logger.info("Dynamic quantization detected. Skipping structure change in loader.")
         else:
             logger.info("No quantization config found. Skipping quantization.")
-        model.load_weights(model_config)
+
+        checkpoint_path = self._checkpoint_path(model_config)
+
+        if checkpoint_path and self._checkpoint_exists(checkpoint_path):
+            # Fast path: load pre-converted sharded checkpoint (~5 min)
+            self._load_checkpoint(model, checkpoint_path)
+        else:
+            # Slow path: load from raw weights (~40 min), then save checkpoint
+            model.load_weights(model_config)
+            if checkpoint_path:
+                try:
+                    self._save_checkpoint(model, checkpoint_path)
+                except Exception as e:
+                    logger.warning("Checkpoint save failed (non-fatal): %s", e)
 
         print_parameter_shardings(model)
 
