@@ -245,18 +245,21 @@ class JAXModelLoader(DefaultModelLoader):
         return f"{checkpoint_dir.rstrip('/')}/tp{tp_size}_{dtype}/{model_hash}/"
 
     def _checkpoint_exists(self, path: str) -> bool:
-        """Check whether a saved checkpoint exists at `path`."""
+        """Check whether a saved checkpoint exists at `path`.
+
+        Orbax writes `commit_success.txt` as the final step of a successful save.
+        """
         try:
             if path.startswith("gs://"):
                 import subprocess
                 result = subprocess.run(
-                    ["gsutil", "-q", "stat", f"{path}orbax_checkpoint_manifest"],
+                    ["gsutil", "-q", "stat", f"{path}commit_success.txt"],
                     capture_output=True,
                 )
                 return result.returncode == 0
             else:
                 import pathlib
-                return (pathlib.Path(path) / "orbax_checkpoint_manifest").exists()
+                return (pathlib.Path(path) / "commit_success.txt").exists()
         except Exception:
             return False
 
