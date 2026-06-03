@@ -380,9 +380,20 @@ class JAXModelLoader(DefaultModelLoader):
         u8_abstract = jax.tree_util.tree_map(_to_u8_sds, abstract_state)
         state_u8 = checkpointer.restore(path, item=u8_abstract)
         # Reinterpret uint8 tensors back to their original FP8 dtype.
+        # Use numpy view on CPU to avoid allocating extra HBM for the bitcast.
+        import numpy as np
         def _restore_fp8(restored, orig_sds):
             if hasattr(orig_sds, "dtype") and str(orig_sds.dtype) in self._FP8_DTYPES:
-                return jax.lax.bitcast_convert_type(restored, orig_sds.dtype)
+                # Pull shard to CPU, reinterpret bytes, push back with correct dtype.
+                target_dtype = orig_sds.dtype
+                np_arr = np.array(jax.device_get(restored)).view(np.uint8)
+                # ml_dtypes float8 dtype for numpy view
+                import ml_dtypes
+                fp8_np_dtype = getattr(ml_dtypes, str(target_dtype).replace(".", "_"), None)
+                if fp8_np_dtype is not None:
+                    np_fp8 = np_arr.view(fp8_np_dtype)
+                    return jax.device_put(np_fp8, restored.sharding)
+                return jax.lax.bitcast_convert_type(restored, target_dtype)
             return restored
         state = jax.tree_util.tree_map(_restore_fp8, state_u8, abstract_state)
         nnx.update(model, state)
