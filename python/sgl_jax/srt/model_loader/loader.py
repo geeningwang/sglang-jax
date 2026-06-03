@@ -2,8 +2,10 @@ import copy
 import dataclasses
 import glob
 import hashlib
+import io
 import logging
 import os
+import pickle
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from typing import Any
@@ -263,29 +265,77 @@ class JAXModelLoader(DefaultModelLoader):
         except Exception:
             return False
 
+    def _abstract_state_path(self, checkpoint_path: str) -> str:
+        """Path for the pickled abstract state structure (small metadata file)."""
+        return checkpoint_path.rstrip("/") + "_abstract_state.pkl"
+
+    def _save_abstract_state(self, state: Any, path: str) -> None:
+        """Pickle the abstract state (shapes/dtypes only, no values) to GCS or local."""
+        abstract = jax.tree_util.tree_map(
+            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state
+        )
+        buf = pickle.dumps(abstract)
+        if path.startswith("gs://"):
+            import subprocess
+            proc = subprocess.run(["gsutil", "cp", "-", path], input=buf, capture_output=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"gsutil cp failed: {proc.stderr.decode()}")
+        else:
+            import pathlib
+            pathlib.Path(path).write_bytes(buf)
+
+    def _load_abstract_state(self, path: str) -> Any:
+        """Load the pickled abstract state from GCS or local."""
+        if path.startswith("gs://"):
+            import subprocess
+            proc = subprocess.run(["gsutil", "cp", path, "-"], capture_output=True)
+            if proc.returncode != 0:
+                raise FileNotFoundError(f"Abstract state not found at {path}")
+            return pickle.loads(proc.stdout)
+        else:
+            import pathlib
+            return pickle.loads(pathlib.Path(path).read_bytes())
+
     def _save_checkpoint(self, model: nnx.Module, path: str) -> None:
         """Save model state as sharded Orbax checkpoint to `path`.
 
+        Also saves abstract state structure as a small pickle so _load_checkpoint
+        can restore with the exact same pytree structure regardless of whether
+        load_weights has modified the model structure (e.g. FP8 linear params).
+
         Each JAX process writes only its local device shards concurrently.
-        Expected size: same as source weights (~962 GB), split across 32 files.
         Expected time: ~5 min at NFS/GCS speeds.
         """
         logger.info("Saving checkpoint to %s (this takes ~5 min)...", path)
         checkpointer = ocp.PyTreeCheckpointer()
         state = nnx.state(model)
+        # Save abstract state structure first (small, fast)
+        try:
+            self._save_abstract_state(state, self._abstract_state_path(path))
+        except Exception as e:
+            logger.warning("Could not save abstract state (non-fatal): %s", e)
         checkpointer.save(path, state)
         logger.info("Checkpoint saved successfully to %s", path)
 
     def _load_checkpoint(self, model: nnx.Module, path: str) -> None:
         """Restore model state from Orbax checkpoint at `path`.
 
+        Uses the saved abstract state structure to match the checkpoint's exact
+        pytree layout (including FP8 weight_q/weight_scale params created by
+        load_weights). Falls back to model's current state if not found.
+
         Each JAX process reads only its local device shards (~30 GB per TC).
-        Skips all CPU conversion (scale reshape, QKV fusion, etc.).
         Expected time: ~5 min (vs ~40 min for full weight loading).
         """
         logger.info("Loading from checkpoint %s (~5 min)...", path)
         checkpointer = ocp.PyTreeCheckpointer()
-        abstract_state = nnx.state(model)
+        # Load saved abstract state (exact structure from checkpoint save)
+        try:
+            abstract_state = self._load_abstract_state(self._abstract_state_path(path))
+            logger.info("Restored abstract state structure from checkpoint metadata.")
+        except Exception as e:
+            logger.warning("Abstract state not found, using model state (%s)", e)
+            abstract_state = nnx.state(model)
         state = checkpointer.restore(path, item=abstract_state)
         nnx.update(model, state)
         logger.info("Checkpoint loaded successfully from %s", path)
