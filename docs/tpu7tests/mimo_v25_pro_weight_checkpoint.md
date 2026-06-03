@@ -1,6 +1,23 @@
 # MiMo-V2.5-Pro Weight Checkpoint Conversion
 
-## Status: In Progress
+## Status: Blocked — JAX 0.8.1 cannot create float8 arrays on TPU via Orbax
+
+**Root cause (confirmed 2026-06-03)**: JAX 0.8.1 on TPU cannot create `float8_e4m3fn`
+JAX arrays via `jax.make_array_from_single_device_arrays` (the internal path Orbax uses
+for array deserialization). Orbax leaves FP8 leaves as `ShapeDtypeStruct` instead of
+actual arrays. Since MiMo-V2.5-Pro is **fully FP8-quantized** (all weights are
+float8_e4m3fn), 100% of checkpoint tensors fail to restore.
+
+**Tested approaches (all failed)**:
+- Orbax 0.11.28: FP8 arrays → ShapeDtypeStruct ✗
+- Orbax 0.12.0: same behavior ✗
+- uint8 workaround: saves/restores correctly, but in-device bitcast OOMs (no HBM headroom)
+- CPU bitcast via numpy: `jax.device_get()` fails for non-addressable shards ✗
+- Per-shard `addressable_shards`: `make_array_from_single_device_arrays` OOMs ✗
+
+**Path forward**: Requires JAX upgrade to a version that supports FP8 array creation
+on TPU via the Orbax restore path. The NFS RAM-backed loading (~42 min) remains the
+current fastest option.
 
 Convert HuggingFace FP8 safetensors → sharded Orbax/zarr checkpoint so each
 TensorCore loads only its 30 GB TP shard instead of the full 240 GB node shard.

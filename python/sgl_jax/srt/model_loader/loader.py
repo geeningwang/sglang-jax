@@ -352,6 +352,10 @@ class JAXModelLoader(DefaultModelLoader):
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
             abstract_state = nnx.state(model)
         state = checkpointer.restore(path, item=abstract_state)
+        # NOTE: JAX 0.8.1 on TPU cannot create float8_e4m3fn arrays via Orbax restore.
+        # The leaves remain as ShapeDtypeStruct objects. This model is fully FP8-quantized
+        # so ALL weights fail to restore. The checkpoint approach is blocked until JAX
+        # supports FP8 array creation on TPU. See mimo_v25_pro_weight_checkpoint.md.
         nnx.update(model, state)
         self._patch_narrow_blockwise(model)
         logger.info("Checkpoint loaded successfully from %s", path)
