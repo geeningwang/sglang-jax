@@ -8,10 +8,9 @@
 
 ## Completed Work
 
-### 1. Smoke test — 4-node inference ✅
+### 1. Smoke test — 4-node inference (gcsfuse) ✅
 
-First successful end-to-end MiMo-V2.5-Pro inference on GKE TPU v7x (2x2x4,
-tp-size=32). Key results from `scripts/mimo_v25_pro_demo_job.yaml`:
+First successful end-to-end MiMo-V2.5-Pro inference on GKE TPU v7x (2x2x4, tp-size=32).
 
 | Metric | Value |
 |--------|-------|
@@ -20,160 +19,155 @@ tp-size=32). Key results from `scripts/mimo_v25_pro_demo_job.yaml`:
 | Decode throughput | 10.81 tok/s |
 | Total startup | ~2h26m |
 
-See: [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) Test 4.
+Script: `scripts/mimo_v25_pro_demo_job.yaml` | Doc: [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) Test 4.
 
 ---
 
-### 2. Performance benchmark ✅
+### 2. Smoke test — 4-node inference (NFS RAM) ✅
 
-Full sweep across concurrent requests, prefill lengths, and output lengths.
-Results in [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md).
+Same inference via 3 × n2-highmem-48 RAM-backed NFS servers (jingnw-nfs-weights-1/2/3).
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| TP | 32 | Only viable config (TP=16 has no KV cache headroom) |
-| EP | 1 | Fixed by model config |
-| Peak decode throughput | 20.2 tok/s | Saturates at concurrency=2 |
-| Peak prefill throughput | 3,850 tok/s | At 2048-token inputs |
-| Scheduler ceiling | `#running-req: 2` | Root cause under investigation |
+| Metric | Value |
+|--------|-------|
+| MoE loading rate | ~5–7 s/group (vs gcsfuse ~14–17) |
+| Total MoE load time | **~42 min** (vs gcsfuse ~2h25m) |
+| XLA warmup | ~55s (warm cache) |
+| Decode throughput | 10.80 tok/s |
+| Total startup | ~57 min |
 
-**Throughput ceiling root cause**: scheduler always runs 2 requests at a time
-despite higher concurrency. Attempts to fix via `--precompile-bs-paddings`,
-`--disable-overlap-schedule`, and `--chunked-prefill-size` all had no effect.
-Root cause is in the scheduler's batch admission logic (Opt-1d pending).
+Script: `scripts/mimo_v25_pro_nfs_demo_job.yaml` | Container: `jax0.9.0-rev1`
 
----
-
-### 3. 2-node feasibility test ✅
-
-Confirmed: MiMo-V2.5-Pro **cannot run on 2 TPU v7x nodes** (tp-size=16).
-
-- Weights consume ~60 GB/TC → no HBM left for KV cache after XLA scratch
-- KV cache profiler OOMs: `RuntimeError: Not enough memory`
-- See [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md)
-
----
-
-### 4. RAM-backed NFS weight servers ✅
-
-Three `n2-highmem-48` VMs with 962 GB of weights in RAM-backed tmpfs, served
-via NFS. Weight loading 2–3× faster than gcsfuse.
-
-| VM | Internal IP | Files | Size |
-|----|------------|-------|------|
+NFS servers:
+| VM | Internal IP | Files | RAM used |
+|----|------------|-------|----------|
 | `jingnw-nfs-weights-1` | 10.128.0.92 | 12 safetensors | 322 GB |
 | `jingnw-nfs-weights-2` | 10.128.15.231 | 12 safetensors | 350 GB |
 | `jingnw-nfs-weights-3` | 10.128.0.45 | 10 safetensors | 292 GB |
 
-NFS demo job: `scripts/mimo_v25_pro_nfs_demo_job.yaml`  
-MoE loading rate via NFS: **~5–7 s/group** vs gcsfuse ~14–17 s/group.  
-Total MoE load time: **~42 min** vs gcsfuse ~2h25m.
+---
+
+### 3. Performance benchmark ✅
+
+Full sweep: concurrent requests, prefill lengths, output lengths.
+Full results: [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md).
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| TP | 32 | Only viable config — TP=16 has no KV cache headroom |
+| EP | 1 | Fixed by model config (`ep_size=1`) |
+| Peak decode throughput | **20.2 tok/s** | Saturates at concurrency=2 |
+| Peak prefill throughput | **3,850 tok/s** | At 2048-token inputs |
+| Scheduler ceiling | `#running-req: 2` | Root cause: structural (see Opt-1d) |
+
+Flags tested (none broke the ceiling): `--precompile-bs-paddings`, `--disable-overlap-schedule`, `--chunked-prefill-size 4096`.
 
 ---
 
-### 5. Documentation ✅
+### 4. 2-node feasibility test ✅
 
-| Doc | Contents |
-|-----|----------|
-| [gke_tpu7x_env_setup.md](gke_tpu7x_env_setup.md) | DWS node pool setup, resubmit workflow, known pitfalls |
-| [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) | HBM/RAM/GCS allocation for 4-node and 2-node |
-| [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) | Test 1–5 runbooks |
-| [mimo_v25_pro_inference_pipeline.md](mimo_v25_pro_inference_pipeline.md) | Module-by-module pipeline walkthrough |
-| [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) | Benchmark plan + full results |
-| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint analysis, plan, implementation |
-| [mimo_v25_pro_progress.md](mimo_v25_pro_progress.md) | This document |
+**Confirmed infeasible**: TP=16 weights fill ~60 GB/TC leaving no HBM for KV cache.
+`RuntimeError: Not enough memory` during KV cache profiling.
+See: [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md)
 
 ---
 
-## In Progress
+### 5. Orbax checkpoint — save/load investigation ✅ (blocked)
 
-### 6. Orbax checkpoint save/load 🔄
+**Goal**: Replace ~42 min NFS loading with ~90s GCS checkpoint restore.
 
-**Goal**: Replace ~42 min weight loading with ~90s checkpoint restore from GCS.
+**Checkpoint mechanics work**: Orbax saves at ~4.5 GiB/s, restores at ~5.5 GiB/s in 88–94s. The checkpoint IO is fast and correct.
 
-**Approach**: After first full load, save sharded Orbax checkpoint to GCS. Each
-TC saves/loads only its 30 GB shard (vs 240 GB full node read). 8× less I/O
-per node.
+**Blocked by**: JAX's libtpu (both 0.8.1 and 0.9.0) cannot create `float8_e4m3fn`
+JAX arrays via `make_array_from_single_device_arrays` on TPU. Since MiMo-V2.5-Pro
+is **100% FP8-quantized**, every tensor fails to restore — all 1038 arrays remain as
+`ShapeDtypeStruct` placeholders. The failure is in libtpu (closed source), not
+in Orbax or JAX Python.
 
-**Checkpoint location**:
+**Approaches exhausted**:
+
+| Attempt | Outcome |
+|---------|---------|
+| Orbax 0.11.28, float8 direct | ShapeDtypeStruct (FP8 restore fails) |
+| Orbax 0.12.0, float8 direct | ShapeDtypeStruct (same) |
+| uint8 workaround (save as uint8, restore+bitcast) | HBM OOM during bitcast (only 14 MB free) |
+| Per-shard addressable_shards bitcast | HBM OOM (still needs temp buffer) |
+| Option B: hybrid (non-FP8 from ckpt, FP8 from NFS) | N/A — model is 100% FP8 |
+| JAX 0.9.0 container (`jax0.9.0-rev1`) | ShapeDtypeStruct (libtpu still blocks FP8) |
+
+**Path forward**: Requires a container where libtpu natively supports float8 buffer
+allocation. No `jax0.10.x-rev1` container exists yet in the public registry.
+The JAX Python changelog (0.9.x, 0.10.x) contains no float8 TPU mentions.
+
+**Checkpoint location** (saved, not yet usable):
 ```
 gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/
   95dc2640/
-    tp32_bfloat16/           ← Orbax sharded checkpoint (~962 GB, 32 shards)
-    tp32_bfloat16_abstract_state.pkl  ← pytree structure metadata (~KB)
+    tp32_bfloat16/           ← Orbax checkpoint with FP8 arrays
+    tp32_bfloat16_abstract_state.pkl
 ```
 
-**Status**: Checkpoint saved. Restore loads in **88–94 seconds at ~5.5 GiB/s**
-per host. Currently debugging a post-restore issue:
+Implementation: `python/sgl_jax/srt/model_loader/loader.py`
 
-| Attempt | Error | Fix |
-|---------|-------|-----|
-| Restore v1 | `tree structures do not match` (weight vs weight_q) | Save abstract_state.pkl alongside checkpoint |
-| Restore v2 | `Block-wise kernel: out_dim=128` | Set `allow_narrow_n_blockwise=True` post-restore |
-| Restore v3 (in progress) | `ShapeDtypeStruct is not valid JAX type` | Revert pre-restore flag; patch layers post-restore |
+---
 
-Current fix: `_patch_narrow_blockwise()` — after `nnx.update(model, state)`,
-iterate all FP8 linear layers and set `allow_narrow_n_blockwise=True`. This
-replicates what `load_weights()` did at checkpoint save time.
+### 6. Documentation ✅
 
-**Latest commit**: `9c400b1` — running now.
-
-**Implementation files**:
-- `python/sgl_jax/srt/model_loader/loader.py` — checkpoint save/load logic
-- `scripts/mimo_v25_pro_nfs_demo_job.yaml` — sets `SGLANG_CHECKPOINT_DIR`
+| Doc | Contents |
+|-----|----------|
+| [gke_tpu7x_env_setup.md](gke_tpu7x_env_setup.md) | DWS node pool setup, resubmit workflow, pitfalls |
+| [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) | HBM/RAM/GCS for 4-node and 2-node |
+| [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) | Test 1–6 runbooks |
+| [mimo_v25_pro_inference_pipeline.md](mimo_v25_pro_inference_pipeline.md) | Module-by-module pipeline |
+| [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) | Benchmark results + optimization roadmap |
+| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint analysis (blocked — see above) |
+| [mimo_v25_pro_progress.md](mimo_v25_pro_progress.md) | This document |
 
 ---
 
 ## Pending / Planned
 
-### 7. Checkpoint restore validation ⬜
+### 7. Scheduler throughput (Opt-1d) ⬜
 
-Once restore v3 succeeds, measure:
-- Total startup time with checkpoint (target: <10 min vs ~42 min NFS load)
-- Inference quality (same output as non-checkpoint run)
-- Record in [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md)
+The `#running-req: 2` ceiling is structural — all flag-level fixes failed. Next:
+add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to trace
+`batch_is_full` state and `add_one_req` return codes per queued request.
 
-### 8. Scheduler throughput investigation (Opt-1d) ⬜
+### 8. EP > 1 (Opt-2) ⬜
 
-The `#running-req: 2` ceiling has resisted all flag-level fixes. Next step:
-add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to
-trace `batch_is_full` state and `add_one_req` return codes per request.
+Change `ep_size > 1` in model config + update MoE sub-mesh wiring in `weight_utils.py`.
+Expected: proportional MoE throughput gain (up to 8× with EP=8).
 
-### 9. EP > 1 (Opt-2) ⬜
+### 9. FP8 checkpoint unblock ⬜
 
-Enable expert parallelism by setting `ep_size > 1` in the model config and
-updating the MoE sub-mesh wiring in `weight_utils.py`. Expected: proportional
-MoE throughput improvement (up to 8× with EP=8).
+Wait for a TPU container image where libtpu supports float8 device buffer allocation
+(e.g., `jax0.10.x-rev1` when available), then retry the checkpoint restore.
 
 ### 10. FP8 GMM kernel tuning (Opt-3) ⬜
 
-Block size sweep for the EPMoE GEMM (`tm`, `tn`, `tk`) to improve per-step
-efficiency. Currently uses default block sizes logged as
-`[GMM kernel] using default block sizes`.
+Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency.
 
 ---
 
-## Key Infrastructure State
+## Key Infrastructure State (as of 2026-06-03)
 
 | Resource | Status | Notes |
 |----------|--------|-------|
-| `jingnw-nfs-weights-1/2/3` | RUNNING | 3 × n2-highmem-48, ~$15–18/hr total |
-| `mimo-v25-pro-nfs-demo` job | RUNNING | Checkpoint restore v3 in progress |
-| GCS checkpoint | SAVED | `95dc2640/tp32_bfloat16/` |
-| XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` |
+| `jingnw-nfs-weights-1/2/3` | **RUNNING** | 3 × n2-highmem-48, ~$15–18/hr — weights in RAM |
+| TPU DWS nodes | ✅ 0 nodes | Pool empty, no active job |
+| GCS checkpoint | SAVED (unusable) | `95dc2640/tp32_bfloat16/` — blocked by libtpu FP8 issue |
+| XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` (tp-size=32) |
+| Container image (current) | `jax0.9.0-rev1` | Updated from jax0.8.1-rev1 (still FP8-blocked) |
 
 ---
 
-## Related Commits (recent)
+## Recent Key Commits
 
 | Commit | Description |
 |--------|-------------|
+| `90ba338` | feat: upgrade container to jax0.9.0-rev1 (FP8 still blocked) |
+| `ed35748` | docs: JAX 0.8.1+0.9.0 FP8 restore confirmed blocked at libtpu |
+| `f00a4c0` | feat: Option C — Orbax 0.12, revert uint8 (also blocked) |
 | `9c400b1` | fix(checkpoint): patch allow_narrow_n_blockwise post-restore |
-| `f2b1262` | fix(checkpoint): set flag before apply_linear_quantization (reverted) |
-| `ed43d80` | fix(checkpoint): set allow_narrow_n_blockwise=True on restore path |
-| `b091c36` | fix(checkpoint): save abstract state structure alongside checkpoint |
-| `fe13a9a` | fix(checkpoint): clean path — dtype.__name__ not str() |
-| `4ec6db6` | fix(checkpoint): check commit_success.txt |
-| `3004a85` | feat(tpu7x): orbax checkpoint save/load implementation |
-| `aa4e34d` | feat(tpu7x): timing instrumentation + new question |
-| `4458f86` | feat(tpu7x): NFS weight loading demo job |
+| `7519803` | fix(checkpoint): save FP8 as uint8 for Orbax (HBM OOM on restore) |
+| `3004a85` | feat: orbax checkpoint save/load initial implementation |
+| `4458f86` | feat: NFS weight loading demo job |

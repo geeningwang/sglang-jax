@@ -8,11 +8,12 @@ readiness tests. Covers discovered pitfalls and the workarounds required.
 All active tests use **DWS (Dynamic Workload Scheduler)** with `jingnw-dws-tpu7-16ch`
 (4-node 2x2x4) or `jingnw-dws-tpu7-8ch` (2-node 2x2x2).
 
-| Test | Script | Node pool | Provisioning |
-|------|--------|-----------|--------------|
-| MiMo-V2.5-Pro smoke (4-node) | `scripts/mimo_v25_pro_demo_job.yaml` | `jingnw-dws-tpu7-16ch` | DWS |
-| MiMo-V2.5-Pro benchmark | `scripts/mimo_v25_pro_bench_job.yaml` | `jingnw-dws-tpu7-16ch` | DWS |
-| MiMo-V2.5-Pro smoke (2-node) | `scripts/mimo_v25_pro_2node_demo_job.yaml` | `jingnw-dws-tpu7-8ch` | DWS |
+| Test | Script | Node pool | Container | Provisioning |
+|------|--------|-----------|-----------|--------------|
+| MiMo-V2.5-Pro smoke (gcsfuse) | `scripts/mimo_v25_pro_demo_job.yaml` | `jingnw-dws-tpu7-16ch` | `jax0.8.1-rev1` | DWS |
+| MiMo-V2.5-Pro smoke (NFS RAM) | `scripts/mimo_v25_pro_nfs_demo_job.yaml` | `jingnw-dws-tpu7-16ch` | `jax0.9.0-rev1` | DWS |
+| MiMo-V2.5-Pro benchmark | `scripts/mimo_v25_pro_bench_job.yaml` | `jingnw-dws-tpu7-16ch` | `jax0.9.0-rev1` | DWS |
+| MiMo-V2.5-Pro smoke (2-node) | `scripts/mimo_v25_pro_2node_demo_job.yaml` | `jingnw-dws-tpu7-8ch` | `jax0.8.1-rev1` | DWS |
 
 **Existing DWS node pools:**
 
@@ -261,3 +262,4 @@ GCS, RAM, HBM, and disk allocation details.
 | `ProvisioningRequest FAILED: NodepoolSizeReached` immediately after resubmit | Old nodes from previous run still allocated; pool at max capacity | Wait for nodes to drain (10–20 min) then delete PR and reapply (see Resubmitting section) |
 | PR shows `FAILED=True` but was just created | Old FAILED PR was not deleted before `kubectl apply` — `apply` leaves existing resources unchanged | Always `kubectl delete provisioningrequest PR_NAME` before reapplying |
 | `--precompile-bs-paddings` argument error: `invalid int value: '1,2,4,8,16,32'` | Flag expects space-separated integers, not comma-separated | Use `--precompile-bs-paddings 1 2 4 8 16 32` |
+| Orbax checkpoint restore: `ShapeDtypeStruct is not a valid JAX type` for FP8 arrays | libtpu in `jax0.8.1-rev1` and `jax0.9.0-rev1` cannot create `float8_e4m3fn` device buffers via `make_array_from_single_device_arrays` | Blocked — requires newer libtpu; use NFS loading as workaround |

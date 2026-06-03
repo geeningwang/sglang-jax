@@ -9,15 +9,22 @@ actual arrays. Since MiMo-V2.5-Pro is **fully FP8-quantized** (all weights are
 float8_e4m3fn), 100% of checkpoint tensors fail to restore.
 
 **Tested approaches (all failed)**:
-- Orbax 0.11.28: FP8 arrays → ShapeDtypeStruct ✗
-- Orbax 0.12.0: same behavior ✗
-- uint8 workaround: saves/restores correctly, but in-device bitcast OOMs (no HBM headroom)
+- Orbax 0.11.28 + JAX 0.8.1: FP8 arrays → ShapeDtypeStruct ✗
+- Orbax 0.12.0 + JAX 0.8.1: same behavior ✗
+- uint8 workaround: saves/restores correctly, but in-device bitcast OOMs (only ~14 MB HBM free)
 - CPU bitcast via numpy: `jax.device_get()` fails for non-addressable shards ✗
 - Per-shard `addressable_shards`: `make_array_from_single_device_arrays` OOMs ✗
+- Option B (hybrid): N/A — model is 100% FP8, no non-FP8 tensors to restore
+- Orbax 0.12.0 + JAX 0.9.0 (`jax0.9.0-rev1` container): same ShapeDtypeStruct ✗
 
-**Path forward**: Requires JAX upgrade to a version that supports FP8 array creation
-on TPU via the Orbax restore path. The NFS RAM-backed loading (~42 min) remains the
-current fastest option.
+**Confirmed**: The failure is in **libtpu** (closed source), not in Orbax or JAX Python.
+JAX changelog for 0.9.x and 0.10.x contains no float8 TPU improvements.
+Both `jax0.8.1-rev1` and `jax0.9.0-rev1` containers ship libtpu versions that cannot
+allocate `float8_e4m3fn` device buffers via `make_array_from_single_device_arrays`.
+
+**Path forward**: Requires a container image where libtpu adds float8 buffer allocation
+support (e.g., `jax0.10.x-rev1` when available). The NFS RAM-backed loading (~42 min)
+remains the current fastest option.
 
 Convert HuggingFace FP8 safetensors → sharded Orbax/zarr checkpoint so each
 TensorCore loads only its 30 GB TP shard instead of the full 240 GB node shard.

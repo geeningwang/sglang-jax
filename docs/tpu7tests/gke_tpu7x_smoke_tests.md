@@ -258,6 +258,51 @@ Mixture-of-experts (MoE) is a neural network architecture ...
 
 ---
 
+## Test 6 — MiMo-V2.5-Pro inference demo via NFS RAM (`jingnw-dws-tpu7-16ch`)
+
+**What it does:** Same as Test 4 but reads weights from 3 × n2-highmem-48 RAM-backed
+NFS servers instead of GCS/gcsfuse. Weight loading is **2.2–3× faster** (~42 min vs
+~2h25m). Uses `jax0.9.0-rev1` container.
+
+**Prerequisites**: NFS VMs (`jingnw-nfs-weights-1/2/3`) must be running with weights
+in tmpfs. See [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md)
+for the NFS setup procedure.
+
+**Script:** `scripts/mimo_v25_pro_nfs_demo_job.yaml`
+
+**Key parameters:**
+- Node pool: `jingnw-dws-tpu7-16ch`, Container: `jax0.9.0-rev1`
+- NFS servers: `10.128.0.92`, `10.128.15.231`, `10.128.0.45` (all `/mnt/weights`)
+- `--tp-size 32`, `--nnodes 4`, `--mem-fraction-static 0.75`
+- `SGLANG_CHECKPOINT_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint`
+
+**Loading timing:**
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| Install + NFS mount | ~5 min | |
+| Regular weights | ~3 min | |
+| MoE weights (NFS RAM) | **~42 min** | ~5–7 s/group vs gcsfuse ~14–17 |
+| KV cache profiling + XLA warmup | ~2 min | Warm cache |
+| **Total** | **~52 min** | vs gcsfuse ~2h30m |
+
+### Run the demo
+
+```bash
+kubectl apply -f scripts/mimo_v25_pro_nfs_demo_job.yaml
+kubectl logs -f -l job-name=mimo-v25-pro-nfs-demo --prefix
+kubectl delete -f scripts/mimo_v25_pro_nfs_demo_job.yaml
+```
+
+**Expected output:**
+```
+[rank0] PHASE: server healthy after Xs  [total elapsed: Xs]
+[tokens: prompt=276, completion=512]
+=== Demo complete ===
+```
+
+---
+
 ## Cluster reference
 
 | Pool | Machine | Topology | Provisioning | Max nodes |
