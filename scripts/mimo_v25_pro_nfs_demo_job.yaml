@@ -18,7 +18,7 @@ template:
       effect: NoSchedule
     containers:
     - name: mimo-v25-pro-nfs-demo
-      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
       resources:
         limits:
           cpu: "220"
@@ -97,7 +97,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: mimo-v25-pro-nfs-demo
-        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
