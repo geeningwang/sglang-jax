@@ -316,24 +316,11 @@ class JAXModelLoader(DefaultModelLoader):
             import pathlib
             return pickle.loads(pathlib.Path(path).read_bytes())
 
-    # FP8 dtypes that Orbax 0.11 cannot restore directly (stores/restores as uint8).
-    _FP8_DTYPES = frozenset({"float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"})
-
-    @staticmethod
-    def _is_fp8(x) -> bool:
-        return hasattr(x, "dtype") and str(x.dtype) in JAXModelLoader._FP8_DTYPES
-
-    @staticmethod
-    def _fp8_to_u8(x):
-        """Reinterpret FP8 array as uint8 (same bytes, Orbax-compatible dtype)."""
-        return jax.lax.bitcast_convert_type(x, jax.numpy.uint8) if JAXModelLoader._is_fp8(x) else x
-
     def _save_checkpoint(self, model: nnx.Module, path: str) -> None:
         """Save model state as sharded Orbax checkpoint to `path`.
 
-        FP8 arrays are saved as uint8 (same bytes) because Orbax 0.11 cannot
-        create float8_e4m3fn JAX arrays during restore. The abstract state pickle
-        records the ORIGINAL (FP8) dtype so _load_checkpoint can convert back.
+        Saves FP8 arrays directly (requires Orbax 0.12+ for restore).
+        The abstract state pickle records dtype+sharding for restore.
 
         Each JAX process writes only its local device shards concurrently.
         Expected time: ~5 min at NFS/GCS speeds.
@@ -341,68 +328,30 @@ class JAXModelLoader(DefaultModelLoader):
         logger.info("Saving checkpoint to %s (this takes ~5 min)...", path)
         checkpointer = ocp.PyTreeCheckpointer()
         state = nnx.state(model)
-        # Save abstract state with original dtypes (including FP8) for restore.
         try:
             self._save_abstract_state(state, self._abstract_state_path(path))
         except Exception as e:
             logger.warning("Could not save abstract state (non-fatal): %s", e)
-        # Cast FP8 → uint8 before handing to Orbax.
-        state_saveable = jax.tree_util.tree_map(self._fp8_to_u8, state)
-        checkpointer.save(path, state_saveable)
+        checkpointer.save(path, state)
         logger.info("Checkpoint saved successfully to %s", path)
 
     def _load_checkpoint(self, model: nnx.Module, path: str) -> None:
         """Restore model state from Orbax checkpoint at `path`.
 
-        Orbax 0.11 restores uint8 shards (saved from FP8 arrays). We reinterpret
-        them back to the original FP8 dtype using the abstract_state.pkl.
+        Requires Orbax 0.12+ for native FP8 (float8_e4m3fn) array restore.
 
         Each JAX process reads only its local device shards (~30 GB per TC).
         Expected time: ~90s (vs ~40 min for full weight loading).
         """
         logger.info("Loading from checkpoint %s (~2 min)...", path)
         checkpointer = ocp.PyTreeCheckpointer()
-        # Load saved abstract state to know which tensors were originally FP8.
         try:
             abstract_state = self._load_abstract_state(self._abstract_state_path(path))
             logger.info("Restored abstract state structure from checkpoint metadata.")
         except Exception as e:
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
             abstract_state = nnx.state(model)
-        # Build uint8 abstract state for the Orbax restore item (matches saved dtype).
-        # Don't pass sharding — Orbax reads it from its own _sharding file.
-        # Passing PartitionSpec requires an active jax.set_mesh context which may
-        # not be set at this call site.
-        def _to_u8_sds(sds):
-            if hasattr(sds, "dtype") and str(sds.dtype) in self._FP8_DTYPES:
-                return jax.ShapeDtypeStruct(sds.shape, jax.numpy.uint8)
-            return sds
-        u8_abstract = jax.tree_util.tree_map(_to_u8_sds, abstract_state)
-        state_u8 = checkpointer.restore(path, item=u8_abstract)
-        # Reinterpret uint8 tensors back to their original FP8 dtype.
-        # Use per-shard numpy view on CPU to avoid HBM OOM from jax.lax.bitcast.
-        # jax.device_get() fails for globally-sharded arrays — use addressable_shards.
-        import ml_dtypes, numpy as np
-
-        def _restore_fp8(restored, orig_sds):
-            if not (hasattr(orig_sds, "dtype") and str(orig_sds.dtype) in self._FP8_DTYPES):
-                return restored
-            target_dtype = orig_sds.dtype
-            fp8_np_dtype = getattr(ml_dtypes, str(target_dtype).replace(".", "_"), None)
-            if fp8_np_dtype is None:
-                return jax.lax.bitcast_convert_type(restored, target_dtype)
-            # Reconstruct per-process-local shards: pull each addressable shard to CPU,
-            # view bytes as FP8, put back to same device.
-            shards = []
-            for shard in restored.addressable_shards:
-                np_u8 = np.array(shard.data)
-                np_fp8 = np_u8.view(fp8_np_dtype)
-                shards.append(jax.device_put(np_fp8, shard.device))
-            return jax.make_array_from_single_device_arrays(
-                restored.shape, restored.sharding, shards
-            )
-
-        state = jax.tree_util.tree_map(_restore_fp8, state_u8, abstract_state)
+        state = checkpointer.restore(path, item=abstract_state)
         nnx.update(model, state)
         self._patch_narrow_blockwise(model)
         logger.info("Checkpoint loaded successfully from %s", path)

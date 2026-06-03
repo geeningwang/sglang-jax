@@ -115,6 +115,8 @@ spec:
           git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
           cd /workspace
           uv pip install -e "python[all]"
+          # Upgrade Orbax to 0.12+ for native FP8 array restore support
+          uv pip install "orbax-checkpoint>=0.12.0"
 
           echo "=== [rank${INDEX}] Mounting NFS weight servers ==="
           apt-get update -qq && apt-get install -y -qq nfs-common
