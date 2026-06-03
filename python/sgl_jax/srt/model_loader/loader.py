@@ -351,7 +351,27 @@ class JAXModelLoader(DefaultModelLoader):
         except Exception as e:
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
             abstract_state = nnx.state(model)
-        state = checkpointer.restore(path, item=abstract_state)
+            
+        # WORKAROUND for TPU v7x libtpu float8_e4m3fn host-to-device allocation bug.
+        # jax.device_put fails silently or returns ShapeDtypeStruct for float8 arrays on TPU.
+        # We monkey-patch jax.device_put to transfer as uint8 and bitcast on device.
+        import numpy as np
+        import jax.numpy as jnp
+        orig_device_put = jax.device_put
+        def patched_device_put(x, *args, **kwargs):
+            if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+                x_u8 = np.asarray(x).view(np.uint8)
+                arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+                target_dtype = getattr(jnp, str(x.dtype))
+                return jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+            return orig_device_put(x, *args, **kwargs)
+        
+        jax.device_put = patched_device_put
+        try:
+            state = checkpointer.restore(path, item=abstract_state)
+        finally:
+            jax.device_put = orig_device_put
+            
         # NOTE: JAX 0.8.1 on TPU cannot create float8_e4m3fn arrays via Orbax restore.
         # The leaves remain as ShapeDtypeStruct objects. This model is fully FP8-quantized
         # so ALL weights fail to restore. The checkpoint approach is blocked until JAX

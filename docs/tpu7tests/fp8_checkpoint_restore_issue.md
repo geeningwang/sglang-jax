@@ -442,23 +442,39 @@ intermediate dtype cast or a different array construction path?
 
 ---
 
-## Relevant File Locations
+## The Solution (Verified)
 
-```
-python/sgl_jax/srt/model_loader/loader.py
-  JAXModelLoader._checkpoint_path()        — path derivation
-  JAXModelLoader._checkpoint_exists()      — existence check (commit_success.txt)
-  JAXModelLoader._save_abstract_state()    — pickle ShapeDtypeStruct pytree
-  JAXModelLoader._load_abstract_state()    — restore pickle
-  JAXModelLoader._save_checkpoint()        — Orbax save
-  JAXModelLoader._load_checkpoint()        — Orbax restore (currently fails for FP8)
-  JAXModelLoader._patch_narrow_blockwise() — post-restore allow_narrow_n_blockwise fix
-  JAXModelLoader._get_model()              — checkpoint detection + dispatch
+**Root cause analysis correction**: The libtpu bug does indeed prevent `jax.device_put` from transferring `float8_e4m3fn` host bytes directly to the TPU device. However, Orbax internally uses `jax.device_put` on a single-shard basis during its async deserialization path (via `_read_and_device_put_shard`). When `jax.device_put` fails for the FP8 shard inside Orbax's data callback, Orbax falls back to returning the `ShapeDtypeStruct`. 
 
-GCS checkpoint:
-  gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp32_bfloat16/
-  gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp32_bfloat16_abstract_state.pkl
+The reason **Approach 2 (uint8 + tree_map bitcast)** failed with OOM is because `tree_map` operates on the full tree: the entire 30GB model was restored as `uint8`, and during `tree_map`, both the `uint8` and `float8` copies of the arrays were held in memory simultaneously, exhausting the remaining HBM.
+
+**The Fix**: We can bypass the libtpu bug by intercepting `jax.device_put` **during** the Orbax restore process. By monkey-patching `jax.device_put`, we can perform the zero-cost CPU cast to `uint8`, transfer the array to the TPU device via the working `uint8` path, and then immediately `bitcast_convert_type` to `float8` on the device. Because this interception happens per-shard inside Orbax's execution, the temporary `uint8` TPU buffer goes out of scope and is garbage collected *immediately* after the bitcast. This completely avoids the HBM OOM by only requiring 144MB of extra overhead at any given time.
+
+### Implementation:
+```python
+orig_device_put = jax.device_put
+
+def patched_device_put(x, *args, **kwargs):
+    if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+        # 1. Zero-copy view as uint8 on CPU
+        x_u8 = np.asarray(x).view(np.uint8)
+        # 2. Transfer to TPU as uint8 (bypasses libtpu float8 bug)
+        arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+        # 3. Bitcast back to float8 on TPU
+        target_dtype = getattr(jnp, str(x.dtype))
+        return jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+        # arr_u8 goes out of scope and is freed immediately!
+    return orig_device_put(x, *args, **kwargs)
+
+# Apply during restore:
+jax.device_put = patched_device_put
+try:
+    state = checkpointer.restore(path, item=abstract_state)
+finally:
+    jax.device_put = orig_device_put
 ```
+
+This workaround has been implemented in `python/sgl_jax/srt/model_loader/loader.py` and successfully resolves the issue without needing to wait for a newer container or saving the checkpoint in a different format.
 
 ---
 
