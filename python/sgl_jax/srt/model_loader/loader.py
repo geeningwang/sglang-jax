@@ -281,7 +281,16 @@ class JAXModelLoader(DefaultModelLoader):
         (including FP8 dtypes) without falling back to the sharding file.
         """
         def _to_sds(x):
+            # Include sharding spec (PartitionSpec/NamedSharding) so Orbax can
+            # restore sharded FP8 arrays correctly. Use sharding.spec if available
+            # to avoid pickling non-serializable Device objects inside NamedSharding.
             sharding = getattr(x, "sharding", None)
+            if sharding is not None:
+                try:
+                    # NamedSharding.spec is a PartitionSpec — picklable
+                    sharding = sharding.spec
+                except AttributeError:
+                    sharding = None
             return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding)
 
         abstract = jax.tree_util.tree_map(_to_sds, state)
