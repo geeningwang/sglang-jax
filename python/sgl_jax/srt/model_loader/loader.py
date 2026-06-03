@@ -235,7 +235,8 @@ class JAXModelLoader(DefaultModelLoader):
         """Return GCS checkpoint path for this model/tp-size, or None if disabled.
 
         Auto-derives from model_path when SGLANG_CHECKPOINT_DIR is set.
-        Format: {SGLANG_CHECKPOINT_DIR}/tp{tp_size}/{model_hash}/
+        Format: {SGLANG_CHECKPOINT_DIR}/{model_hash}/tp{tp_size}_{dtype}/
+        Example: gs://.../sglang-checkpoint/95dc2640/tp32_bfloat16/
         """
         checkpoint_dir = os.environ.get("SGLANG_CHECKPOINT_DIR", "")
         if not checkpoint_dir:
@@ -243,8 +244,12 @@ class JAXModelLoader(DefaultModelLoader):
         model_path = model_config.model_path
         model_hash = hashlib.md5(model_path.encode()).hexdigest()[:8]
         tp_size = self.mesh.size
-        dtype = str(model_config.dtype)
-        return f"{checkpoint_dir.rstrip('/')}/tp{tp_size}_{dtype}/{model_hash}/"
+        # Use dtype __name__ (e.g. "bfloat16") instead of str() which gives
+        # the ugly "<class 'jax.numpy.bfloat16'>" representation.
+        dtype_name = getattr(model_config.dtype, "__name__", None) or \
+                     getattr(model_config.dtype, "name", None) or \
+                     str(model_config.dtype).split(".")[-1].strip("'>")
+        return f"{checkpoint_dir.rstrip('/')}/{model_hash}/tp{tp_size}_{dtype_name}/"
 
     def _checkpoint_exists(self, path: str) -> bool:
         """Check whether a saved checkpoint exists at `path`.
