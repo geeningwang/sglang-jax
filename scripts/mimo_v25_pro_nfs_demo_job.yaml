@@ -134,7 +134,8 @@ spec:
           echo "$(ts) [rank${INDEX}] NFS ready: ${SAFETENSORS} safetensors files at /mnt/weights"
 
           if [ "${INDEX}" = "0" ]; then
-            echo "$(ts) [rank0] PHASE: launching server"
+            T_START=$(date +%s)
+            echo "$(ts) [rank0] PHASE: launching server  [T=0s]"
             JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
             python3 -m sgl_jax.launch_server \
               --model-path /mnt/weights \
@@ -156,7 +157,8 @@ spec:
 
             for i in $(seq 1 25920); do
               if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
-                echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s"
+                T_HEALTHY=$(date +%s)
+                echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s  [total elapsed: $((T_HEALTHY - T_START))s]"
                 break
               fi
               if ! kill -0 $SERVER_PID 2>/dev/null; then
@@ -171,15 +173,15 @@ spec:
 
             echo ""
             echo "$(ts) [rank0] PHASE: sending demo inference request"
-            echo "Input: 'What is mixture-of-experts and why is it useful for large language models?'"
+            echo "Input: 'Explain how tensor parallelism works in large language model inference, and what are the tradeoffs compared to pipeline parallelism?'"
             echo ""
 
             RESPONSE=$(curl -sf --max-time 300 http://localhost:8080/v1/chat/completions \
               -H "Content-Type: application/json" \
               -d '{
                 "model": "MiMo-V2.5-Pro",
-                "messages": [{"role": "user", "content": "What is mixture-of-experts and why is it useful for large language models?"}],
-                "max_tokens": 256,
+                "messages": [{"role": "user", "content": "Explain how tensor parallelism works in large language model inference, and what are the tradeoffs compared to pipeline parallelism?"}],
+                "max_tokens": 512,
                 "temperature": 0.7
               }')
             echo "$(ts) [rank0] PHASE: inference response received"
