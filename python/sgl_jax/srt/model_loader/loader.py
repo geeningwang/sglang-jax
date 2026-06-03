@@ -358,6 +358,21 @@ class JAXModelLoader(DefaultModelLoader):
                 lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
             )
 
+        checkpoint_path = self._checkpoint_path(model_config)
+        checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
+
+        # When restoring from checkpoint the weights are already validated FP8.
+        # Force allow_narrow_n_blockwise=True BEFORE apply_linear_quantization so
+        # that each FP8 layer is created with the flag set — otherwise the profiling
+        # forward pass raises: "Block-wise kernel does not support out_dim=128".
+        if checkpoint_ready and (
+            hasattr(model_config, "quantization_config")
+            and model_config.quantization_config is not None
+            and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
+        ):
+            model_config.quantization_config.allow_narrow_n_blockwise = True
+            logger.info("Checkpoint restore: set allow_narrow_n_blockwise=True before quant setup.")
+
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
         if (
@@ -383,23 +398,8 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             logger.info("No quantization config found. Skipping quantization.")
 
-        checkpoint_path = self._checkpoint_path(model_config)
-        checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
-
         if checkpoint_ready:
-            # Fast path: load pre-converted sharded checkpoint (~5 min).
-            # The checkpoint was saved with FP8 weight_q/weight_scale structure. The
-            # abstract_state.pkl captures that structure exactly, so nnx.update will work.
-            # However apply_linear_quantization may have set allow_narrow_n_blockwise=False
-            # (not in config.json) which would make the forward pass fail with a narrow-block
-            # error. Force it True here — the checkpoint weights are already validated FP8.
-            if (
-                hasattr(model_config, "quantization_config")
-                and model_config.quantization_config is not None
-                and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
-            ):
-                model_config.quantization_config.allow_narrow_n_blockwise = True
-                logger.info("Checkpoint restore: set allow_narrow_n_blockwise=True.")
+            # Fast path: load pre-converted sharded checkpoint (~5 min)
             self._load_checkpoint(model, checkpoint_path)
         else:
             # Slow path: load from raw weights (~40 min), then save checkpoint
