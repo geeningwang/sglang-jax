@@ -384,9 +384,22 @@ class JAXModelLoader(DefaultModelLoader):
             logger.info("No quantization config found. Skipping quantization.")
 
         checkpoint_path = self._checkpoint_path(model_config)
+        checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
 
-        if checkpoint_path and self._checkpoint_exists(checkpoint_path):
-            # Fast path: load pre-converted sharded checkpoint (~5 min)
+        if checkpoint_ready:
+            # Fast path: load pre-converted sharded checkpoint (~5 min).
+            # The checkpoint was saved with FP8 weight_q/weight_scale structure. The
+            # abstract_state.pkl captures that structure exactly, so nnx.update will work.
+            # However apply_linear_quantization may have set allow_narrow_n_blockwise=False
+            # (not in config.json) which would make the forward pass fail with a narrow-block
+            # error. Force it True here — the checkpoint weights are already validated FP8.
+            if (
+                hasattr(model_config, "quantization_config")
+                and model_config.quantization_config is not None
+                and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
+            ):
+                model_config.quantization_config.allow_narrow_n_blockwise = True
+                logger.info("Checkpoint restore: set allow_narrow_n_blockwise=True.")
             self._load_checkpoint(model, checkpoint_path)
         else:
             # Slow path: load from raw weights (~40 min), then save checkpoint
