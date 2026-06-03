@@ -343,7 +343,28 @@ class JAXModelLoader(DefaultModelLoader):
             abstract_state = nnx.state(model)
         state = checkpointer.restore(path, item=abstract_state)
         nnx.update(model, state)
+        # Post-restore: the checkpoint was saved after load_weights() which internally
+        # enabled FP8 on narrow-output layers. The apply_linear_quantization() that ran
+        # before restore created those layers with allow_narrow_n_blockwise=False (default).
+        # Patch all FP8 linear layers to allow narrow blocks so the forward pass succeeds.
+        self._patch_narrow_blockwise(model)
         logger.info("Checkpoint loaded successfully from %s", path)
+
+    @staticmethod
+    def _patch_narrow_blockwise(model: nnx.Module) -> None:
+        """Set allow_narrow_n_blockwise=True on every FP8 linear layer in the model.
+
+        Called after checkpoint restore because apply_linear_quantization() creates
+        layers with allow_narrow_n_blockwise=False, but load_weights() (used during
+        the original checkpoint save) set it True for narrow-output layers.
+        """
+        patched = 0
+        for _, module in model.iter_modules():
+            if hasattr(module, "allow_narrow_n_blockwise") and not module.allow_narrow_n_blockwise:
+                module.allow_narrow_n_blockwise = True
+                patched += 1
+        if patched:
+            logger.info("Checkpoint restore: patched allow_narrow_n_blockwise=True on %d layers.", patched)
 
     # ── Model initialization ──────────────────────────────────────────────────
 
@@ -360,18 +381,6 @@ class JAXModelLoader(DefaultModelLoader):
 
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
-
-        # When restoring from checkpoint the weights are already validated FP8.
-        # Force allow_narrow_n_blockwise=True BEFORE apply_linear_quantization so
-        # that each FP8 layer is created with the flag set — otherwise the profiling
-        # forward pass raises: "Block-wise kernel does not support out_dim=128".
-        if checkpoint_ready and (
-            hasattr(model_config, "quantization_config")
-            and model_config.quantization_config is not None
-            and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
-        ):
-            model_config.quantization_config.allow_narrow_n_blockwise = True
-            logger.info("Checkpoint restore: set allow_narrow_n_blockwise=True before quant setup.")
 
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
