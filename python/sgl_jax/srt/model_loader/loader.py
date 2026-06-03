@@ -275,10 +275,16 @@ class JAXModelLoader(DefaultModelLoader):
         return checkpoint_path.rstrip("/") + "_abstract_state.pkl"
 
     def _save_abstract_state(self, state: Any, path: str) -> None:
-        """Pickle the abstract state (shapes/dtypes only, no values) to GCS or local."""
-        abstract = jax.tree_util.tree_map(
-            lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state
-        )
+        """Pickle the abstract state (shapes/dtypes/shardings, no values) to GCS or local.
+
+        Sharding info is included so Orbax can correctly restore sharded arrays
+        (including FP8 dtypes) without falling back to the sharding file.
+        """
+        def _to_sds(x):
+            sharding = getattr(x, "sharding", None)
+            return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding)
+
+        abstract = jax.tree_util.tree_map(_to_sds, state)
         buf = pickle.dumps(abstract)
         if path.startswith("gs://"):
             import subprocess
