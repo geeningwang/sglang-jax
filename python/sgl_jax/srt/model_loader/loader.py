@@ -370,9 +370,12 @@ class JAXModelLoader(DefaultModelLoader):
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
             abstract_state = nnx.state(model)
         # Build uint8 abstract state for the Orbax restore item (matches saved dtype).
+        # Don't pass sharding — Orbax reads it from its own _sharding file.
+        # Passing PartitionSpec requires an active jax.set_mesh context which may
+        # not be set at this call site.
         def _to_u8_sds(sds):
             if hasattr(sds, "dtype") and str(sds.dtype) in self._FP8_DTYPES:
-                return jax.ShapeDtypeStruct(sds.shape, jax.numpy.uint8, sharding=sds.sharding)
+                return jax.ShapeDtypeStruct(sds.shape, jax.numpy.uint8)
             return sds
         u8_abstract = jax.tree_util.tree_map(_to_u8_sds, abstract_state)
         state_u8 = checkpointer.restore(path, item=u8_abstract)
