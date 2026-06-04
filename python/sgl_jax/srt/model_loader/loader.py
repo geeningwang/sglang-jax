@@ -363,7 +363,15 @@ class JAXModelLoader(DefaultModelLoader):
                 x_u8 = np.asarray(x).view(np.uint8)
                 arr_u8 = orig_device_put(x_u8, *args, **kwargs)
                 target_dtype = getattr(jnp, str(x.dtype))
-                return jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+                arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+                
+                # Block to throttle the async queue and ensure XLA finishes
+                # so that arr_u8 can be immediately freed from HBM and Host RAM
+                # doesn't OOM from unbounded compilation/DMA queues.
+                arr_f8.block_until_ready()
+                del x_u8
+                del arr_u8
+                return arr_f8
             return orig_device_put(x, *args, **kwargs)
         
         jax.device_put = patched_device_put

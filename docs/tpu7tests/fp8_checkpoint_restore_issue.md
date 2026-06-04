@@ -462,8 +462,14 @@ def patched_device_put(x, *args, **kwargs):
         arr_u8 = orig_device_put(x_u8, *args, **kwargs)
         # 3. Bitcast back to float8 on TPU
         target_dtype = getattr(jnp, str(x.dtype))
-        return jax.lax.bitcast_convert_type(arr_u8, target_dtype)
-        # arr_u8 goes out of scope and is freed immediately!
+        arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+        # 4. Block to throttle the async queue and ensure XLA finishes.
+        # This prevents both Host RAM OOM (from unbounded DMA/compilation queues)
+        # and TPU HBM OOM (by allowing arr_u8 to be freed immediately).
+        arr_f8.block_until_ready()
+        del x_u8
+        del arr_u8
+        return arr_f8
     return orig_device_put(x, *args, **kwargs)
 
 # Apply during restore:
