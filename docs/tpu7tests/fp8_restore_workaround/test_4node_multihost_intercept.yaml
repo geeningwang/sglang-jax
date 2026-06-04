@@ -27,6 +27,46 @@
 #   - Any OOM during restore with TP=32 (even without HBM pressure)
 # ============================================================
 apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: test-fp8-4node-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: main
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          google.com/tpu: "4"
+        requests:
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: test-fp8-4node-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "3600"
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: test-fp8-4node-dws-template
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: test-fp8-4node
@@ -50,6 +90,11 @@ spec:
   completionMode: Indexed
   backoffLimit: 0
   template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: test-fp8-4node-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       restartPolicy: Never
       subdomain: test-fp8-4node
