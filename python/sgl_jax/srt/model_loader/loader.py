@@ -426,13 +426,13 @@ class JAXModelLoader(DefaultModelLoader):
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
 
-        # When a checkpoint exists, force allow_narrow_n_blockwise=True BEFORE
-        # apply_linear_quantization so ALL linear layers (including narrow out_dim=128
-        # ones) get weight_q+weight_scale structure — matching what load_weights() produces
-        # internally. Without this, narrow layers stay as BF16 'weight' in the model
-        # structure but appear as FP8 weight_q+weight_scale in the checkpoint, causing
-        # a tree structure mismatch during Orbax restore.
-        if checkpoint_ready and (
+        # Force allow_narrow_n_blockwise=True BEFORE apply_linear_quantization whenever
+        # checkpoint saving/loading is enabled (SGLANG_CHECKPOINT_DIR is set).
+        # This ensures ALL linear layers (including narrow out_dim=128 ones) get
+        # weight_q+weight_scale structure — matching what load_weights() produces.
+        # Must apply on BOTH slow-path (save) and fast-path (restore) runs so the
+        # checkpoint structure and abstract_state.pkl are always consistent.
+        if checkpoint_path and (
             hasattr(model_config, "quantization_config")
             and model_config.quantization_config is not None
             and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
