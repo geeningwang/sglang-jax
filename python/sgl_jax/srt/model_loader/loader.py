@@ -344,37 +344,46 @@ class JAXModelLoader(DefaultModelLoader):
         Expected time: ~90s (vs ~40 min for full weight loading).
         """
         logger.info("Loading from checkpoint %s (~2 min)...", path)
+        import numpy as np
         checkpointer = ocp.PyTreeCheckpointer()
         try:
+            abstract_state = self._load_abstract_state(self._abstract_state_path(path))
+            # The abstract_state.pkl stores PartitionSpec (picklable) not full NamedSharding.
+            # Orbax takes a different (non-device_put) code path when only PartitionSpec is
+            # given, bypassing our monkey-patch. Reconstruct full NamedSharding from the
+            # PartitionSpec + current mesh so Orbax uses the standard device_put broadcast path.
+            def _upgrade_sharding(sds):
+                if hasattr(sds, "sharding") and isinstance(
+                    sds.sharding, jax.sharding.PartitionSpec
+                ):
+                    sharding = jax.sharding.NamedSharding(self.mesh, sds.sharding)
+                    return jax.ShapeDtypeStruct(sds.shape, sds.dtype, sharding=sharding)
+                return sds
             with jax.set_mesh(self.mesh):
-                abstract_state = self._load_abstract_state(self._abstract_state_path(path))
+                abstract_state = jax.tree_util.tree_map(_upgrade_sharding, abstract_state)
             logger.info("Restored abstract state structure from checkpoint metadata.")
         except Exception as e:
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
             abstract_state = nnx.state(model)
-            
+
         # WORKAROUND for TPU v7x libtpu float8_e4m3fn host-to-device allocation bug.
-        # jax.device_put fails silently or returns ShapeDtypeStruct for float8 arrays on TPU.
-        # We monkey-patch jax.device_put to transfer as uint8 and bitcast on device.
-        import numpy as np
-        import jax.numpy as jnp
+        # jax.device_put fails silently for float8 arrays — returns ShapeDtypeStruct.
+        # Intercept: transfer as uint8, bitcast to float8 on-device. Validated in
+        # docs/tpu7tests/fp8_restore_workaround/ (all 4 tests pass, concurrency=1).
         orig_device_put = jax.device_put
+        _FP8 = frozenset({"float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"})
+
         def patched_device_put(x, *args, **kwargs):
-            if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+            if hasattr(x, "dtype") and str(x.dtype) in _FP8:
+                logger.debug("fp8_patch: intercepted %s shard of dtype %s", x.shape, x.dtype)
                 x_u8 = np.asarray(x).view(np.uint8)
                 arr_u8 = orig_device_put(x_u8, *args, **kwargs)
-                target_dtype = getattr(jnp, str(x.dtype))
-                arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
-                
-                # Block to throttle the async queue and ensure XLA finishes
-                # so that arr_u8 can be immediately freed from HBM and Host RAM
-                # doesn't OOM from unbounded compilation/DMA queues.
+                arr_f8 = jax.lax.bitcast_convert_type(arr_u8, x.dtype)
                 arr_f8.block_until_ready()
-                del x_u8
-                del arr_u8
+                del x_u8, arr_u8
                 return arr_f8
             return orig_device_put(x, *args, **kwargs)
-        
+
         jax.device_put = patched_device_put
         try:
             state = checkpointer.restore(path, item=abstract_state)
