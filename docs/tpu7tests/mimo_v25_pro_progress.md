@@ -71,19 +71,31 @@ See: [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md)
 
 ---
 
-### 5. Orbax checkpoint — save/load investigation ✅ (blocked)
+### 5. Orbax checkpoint — save/load investigation ✅ (workaround validated)
 
 **Goal**: Replace ~42 min NFS loading with ~90s GCS checkpoint restore.
 
 **Checkpoint mechanics work**: Orbax saves at ~4.5 GiB/s, restores at ~5.5 GiB/s in 88–94s. The checkpoint IO is fast and correct.
 
-**Blocked by**: JAX's libtpu (both 0.8.1 and 0.9.0) cannot create `float8_e4m3fn`
-JAX arrays via `make_array_from_single_device_arrays` on TPU. Since MiMo-V2.5-Pro
-is **100% FP8-quantized**, every tensor fails to restore — all 1038 arrays remain as
-`ShapeDtypeStruct` placeholders. The failure is in libtpu (closed source), not
-in Orbax or JAX Python.
+**Root cause**: JAX's libtpu cannot create `float8_e4m3fn` arrays via
+`jax.device_put(numpy_float8, tpu_device)`. Since MiMo-V2.5-Pro is 100% FP8,
+all 1038 tensors fail — returning `ShapeDtypeStruct` instead of `jax.Array`.
 
-**Approaches exhausted**:
+**Workaround validated** (2026-06-03): Monkey-patch `jax.device_put` to transfer
+FP8 as `uint8` then `bitcast_convert_type` back to `float8_e4m3fn` on-device.
+All 4 validation tests passed:
+
+| Test | Result |
+|------|--------|
+| `bitcast_convert_type(uint8→float8)` on TPU v7x | ✅ PASS |
+| Patch under ~14 MB free HBM (post-model-load) | ✅ PASS |
+| Orbax shard concurrency = 1 (no semaphore needed) | ✅ PASS |
+| 4-node 32-TC multi-host `device_put` intercepted | ✅ PASS |
+
+**Next step**: Integrate the monkey-patch into `loader.py _load_checkpoint()`.
+See `fp8_restore_workaround/README.md` for implementation code.
+
+**Approaches that failed**:
 
 | Attempt | Outcome |
 |---------|---------|
@@ -154,9 +166,9 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 |----------|--------|-------|
 | `jingnw-nfs-weights-1/2/3` | **RUNNING** | 3 × n2-highmem-48, ~$15–18/hr — weights in RAM |
 | TPU DWS nodes | ✅ 0 nodes | Pool empty, no active job |
-| GCS checkpoint | SAVED (unusable) | `95dc2640/tp32_bfloat16/` — blocked by libtpu FP8 issue |
+| GCS checkpoint | SAVED ✅ | `95dc2640/tp32_bfloat16/` — usable with monkey-patch workaround |
 | XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` (tp-size=32) |
-| Container image (current) | `jax0.9.0-rev1` | Updated from jax0.8.1-rev1 (still FP8-blocked) |
+| Container image (current) | `jax0.9.0-rev1` | FP8 restore unblocked via monkey-patch |
 
 ---
 

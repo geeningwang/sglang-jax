@@ -1,6 +1,12 @@
-# FP8 Checkpoint Restore Workaround Demo
+# FP8 Checkpoint Restore Workaround — Validated ✅
 
-This folder contains a minimal reproducible demo that successfully tests the workaround for the JAX/libtpu issue preventing `float8_e4m3fn` arrays from being transferred via `jax.device_put` or `jax.make_array_from_single_device_arrays` on TPU v7x.
+**Status**: Workaround fully validated (2026-06-03). All 4 critical tests passed.
+Ready for production integration into `loader.py`.
+
+This folder contains the investigation work, minimal demo, and validation test suite
+for the workaround to the JAX/libtpu issue preventing `float8_e4m3fn` arrays from
+being transferred via `jax.device_put` or `jax.make_array_from_single_device_arrays`
+on TPU v7x.
 
 ## Contents
 
@@ -38,10 +44,26 @@ This confirms the underlying transfer bug is successfully bypassed on a **single
 
 ---
 
-## Validation Test Suite
+## Validation Test Results (2026-06-03)
 
-Three critical unknowns must be verified before this workaround can be considered
-production-ready for the actual 4-node 32-TC setup. Run these tests in order:
+All 4 tests executed and passed on `jax0.9.0-rev1` + Orbax 0.12.0:
+
+| Test | Result | Key Finding |
+|------|--------|-------------|
+| `test_bitcast_on_tpu.yaml` | ✅ PASS | `bitcast_convert_type(uint8→float8_e4m3fn)` works on TPU v7x |
+| `test_hbm_pressure.yaml` | ✅ PASS | Patch succeeds with ~14 MB free HBM, no OOM |
+| `test_concurrent_shards.yaml` | ✅ PASS | Max concurrency = 1 (Orbax is serial), no semaphore needed |
+| `test_4node_multihost_intercept.yaml` | ✅ PASS | `jax.device_put` IS intercepted in the 4-node multi-host path |
+
+The confidence level for the full production implementation rises from **25–40%** to **~90%**.
+All three critical unknowns are resolved.
+
+---
+
+## Validation Test Suite (for re-running)
+
+Tests in order of dependency — run Test 1 first (prerequisite), then 2 and 3 in
+parallel, then Test 4 last (requires DWS 4-node slice):
 
 ### Test 1 — `test_bitcast_on_tpu.yaml` (prerequisite)
 

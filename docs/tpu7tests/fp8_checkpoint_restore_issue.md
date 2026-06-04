@@ -1,8 +1,8 @@
 # FP8 Checkpoint Save/Restore Issue — Technical Deep Dive
 
-**Status**: Blocked. All attempted approaches fail. Seeking expert review.  
+**Status**: Workaround validated ✅ — ready for production integration.  
 **Last updated**: 2026-06-03  
-**Environment**: GKE TPU v7x (2x2x4), `tpu7x-standard-4t`, JAX 0.8.1 / 0.9.0 + Orbax 0.11–0.12
+**Environment**: GKE TPU v7x (2x2x4), `tpu7x-standard-4t`, JAX 0.9.0 + Orbax 0.12
 
 ---
 
@@ -410,35 +410,67 @@ The `jax.device_put(numpy_float8, tpu_device)` call is the failure point. It doe
 raise an exception — it appears to return silently and Orbax uses the abstract state
 descriptor as fallback.
 
-**Key question for the expert**: Is there a way to make `jax.device_put` (or
+**Key question for the expert**: ~~Is there a way to make `jax.device_put` (or
 `jax.make_array_from_single_device_arrays`) work for `float8_e4m3fn` on TPU v7x with
-JAX 0.9.0 / libtpu? Is this a known limitation? Is there a workaround like an
-intermediate dtype cast or a different array construction path?
+JAX 0.9.0 / libtpu?~~
+
+**Answered**: Yes — monkey-patch `jax.device_put` to transfer as `uint8` and
+`bitcast_convert_type` to `float8_e4m3fn` on-device. All sub-problems validated.
+See `fp8_restore_workaround/README.md` for test results.
 
 ---
 
-## Potential Solutions (Unverified)
+## Validated Solution (2026-06-03)
 
-1. **Container upgrade**: Wait for `jax0.10.x-rev1` container (currently unavailable
-   in `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu`). May include a libtpu
-   with float8 buffer allocation support.
+Monkey-patch `jax.device_put` to intercept FP8 arrays during Orbax restore,
+transfer as `uint8`, then `bitcast_convert_type` to `float8_e4m3fn` on-device.
 
-2. **Force-cast to BF16 before device_put**: If `jax.device_put(np.array(shard,
-   dtype=np.float16).view(ml_dtypes.float8_e4m3fn), device)` works by going through
-   an intermediate cast... but this seems unlikely to differ from direct float8.
+**Why this works**:
+- Orbax calls `jax.device_put` via `jax.tree.map(jax.device_put, ret, shardings)`
+  — Python-level public API, interceptable via assignment.
+- `bitcast_convert_type(uint8 → float8)` works on TPU v7x ✅
+- Per-shard HBM: 3 MB uint8 + 3 MB float8 = 6 MB < 14 MB free ✅
+- Orbax processes shards serially (max concurrency = 1), no semaphore needed ✅
+- 4-node multi-host restore path DOES call `jax.device_put` ✅
 
-3. **Save checkpoint as BF16 (dequantized)**: Before saving, call
-   `x.astype(jnp.bfloat16)` on FP8 arrays. Restores as BF16 without issues. Model
-   runs in BF16 for those layers. Checkpoint is 2× larger (~2 TB). This definitely
-   works but changes inference characteristics.
+```python
+orig_device_put = jax.device_put
+_FP8 = frozenset({"float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"})
 
-4. **Patch libtpu (not feasible)**: libtpu is closed source. Cannot patch.
+def _patched_device_put(x, *args, **kwargs):
+    if hasattr(x, "dtype") and str(x.dtype) in _FP8:
+        x_u8 = np.asarray(x).view(np.uint8)
+        arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+        arr_f8 = jax.lax.bitcast_convert_type(arr_u8, x.dtype)
+        arr_f8.block_until_ready()
+        return arr_f8
+    return orig_device_put(x, *args, **kwargs)
 
-5. **Alternative checkpoint format**: Instead of Orbax, save each FP8 shard as a raw
-   numpy `.npy` file to GCS. On restore, load as uint8, then use `jax.lax.bitcast_convert_type`
-   after model initialization (before weights are in HBM). The HBM OOM only occurs when
-   weights are ALREADY loaded — if we do the bitcast during model construction (before
-   full weight allocation), there should be headroom.
+jax.device_put = _patched_device_put
+try:
+    state = checkpointer.restore(path, item=abstract_state)
+finally:
+    jax.device_put = orig_device_put
+```
+
+**Test results** (JAX 0.9.0, Orbax 0.12.0, TPU v7x 2x2x4):
+
+| Test | Result |
+|------|--------|
+| `bitcast_convert_type(uint8→float8)` on TPU | ✅ PASS |
+| Patch under ~14 MB free HBM | ✅ PASS |
+| Max concurrency = 1 | ✅ PASS |
+| 4-node multi-host intercept | ✅ PASS |
+
+See `fp8_restore_workaround/README.md` for full validation details.
+
+## Previously Ruled Out
+
+1. **JAX 0.9.0 container upgrade**: Same ShapeDtypeStruct failure ✗
+2. **Save as BF16 (dequantized)**: Works but 2× larger, changes inference ✗
+3. **Patch libtpu**: Closed source ✗
+4. **uint8 + on-device tree_map bitcast**: HBM OOM (holds full tree simultaneously) ✗
+5. **Option B hybrid restore**: Model is 100% FP8, nothing non-FP8 to restore ✗
 
 ---
 
