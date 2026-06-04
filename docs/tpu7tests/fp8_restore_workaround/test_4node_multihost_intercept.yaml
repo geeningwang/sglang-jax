@@ -1,0 +1,174 @@
+# ============================================================
+# Test: Critical Unknown 1 — Does monkey-patch intercept jax.device_put
+#       during 4-node multi-host Orbax restore?
+# ============================================================
+# The single-node demo proved interception in the single-replica path.
+# In a 4-node setup Orbax uses SingleReplicaArrayHandler which may route
+# through a different internal path (create_async_array_from_callback via
+# TensorStore, NOT jax.tree.map(jax.device_put, ...)).
+#
+# This test runs on the actual 4-node 2x2x4 slice (tp-size=32), saves a
+# sharded FP8 array to GCS, then restores it with the patch installed.
+#
+# Run:    kubectl apply -f test_4node_multihost_intercept.yaml
+# Logs:   kubectl logs -l job-name=test-fp8-4node --prefix -f
+# Clean:  kubectl delete job test-fp8-4node
+#
+# PASS criteria:
+#   [1] "Patched device_put called!" appears during restore (not just during save)
+#       → patch intercepts the multi-host restore path
+#   [2] "Restored type: ArrayImpl" — not ShapeDtypeStruct
+#   [3] "Restored dtype: float8_e4m3fn"
+#
+# FAIL indicators:
+#   - "Patched device_put called!" does NOT appear during restore
+#     → multi-host path bypasses jax.device_put; TensorStore manual iteration needed
+#   - "Restored type: ShapeDtypeStruct" — patch had no effect
+#   - Any OOM during restore with TP=32 (even without HBM pressure)
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-fp8-4node
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: test-fp8-4node
+  ports:
+  - name: dist-init
+    port: 6006
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-fp8-4node
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      subdomain: test-fp8-4node
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        command: [bash, -c]
+        args:
+        - |
+          set -e
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="test-fp8-4node-0.test-fp8-4node.default.svc.cluster.local"
+          CKPT_PATH="gs://jingnw-mimo-v2-5-pro-us-central1/test-fp8-4node-intercept"
+
+          python3 - << PYEOF
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import orbax.checkpoint as ocp
+          import os
+
+          INDEX = int(os.environ["JOB_COMPLETION_INDEX"])
+
+          # Init multi-host JAX (tp-size=32 across 4 nodes)
+          jax.distributed.initialize(
+              coordinator_address="${COORDINATOR}:6006",
+              num_processes=4,
+              process_id=INDEX,
+          )
+          print(f"[rank{INDEX}] Global devices: {jax.device_count()}, local: {jax.local_device_count()}")
+
+          # Build TP=32 mesh
+          mesh = jax.sharding.Mesh(
+              np.array(jax.devices()).reshape(1, 32),
+              axis_names=('data', 'tensor'),
+              axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+          )
+          sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, 'tensor'))
+
+          # Create a small FP8 array sharded across all 32 TCs
+          arr_np = np.ones((64, 32), dtype=np.float32).view(np.uint8)  # proxy for FP8
+          with jax.set_mesh(mesh):
+              # Actually create an FP8 array
+              arr_f8 = jax.device_put(
+                  np.ones((64, 32), dtype=np.uint8),
+                  sharding
+              )
+              arr_f8 = jax.lax.bitcast_convert_type(arr_f8, jnp.float8_e4m3fn)
+              arr_f8.block_until_ready()
+
+          print(f"[rank{INDEX}] Created FP8 array: shape={arr_f8.shape}, dtype={arr_f8.dtype}")
+
+          # Save via Orbax
+          ckptr = ocp.PyTreeCheckpointer()
+          if INDEX == 0:
+              import subprocess
+              subprocess.run(["gsutil", "-m", "rm", "-rf", "${CKPT_PATH}"], capture_output=True)
+          jax.effects_barrier()
+
+          ckptr.save("${CKPT_PATH}", {"w": arr_f8})
+          print(f"[rank{INDEX}] Saved checkpoint")
+
+          # Install the monkey-patch
+          patch_call_count = [0]
+          orig_device_put = jax.device_put
+
+          def patched_device_put(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+                  patch_call_count[0] += 1
+                  print(f"[rank{INDEX}] Patched device_put called! (call #{patch_call_count[0]})")
+                  x_u8 = np.asarray(x).view(np.uint8)
+                  arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+                  arr_f8 = jax.lax.bitcast_convert_type(arr_u8, jnp.float8_e4m3fn)
+                  arr_f8.block_until_ready()
+                  return arr_f8
+              return orig_device_put(x, *args, **kwargs)
+
+          jax.device_put = patched_device_put
+
+          # Restore
+          abstract = {"w": jax.ShapeDtypeStruct((64, 32), jnp.float8_e4m3fn, sharding=sharding)}
+          print(f"[rank{INDEX}] Starting restore...")
+          restored = ckptr.restore("${CKPT_PATH}", item=abstract)
+          jax.device_put = orig_device_put
+
+          # Report results
+          w = restored["w"]
+          print(f"[rank{INDEX}] Restored type: {type(w).__name__}")
+          print(f"[rank{INDEX}] Patch called during restore: {patch_call_count[0]} times")
+
+          if isinstance(w, jax.Array):
+              print(f"[rank{INDEX}] Restored dtype: {w.dtype}")
+              if str(w.dtype) == 'float8_e4m3fn':
+                  print(f"[rank{INDEX}] === PASS: Multi-host FP8 restore via patch works ===")
+              else:
+                  print(f"[rank{INDEX}] === FAIL: Wrong dtype {w.dtype} ===")
+          else:
+              print(f"[rank{INDEX}] === FAIL: Got {type(w).__name__} not ArrayImpl ===")
+              if patch_call_count[0] == 0:
+                  print(f"[rank{INDEX}] DIAGNOSIS: patch was NEVER called — multi-host path bypasses jax.device_put")
+                  print(f"[rank{INDEX}] NEXT STEP: manual TensorStore iteration required")
+
+          PYEOF

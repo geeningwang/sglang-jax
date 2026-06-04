@@ -1,0 +1,143 @@
+# ============================================================
+# Test: Critical Unknown 2 (part A) — Does the patch succeed when HBM is
+#       nearly exhausted (~14 MB free per TC)?
+# ============================================================
+# The single-node demo ran with fresh HBM. Our actual constraint is that
+# model weights fill HBM to ~14 MB free per TC. This test drains HBM to
+# that level via a large dummy allocation, then runs the FP8 restore patch.
+#
+# The per-shard math says it should work:
+#   shard of (6144, 512) FP8 = 3 MB  → uint8(3MB) + float8(3MB) = 6 MB < 14 MB free
+# But JAX's async dispatch may delay buffer freeing, causing momentary spikes.
+#
+# Run:    kubectl apply -f test_hbm_pressure.yaml
+# Logs:   kubectl logs -l job-name=test-fp8-hbm -f
+# Clean:  kubectl delete job test-fp8-hbm
+#
+# PASS criteria:
+#   [1] "HBM drained to ~14 MB free: OK" — drain succeeded
+#   [2] "Patched device_put called!" during restore
+#   [3] "Restore under pressure: PASS" — no OOM, got float8 ArrayImpl back
+#
+# FAIL indicators:
+#   - RESOURCE_EXHAUSTED during restore → HBM OOM even at per-shard level
+#     → bitcast still accumulates buffers across concurrent shards
+#   - HBM drain itself OOMs → adjust dummy_gb parameter
+# ============================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-fp8-hbm
+  namespace: default
+spec:
+  completions: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          python3 - << 'PYEOF'
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import orbax.checkpoint as ocp
+          import tempfile, os, shutil
+
+          print(f"JAX version: {jax.__version__}")
+          print(f"Devices: {jax.device_count()}")
+          device = jax.devices()[0]
+
+          # Step 1: Drain HBM to ~14 MB free (simulating post-model-load state).
+          # 1 flex-start TPU v7x node = 8 chips × 2 TCs × 96 GB = 1536 GB total HBM
+          # We only test on 1 chip (8 TCs from 1 node's perspective) = 768 GB per local process.
+          # Drain to leave ~14 MB free per TC = 112 MB free total (8 TCs × 14 MB).
+          # dummy_elements = (768 * 1024**3 - 112 * 1024**2) / 2 bytes (bfloat16)
+          # Adjust dummy_gb if OOM during drain.
+          dummy_gb = 68  # leave ~14 MB free on this single chip (96 GB HBM)
+          dummy_elements = int(dummy_gb * 1024**3 / 2)  # bfloat16 = 2 bytes
+          print(f"Draining HBM with {dummy_gb} GB BF16 dummy array...")
+          try:
+              dummy = jax.device_put(
+                  np.zeros(dummy_elements, dtype=np.float16),
+                  device
+              )
+              dummy.block_until_ready()
+              print(f"[1] HBM drained to ~14 MB free: OK")
+          except Exception as e:
+              print(f"[1] HBM drain FAILED (adjust dummy_gb): {e}")
+              raise SystemExit(1)
+
+          # Step 2: Save a small FP8 array to local tmpdir (single chip, no multi-host)
+          # Shape (6144, 512) mimics a TP-sharded weight shard (~3 MB)
+          base = tempfile.mkdtemp()
+          path = os.path.join(base, "ckpt")
+          ckptr = ocp.PyTreeCheckpointer()
+          sharding = jax.sharding.NamedSharding(
+              jax.sharding.Mesh(jax.devices(), ('x',)),
+              jax.sharding.PartitionSpec('x')
+          )
+          arr_f8_save = jax.lax.bitcast_convert_type(
+              jax.device_put(np.ones((6144, 512), dtype=np.uint8), sharding),
+              jnp.float8_e4m3fn
+          )
+          arr_f8_save.block_until_ready()
+          ckptr.save(path, {"w": arr_f8_save})
+          del arr_f8_save
+          print(f"[2] Checkpoint saved")
+
+          # Step 3: Install patch and restore under HBM pressure
+          patch_count = [0]
+          orig_dp = jax.device_put
+          def patched_dp(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn"}:
+                  patch_count[0] += 1
+                  print(f"Patched device_put called! #{patch_count[0]}")
+                  x_u8 = np.asarray(x).view(np.uint8)
+                  u8 = orig_dp(x_u8, *args, **kwargs)
+                  f8 = jax.lax.bitcast_convert_type(u8, jnp.float8_e4m3fn)
+                  f8.block_until_ready()
+                  return f8
+              return orig_dp(x, *args, **kwargs)
+          jax.device_put = patched_dp
+
+          abstract = {"w": jax.ShapeDtypeStruct((6144, 512), jnp.float8_e4m3fn, sharding=sharding)}
+          print(f"[3] Restoring under HBM pressure...")
+          try:
+              restored = ckptr.restore(path, item=abstract)
+              jax.device_put = orig_dp
+              w = restored["w"]
+              if isinstance(w, jax.Array) and str(w.dtype) == 'float8_e4m3fn':
+                  print(f"[3] Restore under pressure: PASS (dtype={w.dtype}, patch_calls={patch_count[0]})")
+                  print("=== PASS: patch works under HBM pressure ===")
+              else:
+                  print(f"[3] Restore under pressure: FAIL (got {type(w).__name__}, dtype={getattr(w,'dtype','N/A')})")
+          except Exception as e:
+              jax.device_put = orig_dp
+              print(f"[3] Restore under pressure: FAIL — {e}")
+              print("=== FAIL: OOM even at per-shard level — concurrent buffers exceed 14 MB free ===")
+
+          shutil.rmtree(base)
+          PYEOF

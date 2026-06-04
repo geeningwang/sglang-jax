@@ -1,0 +1,112 @@
+# ============================================================
+# Test: Critical Unknown 3 — Does bitcast_convert_type(uint8 → float8) work on TPU?
+# ============================================================
+# This is a prerequisite for the entire monkey-patch approach.
+# If bitcast_convert_type itself fails or produces a ShapeDtypeStruct,
+# the workaround is dead regardless of the interception point.
+#
+# Run:    kubectl apply -f test_bitcast_on_tpu.yaml
+# Logs:   kubectl logs -l job-name=test-fp8-bitcast -f
+# Clean:  kubectl delete job test-fp8-bitcast
+#
+# PASS criteria (all must be true):
+#   [1] "uint8 on device: PASS" — device_put(uint8) works
+#   [2] "bitcast to float8: PASS" — bitcast_convert_type returns a jax.Array
+#   [3] "dtype correct: PASS" — result.dtype == float8_e4m3fn
+#   [4] "compute works: PASS" — can use the float8 array in a GEMM
+#
+# FAIL indicators:
+#   - "bitcast to float8: FAIL" → bitcast is broken, workaround impossible
+#   - Any RESOURCE_EXHAUSTED error → HBM issue even for this small test
+#   - TypeError with ShapeDtypeStruct → same libtpu block as device_put
+# ============================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-fp8-bitcast
+  namespace: default
+spec:
+  completions: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        command: [bash, -c]
+        args:
+        - |
+          python3 - << 'PYEOF'
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+
+          print(f"JAX version: {jax.__version__}")
+          print(f"Devices: {jax.devices()}")
+
+          device = jax.devices()[0]
+
+          # Test 1: device_put(uint8) on TPU
+          arr_np_u8 = np.ones((6144, 16384), dtype=np.uint8)
+          try:
+              arr_u8 = jax.device_put(arr_np_u8, device)
+              arr_u8.block_until_ready()
+              print(f"[1] uint8 on device: PASS (dtype={arr_u8.dtype}, type={type(arr_u8).__name__})")
+          except Exception as e:
+              print(f"[1] uint8 on device: FAIL — {e}")
+              raise SystemExit(1)
+
+          # Test 2: bitcast uint8 → float8_e4m3fn on TPU device
+          try:
+              arr_f8 = jax.lax.bitcast_convert_type(arr_u8, jnp.float8_e4m3fn)
+              arr_f8.block_until_ready()
+              print(f"[2] bitcast to float8: PASS (type={type(arr_f8).__name__})")
+          except Exception as e:
+              print(f"[2] bitcast to float8: FAIL — {e}")
+              raise SystemExit(1)
+
+          # Test 3: dtype check
+          if str(arr_f8.dtype) == 'float8_e4m3fn' and isinstance(arr_f8, jax.Array):
+              print(f"[3] dtype correct: PASS (dtype={arr_f8.dtype})")
+          else:
+              print(f"[3] dtype correct: FAIL (got dtype={arr_f8.dtype}, type={type(arr_f8).__name__})")
+              raise SystemExit(1)
+
+          # Test 4: use the float8 array in a FP8 GEMM (confirms it's computationally valid)
+          try:
+              # Small GEMM: [64, 6144] x [6144, 64] — uses FP8 matmul kernel
+              a = jax.lax.bitcast_convert_type(
+                  jax.device_put(np.ones((64, 6144), dtype=np.uint8), device),
+                  jnp.float8_e4m3fn
+              )
+              b = jax.lax.bitcast_convert_type(
+                  jax.device_put(np.ones((6144, 64), dtype=np.uint8), device),
+                  jnp.float8_e4m3fn
+              )
+              result = jax.lax.dot(
+                  a.astype(jnp.bfloat16),
+                  b.astype(jnp.bfloat16)
+              )
+              result.block_until_ready()
+              print(f"[4] compute works: PASS (result shape={result.shape}, dtype={result.dtype})")
+          except Exception as e:
+              print(f"[4] compute works: FAIL — {e}")
+              raise SystemExit(1)
+
+          print("\n=== ALL TESTS PASSED — bitcast approach is viable on this TPU ===")
+          PYEOF

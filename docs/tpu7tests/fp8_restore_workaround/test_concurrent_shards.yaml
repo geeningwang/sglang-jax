@@ -1,0 +1,159 @@
+# ============================================================
+# Test: Critical Unknown 2 (part B) — Does concurrent shard processing
+#       cause OOM when HBM is tight?
+# ============================================================
+# Orbax's async deserialization processes multiple array shards in parallel
+# for performance. If N shards are in-flight simultaneously, the peak HBM
+# usage during the patch is N × (uint8_shard + float8_shard).
+#
+# With 14 MB free and 6 MB per shard (3 MB uint8 + 3 MB float8):
+#   N=2  → 12 MB < 14 MB free  (fits)
+#   N=3  → 18 MB > 14 MB free  (OOM)
+#
+# This test saves M FP8 arrays and restores them simultaneously to observe
+# Orbax's actual concurrency. We instrument the patch to measure peak
+# concurrent shard count.
+#
+# Run:    kubectl apply -f test_concurrent_shards.yaml
+# Logs:   kubectl logs -l job-name=test-fp8-concurrent -f
+# Clean:  kubectl delete job test-fp8-concurrent
+#
+# PASS criteria:
+#   [1] Max concurrent patches ≤ 2 during restore → fits in 14 MB free
+#   [2] No OOM error
+#
+# FAIL indicators:
+#   - RESOURCE_EXHAUSTED → concurrent count exceeded available HBM
+#   - "Max concurrent patches: N" where N ≥ 3 → need to serialize shard transfers
+# ============================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-fp8-concurrent
+  namespace: default
+spec:
+  completions: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-flex-tpu7
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          python3 - << 'PYEOF'
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import orbax.checkpoint as ocp
+          import tempfile, os, shutil, threading, time
+
+          print(f"JAX version: {jax.__version__}")
+          device = jax.devices()[0]
+          sharding = jax.sharding.NamedSharding(
+              jax.sharding.Mesh(jax.devices(), ('x',)),
+              jax.sharding.PartitionSpec('x')
+          )
+
+          # Step 1: Drain HBM to ~14 MB free (same as test_hbm_pressure)
+          dummy_gb = 68
+          dummy_elements = int(dummy_gb * 1024**3 / 2)
+          print(f"Draining {dummy_gb} GB HBM...")
+          dummy = jax.device_put(np.zeros(dummy_elements, dtype=np.float16), device)
+          dummy.block_until_ready()
+          print("[1] HBM drained")
+
+          # Step 2: Save M=20 FP8 arrays (simulating 20 weight tensors)
+          # Each ~3 MB: shape (6144, 512) FP8
+          M = 20
+          base = tempfile.mkdtemp()
+          path = os.path.join(base, "ckpt")
+          ckptr = ocp.PyTreeCheckpointer()
+          arrays = {}
+          for i in range(M):
+              arr = jax.lax.bitcast_convert_type(
+                  jax.device_put(np.ones((6144, 512), dtype=np.uint8), sharding),
+                  jnp.float8_e4m3fn
+              )
+              arrays[f"w{i}"] = arr
+          jax.effects_barrier()
+          ckptr.save(path, arrays)
+          del arrays
+          print(f"[2] Saved {M} FP8 arrays")
+
+          # Step 3: Instrumented patch — measure concurrency
+          active_count = [0]
+          max_active = [0]
+          lock = threading.Lock()
+
+          orig_dp = jax.device_put
+          def patched_dp(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn"}:
+                  with lock:
+                      active_count[0] += 1
+                      if active_count[0] > max_active[0]:
+                          max_active[0] = active_count[0]
+                      current = active_count[0]
+                  print(f"  patch enter (concurrent={current})")
+                  try:
+                      x_u8 = np.asarray(x).view(np.uint8)
+                      u8 = orig_dp(x_u8, *args, **kwargs)
+                      f8 = jax.lax.bitcast_convert_type(u8, jnp.float8_e4m3fn)
+                      f8.block_until_ready()
+                      return f8
+                  finally:
+                      with lock:
+                          active_count[0] -= 1
+              return orig_dp(x, *args, **kwargs)
+
+          jax.device_put = patched_dp
+
+          # Step 4: Restore all M arrays simultaneously
+          abstract = {
+              f"w{i}": jax.ShapeDtypeStruct((6144, 512), jnp.float8_e4m3fn, sharding=sharding)
+              for i in range(M)
+          }
+          print(f"[3] Restoring {M} FP8 arrays under HBM pressure...")
+          try:
+              restored = ckptr.restore(path, item=abstract)
+              jax.device_put = orig_dp
+              ok = all(
+                  isinstance(restored[f"w{i}"], jax.Array) and
+                  str(restored[f"w{i}"].dtype) == 'float8_e4m3fn'
+                  for i in range(M)
+              )
+              print(f"[4] Max concurrent patch calls: {max_active[0]}")
+              print(f"[4] All {M} arrays restored correctly: {ok}")
+              if max_active[0] <= 2:
+                  print("=== PASS: Concurrency is low enough — fits in 14 MB free ===")
+              else:
+                  print(f"=== WARNING: Max concurrency={max_active[0]}, peak HBM={max_active[0]*6} MB > 14 MB free ===")
+                  print("=== Need to serialize shard transfers (semaphore in patch) ===")
+          except Exception as e:
+              jax.device_put = orig_dp
+              print(f"[3] FAILED — {e}")
+              print(f"[4] Max concurrent before failure: {max_active[0]}")
+              print("=== FAIL: OOM — add semaphore to limit concurrent bitcasts ===")
+
+          shutil.rmtree(base)
+          PYEOF
