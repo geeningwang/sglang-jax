@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-nnx-keys
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          cat << 'PYEOF' > /tmp/test.py
+          import jax
+          from flax import nnx
+          class MyModel(nnx.Module):
+              def __init__(self):
+                  self.w = nnx.Param(jax.ShapeDtypeStruct((10,), jax.numpy.float32))
+
+          model = MyModel()
+          state = nnx.state(model)
+          print("State keys:", state.keys())
+          
+          # Simulate Orbax restore where the returned state is a dict!
+          # Orbax restores into the exact type of `item`. `item` is `abstract_state`.
+          # abstract_state is created via `jax.tree_util.tree_map(_to_sds, state)`.
+          # Let's see what `jax.tree_util.tree_map` returns for an nnx.State!
+          abstract_state = jax.tree_util.tree_map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state)
+          print("Abstract state type:", type(abstract_state))
+          
+          # Now suppose Orbax restores it, returning a new tree of the same type.
+          restored_state = jax.tree_util.tree_map(lambda x: jax.numpy.ones(x.shape, x.dtype), abstract_state)
+          print("Restored state type:", type(restored_state))
+          
+          # Now update the model!
+          nnx.update(model, restored_state)
+          print("Model w type:", type(model.w.value))
+          PYEOF
+          python3 /tmp/test.py
+      restartPolicy: Never

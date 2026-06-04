@@ -1,0 +1,36 @@
+557:async def async_deserialize(
+558-    user_in_sharding: jax.sharding.Sharding,
+559-    tensorstore_spec: Union[ts.Spec, Dict[str, Any]],
+560-    global_shape: Optional[Sequence[int]] = None,
+561-    dtype: Optional[jnp.dtype] = None,
+562-    byte_limiter: Optional[ByteLimiter] = None,
+563-    context: ts.Context = TS_CONTEXT,
+564-    assume_metadata: bool = False,
+565-) -> jax.Array:
+566-  """Reads an array using TensorStore."""
+567-  byte_limiter = byte_limiter or get_byte_limiter()
+568-  in_sharding = user_in_sharding
+569-  if not isinstance(in_sharding, jax.sharding.Sharding):
+570-    raise ValueError(
+571-        'sharding passed to deserialization should be specified, concrete and'
+572-        f' an instance of `jax.sharding.Sharding`. Got {in_sharding}')
+573-  t = await ts.open(
+574-      tensorstore_spec,
+575-      open=True,
+576-      assume_metadata=assume_metadata,
+577-      context=context,
+578-  )
+579-  shape = t.shape if global_shape is None else global_shape
+580-  new_shard_shape = in_sharding.shard_shape(tuple(shape))
+581-  return await create_async_array_from_callback(
+582-      tuple(shape),
+583-      in_sharding,
+584-      functools.partial(
+585-          _read_array_index_callback,
+586-          t=t,
+587-          shape=shape,
+588-          new_shard_shape=new_shard_shape,
+589-          dtype=dtype,
+590-          byte_limiter=byte_limiter,
+591-      ),
+592-  )

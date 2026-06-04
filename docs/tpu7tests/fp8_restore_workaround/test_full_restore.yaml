@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-full-restore
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          cat << 'PYEOF' > /tmp/test.py
+          import jax
+          import jax.numpy as jnp
+          import orbax.checkpoint as ocp
+          import pickle
+          
+          # We don't monkey patch, we just see what vanilla Orbax does!
+          
+          path = "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp32_bfloat16"
+          abstract_path = path + "_abstract_state.pkl"
+          
+          import subprocess
+          subprocess.run(["gsutil", "cp", abstract_path, "/tmp/abs.pkl"])
+          
+          with open("/tmp/abs.pkl", "rb") as f:
+              abstract_state = pickle.load(f)
+              
+          ckptr = ocp.PyTreeCheckpointer()
+          
+          # HACK: Mock process_count to pretend we are the primary replica, or just let it run.
+          # We are a single CPU node, so we will fail to parse NamedSharding!
+          # To avoid the Sharding parse failure, we replace the `sharding` in abstract_state with None!
+          # Wait, if we replace with None, it will read from `_sharding` file.
+          # But the `_sharding` file has NamedSharding for 32 devices, which will fail!
+          # So we MUST mock jax.devices() and jax.process_count()!
+          
+          PYEOF
+          python3 /tmp/test.py
+      restartPolicy: Never

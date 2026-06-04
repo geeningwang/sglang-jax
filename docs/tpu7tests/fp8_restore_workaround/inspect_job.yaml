@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-restore-3
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          cat << 'PYEOF' > /tmp/test.py
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import ml_dtypes
+          import orbax.checkpoint as ocp
+          import pickle
+          
+          orig_device_put = jax.device_put
+          def patched_device_put(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+                  print("Patched device_put called!")
+                  x_u8 = np.asarray(x).view(np.uint8)
+                  arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+                  target_dtype = getattr(jnp, str(x.dtype))
+                  arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+                  arr_f8.block_until_ready()
+                  return arr_f8
+              return orig_device_put(x, *args, **kwargs)
+          jax.device_put = patched_device_put
+          
+          path = "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp32_bfloat16"
+          abstract_path = path + "_abstract_state.pkl"
+          
+          import urllib.request
+          import subprocess
+          subprocess.run(["gsutil", "cp", abstract_path, "/tmp/abs.pkl"])
+          
+          with open("/tmp/abs.pkl", "rb") as f:
+              abstract_state = pickle.load(f)
+              
+          ckptr = ocp.PyTreeCheckpointer()
+          print("Restoring...")
+          # Mock the partition specs to avoid error on single CPU node
+          mesh = jax.sharding.Mesh(jax.devices(), ('x',))
+          def convert_spec(x):
+              if isinstance(x, jax.ShapeDtypeStruct) and isinstance(x.sharding, jax.sharding.PartitionSpec):
+                  return jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=jax.sharding.NamedSharding(mesh, x.sharding))
+              return x
+          abstract_state = jax.tree_util.tree_map(convert_spec, abstract_state)
+          
+          state = ckptr.restore(path, item=abstract_state)
+          
+          flat, _ = jax.tree_util.tree_flatten(state)
+          print("Restored types:")
+          for i, x in enumerate(flat[:5]):
+              print(i, type(x))
+          PYEOF
+          python3 /tmp/test.py
+      restartPolicy: Never

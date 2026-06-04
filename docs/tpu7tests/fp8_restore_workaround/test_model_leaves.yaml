@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-model-leaves
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          
+          cat << 'PYEOF' > /tmp/test.py
+          import jax
+          from sgl_jax.srt.model_config import ModelConfig
+          from sgl_jax.srt.models.mimo_v2_pro import MIMOv2ProForCausalLM
+          from flax import nnx
+          
+          config = ModelConfig("Qwen/Qwen3-Omni-30B-A3B-Instruct", trust_remote_code=True)
+          config.dtype = jax.numpy.bfloat16
+          
+          # We need to simulate _get_model
+          mesh = jax.sharding.Mesh(jax.devices(), ('x',))
+          with jax.set_mesh(mesh):
+              model = nnx.eval_shape(lambda: MIMOv2ProForCausalLM(config.hf_config, dtype=config.dtype, mesh=mesh))
+              
+          flat, _ = jax.tree_util.tree_flatten(nnx.state(model))
+          print("Model leaves:", len(flat))
+          PYEOF
+          python3 /tmp/test.py
+      restartPolicy: Never

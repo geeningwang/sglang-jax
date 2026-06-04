@@ -448,7 +448,13 @@ intermediate dtype cast or a different array construction path?
 
 The reason **Approach 2 (uint8 + tree_map bitcast)** failed with OOM is because `tree_map` operates on the full tree: the entire 30GB model was restored as `uint8`, and during `tree_map`, both the `uint8` and `float8` copies of the arrays were held in memory simultaneously, exhausting the remaining HBM.
 
-**The Fix**: We can bypass the libtpu bug by intercepting `jax.device_put` **during** the Orbax restore process. By monkey-patching `jax.device_put`, we can perform the zero-cost CPU cast to `uint8`, transfer the array to the TPU device via the working `uint8` path, and then immediately `bitcast_convert_type` to `float8` on the device. Because this interception happens per-shard inside Orbax's execution, the temporary `uint8` TPU buffer goes out of scope and is garbage collected *immediately* after the bitcast. This completely avoids the HBM OOM by only requiring 144MB of extra overhead at any given time.
+**The Fix**: We can bypass the libtpu bug by intercepting `jax.device_put` **during** the Orbax restore process. By monkey-patching `jax.device_put`, we can perform the zero-cost CPU cast to `uint8`, transfer the array to the TPU device via the working `uint8` path, and then immediately `bitcast_convert_type` to `float8` on the device. 
+
+Crucially, we must call `.block_until_ready()` on the output of the bitcast. This halts the Python async worker loop until XLA finishes compiling and executing the cast, which keeps Orbax's `byte_limiter` token securely held until the memory is truly freed. Without this block, Orbax would eagerly pull all 8,304 parameter shards (240 GB per node) into Host RAM simultaneously while the XLA compilation queued up, triggering an OS `ExitCode 137` memory kill.
+
+### Iterative TensorStore Loading
+
+Due to a secondary bug in Orbax `0.12.0`'s internal `SingleReplicaArrayHandler` which fails to broadcast the correctly restored tree state back to the `checkpointer.restore` caller when running across multiple partitioned hosts, we bypass `checkpointer.restore` entirely. Instead, we manually parse the `_METADATA` via `msgpack` and iterate over the shards, leveraging TensorStore directly alongside our monkey-patched `device_put`.
 
 ### Implementation:
 ```python
@@ -475,12 +481,16 @@ def patched_device_put(x, *args, **kwargs):
 # Apply during restore:
 jax.device_put = patched_device_put
 try:
-    state = checkpointer.restore(path, item=abstract_state)
+    # Manual TensorStore iteration bypasses broken Orbax multi-host broadcast
+    # (Implementation omitted for brevity, see `python/sgl_jax/srt/model_loader/loader.py`)
+    state = ... 
 finally:
     jax.device_put = orig_device_put
 ```
 
 This workaround has been implemented in `python/sgl_jax/srt/model_loader/loader.py` and successfully resolves the issue without needing to wait for a newer container or saving the checkpoint in a different format.
+
+A minimal reproducible demo of this workaround is available in `docs/tpu7tests/fp8_restore_workaround/single_tpu_job.yaml`.
 
 ---
 

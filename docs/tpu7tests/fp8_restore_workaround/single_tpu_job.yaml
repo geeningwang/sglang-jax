@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-orbax-fp8-single
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          cat << 'PYEOF' > /tmp/test_fp8.py
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import ml_dtypes
+          import orbax.checkpoint as ocp
+          import tempfile
+          import os
+          import shutil
+          
+          print(f"JAX devices: {jax.device_count()}")
+          
+          # We monkey-patch jax.device_put to transfer as uint8 and bitcast on device.
+          orig_device_put = jax.device_put
+          def patched_device_put(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+                  print("Patched device_put called!")
+                  x_u8 = np.asarray(x).view(np.uint8)
+                  arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+                  target_dtype = getattr(jnp, str(x.dtype))
+                  arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+                  arr_f8.block_until_ready()
+                  del x_u8
+                  del arr_u8
+                  return arr_f8
+              return orig_device_put(x, *args, **kwargs)
+          
+          jax.device_put = patched_device_put
+          
+          base = tempfile.mkdtemp()
+          path = os.path.join(base, "ckpt")
+          
+          # Create an FP8 array
+          mesh = jax.sharding.Mesh(jax.devices(), ('x',))
+          with jax.set_mesh(mesh):
+              sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+              
+              # Put it on device. This should trigger our patch!
+              print("Putting array on device...")
+              arr = jnp.ones((1024, 1024), dtype=jnp.float8_e4m3fn)
+              jax_arr = jax.device_put(arr, sharding)
+              
+              ckptr = ocp.PyTreeCheckpointer()
+              
+              # Save it
+              print("Saving...")
+              ckptr.save(path, {"w": jax_arr})
+              
+              # Restore it using an abstract state
+              print("Restoring...")
+              abstract_state = {"w": jax.ShapeDtypeStruct((1024, 1024), jnp.float8_e4m3fn, sharding=sharding)}
+              restored = ckptr.restore(path, item=abstract_state)
+              
+              print("Restored type:", type(restored["w"]))
+              if not isinstance(restored["w"], jax.ShapeDtypeStruct):
+                  print("Restored dtype:", restored["w"].dtype)
+          
+          jax.device_put = orig_device_put
+          shutil.rmtree(base)
+          PYEOF
+          python3 /tmp/test_fp8.py
+      restartPolicy: Never
+  backoffLimit: 0
