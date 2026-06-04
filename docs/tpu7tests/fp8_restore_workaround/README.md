@@ -21,8 +21,17 @@ kubectl logs -l job-name=test-orbax-fp8-single
 ```
 
 You should see:
-```
+```text
+JAX devices: 1
+Putting array on device...
+Patched device_put called!
+Saving...
+Restoring...
+/opt/venv/lib/python3.12/site-packages/orbax/checkpoint/_src/serialization/jax_array_handlers.py:749: UserWarning: Sharding info not provided when restoring. Populating sharding info from sharding file. Please note restoration time will be slightly increased due to reading from file. Note also that this option is unsafe when restoring on a different topology than the checkpoint was saved with.
+  warnings.warn(
 Patched device_put called!
 Restored type: <class 'jaxlib._jax.ArrayImpl'>
 Restored dtype: float8_e4m3fn
 ```
+
+This confirms the underlying transfer bug is successfully bypassed. To implement this across a multi-host TPU slice, the `tensorstore` reads must be manually iterated to bypass Orbax `0.12.0`'s broken `SingleReplicaArrayHandler` multi-host broadcast tree logic.

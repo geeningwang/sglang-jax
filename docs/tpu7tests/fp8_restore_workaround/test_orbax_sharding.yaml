@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-orbax-sharding
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        command: [bash, -c]
+        args:
+        - |
+          pip3 install -q "orbax-checkpoint>=0.12.0"
+          cat << 'PYEOF' > /tmp/test_sharding.py
+          import jax
+          import jax.numpy as jnp
+          import numpy as np
+          import ml_dtypes
+          import orbax.checkpoint as ocp
+          import tempfile
+          import os
+          import shutil
+          
+          # Patch device_put
+          orig_device_put = jax.device_put
+          def patched_device_put(x, *args, **kwargs):
+              if hasattr(x, "dtype") and str(x.dtype) in {"float8_e4m3fn", "float8_e5m2"}:
+                  print("Patched device_put called!")
+                  x_u8 = np.asarray(x).view(np.uint8)
+                  arr_u8 = orig_device_put(x_u8, *args, **kwargs)
+                  target_dtype = getattr(jnp, str(x.dtype))
+                  arr_f8 = jax.lax.bitcast_convert_type(arr_u8, target_dtype)
+                  arr_f8.block_until_ready()
+                  del x_u8
+                  del arr_u8
+                  return arr_f8
+              return orig_device_put(x, *args, **kwargs)
+          
+          jax.device_put = patched_device_put
+          
+          base = tempfile.mkdtemp()
+          path = os.path.join(base, "ckpt")
+          
+          # Create a mesh with 4 nodes, 8 devices each -> 32 total devices, just like 2x2x4 TPU
+          # Since we are on a 1-device VM, we mock the mesh!
+          # Actually, we can't mock jax.devices() easily.
+          # Let's just create a sharding with 1 device and see if we can restore using `restore_args`!
+          
+          mesh = jax.sharding.Mesh(jax.devices(), ('x',))
+          sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('x'))
+          
+          arr = jnp.ones((1024, 1024), dtype=jnp.float8_e4m3fn)
+          jax_arr = jax.device_put(arr, sharding)
+          
+          ckptr = ocp.PyTreeCheckpointer()
+          ckptr.save(path, {"w": jax_arr})
+          
+          # Now, instead of passing `item=abstract_state`, we use `restore_args`!
+          # PyTreeRestore
+          
+          restore_args = {"w": ocp.args.ArrayRestoreArgs(restore_type=jnp.ndarray, sharding=sharding)}
+          args = ocp.args.PyTreeRestore(restore_args=restore_args)
+          
+          restored = ckptr.restore(path, args=args)
+          
+          print("Restored type:", type(restored["w"]))
+          if not isinstance(restored["w"], jax.ShapeDtypeStruct):
+              print("Restored dtype:", restored["w"].dtype)
+          
+          jax.device_put = orig_device_put
+          shutil.rmtree(base)
+          PYEOF
+          python3 /tmp/test_sharding.py
+      restartPolicy: Never
