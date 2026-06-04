@@ -346,7 +346,8 @@ class JAXModelLoader(DefaultModelLoader):
         logger.info("Loading from checkpoint %s (~2 min)...", path)
         checkpointer = ocp.PyTreeCheckpointer()
         try:
-            abstract_state = self._load_abstract_state(self._abstract_state_path(path))
+            with jax.set_mesh(self.mesh):
+                abstract_state = self._load_abstract_state(self._abstract_state_path(path))
             logger.info("Restored abstract state structure from checkpoint metadata.")
         except Exception as e:
             logger.warning("Abstract state not found, falling back to model state (%s)", e)
@@ -379,11 +380,7 @@ class JAXModelLoader(DefaultModelLoader):
             state = checkpointer.restore(path, item=abstract_state)
         finally:
             jax.device_put = orig_device_put
-            
-        # NOTE: JAX 0.8.1 on TPU cannot create float8_e4m3fn arrays via Orbax restore.
-        # The leaves remain as ShapeDtypeStruct objects. This model is fully FP8-quantized
-        # so ALL weights fail to restore. The checkpoint approach is blocked until JAX
-        # supports FP8 array creation on TPU. See mimo_v25_pro_weight_checkpoint.md.
+
         nnx.update(model, state)
         self._patch_narrow_blockwise(model)
         logger.info("Checkpoint loaded successfully from %s", path)
