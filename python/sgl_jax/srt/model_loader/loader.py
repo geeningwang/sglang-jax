@@ -426,20 +426,6 @@ class JAXModelLoader(DefaultModelLoader):
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
 
-        # Force allow_narrow_n_blockwise=True BEFORE apply_linear_quantization whenever
-        # checkpoint saving/loading is enabled (SGLANG_CHECKPOINT_DIR is set).
-        # This ensures ALL linear layers (including narrow out_dim=128 ones) get
-        # weight_q+weight_scale structure — matching what load_weights() produces.
-        # Must apply on BOTH slow-path (save) and fast-path (restore) runs so the
-        # checkpoint structure and abstract_state.pkl are always consistent.
-        if checkpoint_path and (
-            hasattr(model_config, "quantization_config")
-            and model_config.quantization_config is not None
-            and hasattr(model_config.quantization_config, "allow_narrow_n_blockwise")
-        ):
-            model_config.quantization_config.allow_narrow_n_blockwise = True
-            logger.info("Checkpoint restore: set allow_narrow_n_blockwise=True before quant setup.")
-
         # Quantization config is already unified in model_config
         # No need for any conversion logic here
         if (
