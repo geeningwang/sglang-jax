@@ -80,7 +80,46 @@ they are streamed from GCS via gcsfuse into a RAM-backed file cache.
 
 ## Main memory / RAM
 
-### 4-node
+The RAM profile depends on the weight-loading mode. Two modes have been measured:
+
+---
+
+### Mode A — NFS + Orbax checkpoint restore (current production path)
+
+**TPU worker nodes** (4×, pod limit 900 Gi each):
+
+| Allocation | Per node | 4-node total | Notes |
+|------------|----------|-------------|-------|
+| Pod request / limit | 900 Gi | 3600 Gi | Hard limit set in pod spec |
+| OS + kernel | ~2 GB | ~8 GB | Linux system |
+| Container runtime (containerd, kubelet, GKE agents) | ~1 GB | ~4 GB | |
+| Python process (JAX runtime, NNX model graph, sglang-jax, tokenizer) | ~8–15 GB | ~32–60 GB | Steady-state after restore |
+| **Orbax I/O buffer** (GCS OCDBT streaming read window) | **up to 89.4 GB** | **up to 358 GB** | `restore_concurrent_bytes=96,000,000,000`; released after restore |
+| JAX host-side staging (FP8 monkey-patch, uint8 shard buffers) | ~3–6 GB peak | ~12–24 GB peak | Each shard ~3 MB; serial, transient |
+| XLA compilation cache (HLO modules in RAM) | ~2–5 GB | ~8–20 GB | Warm after first run |
+| NFS client page cache (tokenizer + config files) | <0.1 GB | <0.5 GB | Weights come from GCS, not NFS in fast path |
+| **Peak (during restore)** | **~100–110 GB** | **~400–440 GB** | Dominated by Orbax buffer |
+| **Steady-state (serving)** | **~15–20 GB** | **~60–80 GB** | Buffer released; model is in HBM |
+| **Headroom** | **~780–785 GB** | | Of 900 Gi pod limit |
+
+> `enable_pinned_host_transfer=False` confirmed in logs — Orbax does **not** use pinned (page-locked) host memory. The 89.4 GiB is a soft concurrency cap on in-flight GCS reads, not a reserved allocation.
+
+**NFS weight servers** (3×, always-on, not accessed during fast-restore):
+
+| VM | Machine type | Total RAM | tmpfs used | Safetensors files |
+|----|-------------|-----------|-----------|-------------------|
+| `jingnw-nfs-weights-1` | n2-highmem-48 | **384 GB** | ~322 GB | 12 files |
+| `jingnw-nfs-weights-2` | n2-highmem-48 | **384 GB** | ~350 GB | 12 files |
+| `jingnw-nfs-weights-3` | n2-highmem-48 | **384 GB** | ~292 GB | 10 files |
+| **Total NFS RAM** | | **1,152 GB** | **~964 GB** | 34 files |
+
+NFS servers are used **only** for the slow-path (first-run weight load, ~42 min).
+On checkpoint-restore runs, NFS is mounted read-only but only tokenizer/config
+files (KBs) are accessed.
+
+---
+
+### Mode B — gcsfuse direct (legacy, slow path)
 
 | Allocation | Per pod | 4-pod total |
 |------------|---------|-------------|
@@ -88,18 +127,10 @@ they are streamed from GCS via gcsfuse into a RAM-backed file cache.
 | gcsfuse file cache (`emptyDir medium: Memory`) | up to 850 Gi | up to 3400 Gi |
 | OS + Python process + gcsfuse daemon | ~50 Gi | ~200 Gi |
 
-### 2-node
-
-| Allocation | Per pod | 2-pod total |
-|------------|---------|-------------|
-| Pod request / limit | 900 Gi | 1800 Gi |
-| gcsfuse file cache (`emptyDir medium: Memory`) | up to 850 Gi | up to 1700 Gi |
-| OS + Python process + gcsfuse daemon | ~50 Gi | ~100 Gi |
-
-The gcsfuse cache (`--file-cache-max-size-mb=800000`, 800 GB LRU limit) holds
-recently-accessed weight chunks in RAM. The 34 safetensors files (~962 GB total)
-do not fully fit, so LRU eviction keeps hot MoE expert files resident. First access
-downloads from GCS; subsequent accesses are served from RAM (~10× faster).
+The gcsfuse cache (`--file-cache-max-size-mb=800000`, 800 GB LRU limit) held
+recently-accessed weight chunks in RAM. The 34 safetensors files (~962 GB) did
+not fully fit, so hot MoE experts stayed resident. Load time: ~2h25m.
+**This mode is no longer used.**
 
 ---
 
@@ -117,9 +148,9 @@ for **both** configurations:
 
 | Use | Per node | Per TensorCore | Notes |
 |-----|----------|----------------|-------|
-| Model weights (FP8, sharded ÷ 32 TCs) | ~240 GB | ~30 GB | 962 GB ÷ 32 |
-| KV cache — attention layers | 286 GB | ~35.8 GB | 156,288 tokens; bfloat16 |
-| KV cache — MLA/linear layers | 60 GB | ~7.5 GB | 195,360 tokens; bfloat16 |
+| Model weights (FP8 MoE + BF16 attn, sharded ÷ 32 TCs) | ~240 GB | ~30 GB | 962 GB ÷ 32 |
+| KV cache — full layers (60 SWA layers) | 286.64 GB | ~35.8 GB | 156,528 tokens; bfloat16 (measured) |
+| KV cache — SWA layers (10 layers) | 59.72 GB | ~7.5 GB | 195,664 tokens; bfloat16 (measured) |
 | **Total static used** | **~586 GB** | **~73 GB** | |
 
 ### 2-node static pool breakdown (per node, 8 TensorCores, 768 GB total)
@@ -209,13 +240,16 @@ freeing ~43 GB for KV cache (~3.5× more context capacity).
 
 | Resource | 4-node | 2-node |
 |----------|--------|--------|
-| GCS weights | ~962 GB | ~962 GB (shared) |
+| GCS checkpoint | ~482 GB logical | — |
+| GCS weights (HF safetensors) | ~962 GB | ~962 GB (shared) |
 | GCS compilation cache | ~85 MB | ~85 MB (separate cache key) |
 | Hard disk total | 400 GB | 200 GB |
-| RAM total (pods) | 3600 Gi | 1800 Gi |
-| RAM gcsfuse cache | up to 3400 Gi | up to 1700 Gi |
+| **RAM — TPU nodes (pods, limit)** | **3600 Gi** | **1800 Gi** |
+| RAM — TPU nodes, peak (restore) | ~400–440 GB | — |
+| RAM — TPU nodes, steady-state | ~60–80 GB | — |
+| RAM — NFS weight servers (tmpfs) | **~964 GB** (3 VMs) | ~964 GB (slow path only) |
 | HBM total | 3072 GB | 1536 GB |
 | HBM static pool (75%) | 2304 GB | 1152 GB |
 | HBM XLA temp (25%) | 768 GB | 384 GB |
-| HBM weights | ~960 GB | ~960 GB |
-| HBM KV cache | ~1384 GB | ~192 GB |
+| HBM weights | ~962 GB | ~962 GB |
+| HBM KV cache (measured) | **346 GB** (286.6 + 59.7) | ~192 GB |

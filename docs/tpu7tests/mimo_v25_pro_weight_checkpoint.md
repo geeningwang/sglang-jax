@@ -23,17 +23,43 @@ Expected startup reduction: ~40 min → ~5 min (MoE loading phase).
 
 ---
 
-## Background — Current Loading Pipeline
+## Startup Timing — Checkpoint Restore Path (measured 2026-06-05)
 
-### Timing (measured, 4-node 2x2x4, tp-size=32)
+All times from pod start (`T=0`). 4-node 2x2x4, tp-size=32, warm XLA cache.
+
+| Phase | Wall time | Duration | Notes |
+|-------|-----------|----------|-------|
+| Container setup (git clone, pip install, apt, NFS mount) | T+0s → T+0s | ~0s | Warm nodes; install cached from prior run |
+| JAX distributed init (4-node rendezvous on port 6006) | T+48s → T+57s | ~9s | All 4 nodes synchronize |
+| Quantization structure prep (`apply_moe_quantization`) | T+57s → T+59s | ~2s | Model graph wired up in host RAM |
+| **Checkpoint restore** (Orbax OCDBT from GCS) | T+59s → T+158s | **98.3s** | 5.28 GiB/s · 481.9 GiB per host |
+| KV cache profiling (binary search, HBM probe) | T+158s → T+162s | ~4s | Tries 156k → 195k tokens |
+| KV cache allocation (fused slabs) | T+162s → T+162s | <1s | 286.6 GB + 59.7 GB |
+| XLA precompile — EXTEND (4 token-pad shapes) | T+162s → T+212s | **50s** | bs=2; tokens ∈ {64,128,256,512}; warm cache |
+| XLA precompile — DECODE (2 batch sizes) | T+212s → T+231s | **19s** | bs ∈ {1,2}; warm cache |
+| **Server healthy** (`/health` returns 200) | **T+235s** | | **~3m55s total** |
+| Inference (276 prompt + 512 decode tokens) | T+235s → T+283s | ~48s | ~10.7 tok/s decode |
+
+**Total startup: 235s (~3m55s)** — vs 57 min NFS slow-path, vs ~2h25m gcsfuse.
+
+---
+
+## Startup Timing — NFS Slow Path (reference, measured 2026-06-04)
 
 | Phase | Duration | Notes |
 |-------|----------|-------|
-| sglang-jax install + NFS mount | ~5 min | One-time per job |
-| Regular weights (557 tensors) | ~3 min | Fast, small tensors |
-| **MoE weights (414 groups)** | **~40 min (NFS) / ~2h (gcsfuse)** | Bottleneck |
-| KV cache profiling | ~1 min | |
-| XLA warmup | ~55s (warm cache) | |
+| Container setup + NFS mount | ~5 min | git clone, pip install, apt, mount |
+| JAX distributed init | ~9s | |
+| Quantization structure prep | ~2s | |
+| **MoE weight loading (414 groups)** | **~40 min** | NFS RAM-backed; I/O + CPU conversion bottleneck |
+| Regular weights (attn/MLP, 557 tensors) | ~3 min | Fast, small tensors |
+| KV cache profiling + allocation | ~1 min | |
+| XLA precompile (warm cache) | ~69s | |
+| **Server healthy** | **~57 min total** | |
+
+---
+
+## Background — Slow-Path Loading Pipeline
 
 ### What happens during MoE weight loading
 
@@ -273,24 +299,108 @@ python3 -c "import orbax.checkpoint; print(orbax.checkpoint.__version__)"
 
 ---
 
-## Expected Results
+## Measured Results (2026-06-05)
 
-| Metric | Before (NFS) | After (checkpoint) |
-|--------|-------------|-------------------|
-| First-run load time | ~40 min | ~45 min (40 + 5 save) |
-| Subsequent load time | ~40 min | **~5 min** |
-| I/O per node | 240 GB | 30 GB |
-| CPU conversion | Yes (scale reshape, QKV fusion) | **No** |
-| Checkpoint size (GCS) | — | ~962 GB (32 shards) |
+| Metric | NFS slow-path | Checkpoint restore |
+|--------|--------------|-------------------|
+| First-run load time | ~42 min | ~44.6 min (42 + 2.6 save) |
+| Subsequent restore time | ~42 min | **98.3s (~1m38s)** |
+| Total startup (restore + warmup) | ~57 min | **~3m55s** |
+| GCS I/O per host | — | 481.9 GiB at 5.28 GiB/s |
+| GCS raw block I/O per host | — | 273.9 GiB at 3.64 GiB/s |
+| CPU conversion during restore | — | **None** |
 | tp-size portability | Any | Fixed to saved tp-size |
 
-First-run cost: +5 min (save). Subsequent savings: ~35 min per run.
-Break-even: after 2 runs (1 first-run + 1 fast reload = ~50 min vs 2 × 40 min = 80 min).
+First-run cost: +2.6 min (save). Subsequent savings: ~53 min per run.
+Break-even: after 2 runs.
+
+---
+
+## Memory Allocation — Checkpoint Restore Path
+
+### HBM (per TensorCore, 96 GB total)
+
+| Use | Per TC | 32-TC total | Notes |
+|-----|--------|-------------|-------|
+| Model weights | ~30 GB | ~962 GB | FP8 MoE + BF16 attention/MLP |
+| KV cache — 60 SWA layers | ~8.96 GB | 286.64 GB | 156,528 tokens, bfloat16 |
+| KV cache — 10 full layers | ~1.87 GB | 59.72 GB | 195,664 tokens, bfloat16 |
+| XLA temporaries | 24 GB | 768 GB | 25% reserved; needed for EPMoE GEMM |
+| **Total used** | **~65 GB** | **~2,076 GB** | of 3,072 GB total |
+
+### Host RAM (per TPU worker node, 900 Gi pod limit)
+
+| Consumer | Per node | 4-node total | Notes |
+|----------|----------|-------------|-------|
+| Orbax I/O buffer (GCS read window) | up to 89.4 GB | up to 358 GB | Released after restore; `restore_concurrent_bytes=96 GB` |
+| Python / JAX runtime + model graph | ~8–15 GB | ~32–60 GB | NNX module objects, sglang-jax, tokenizer |
+| XLA compilation cache | ~2–5 GB | ~8–20 GB | Warm HLO modules |
+| FP8 staging (uint8 shard buffers) | ~3–6 GB peak | ~12–24 GB peak | Transient; ~3 MB per shard, serial |
+| OS + container runtime | ~3 GB | ~12 GB | |
+| **Peak (during restore)** | **~105–115 GB** | **~420–460 GB** | |
+| **Steady-state (serving)** | **~15–25 GB** | **~60–100 GB** | Buffer released; model is in HBM |
+
+> `enable_pinned_host_transfer=False` — Orbax does **not** use pinned host memory.
+> The 89.4 GiB is a streaming concurrency cap, not a reserved allocation.
+
+### NFS weight servers (always-on, not read during fast-restore)
+
+| VM | RAM | tmpfs | Files |
+|----|-----|-------|-------|
+| `jingnw-nfs-weights-1` | 384 GB | ~322 GB | 12 safetensors |
+| `jingnw-nfs-weights-2` | 384 GB | ~350 GB | 12 safetensors |
+| `jingnw-nfs-weights-3` | 384 GB | ~292 GB | 10 safetensors |
+| **Total** | **1,152 GB** | **~964 GB** | 34 files |
+
+NFS servers hold the HuggingFace safetensors in RAM for the slow-path (first run
+only). They are **not read** during checkpoint restore — only the tokenizer and
+`config.json` are fetched (KBs via NFS).
+
+---
+
+## Data Dependencies — Checkpoint Restore Path
+
+```
+pod start
+    │
+    ├─── GitHub (git clone -b tpu7)
+    │       └─ python/sgl_jax/...  ← sglang-jax source code
+    │
+    ├─── NFS (read-only mount, tokenizer + config only)
+    │       ├─ 10.128.0.92:/mnt/weights    (jingnw-nfs-weights-1)
+    │       ├─ 10.128.15.231:/mnt/weights  (jingnw-nfs-weights-2)
+    │       └─ 10.128.0.45:/mnt/weights    (jingnw-nfs-weights-3)
+    │       → /mnt/weights/ symlink union
+    │           ├─ tokenizer.json, tokenizer_config.json  ← read
+    │           ├─ config.json, generation_config.json    ← read
+    │           └─ model-*.safetensors (34 files, ~964 GB) ← NOT read
+    │
+    ├─── GCS (checkpoint restore, ~5.28 GiB/s per host, 98s)
+    │       └─ gs://.../sglang-checkpoint/95dc2640/tp32_bfloat16/
+    │               ├─ ocdbt.process_{0,1,2,3}/  ← each node reads its own shards
+    │               ├─ d/                         ← OCDBT shared data blocks
+    │               ├─ _METADATA                  ← tensor tree structure
+    │               ├─ _CHECKPOINT_METADATA       ← Orbax bookkeeping
+    │               └─ tp32_bfloat16_abstract_state.pkl  ← shape/sharding metadata
+    │
+    ├─── GCS (XLA compilation cache, warm hit, negligible I/O)
+    │       └─ gs://.../jax-compilation-cache/   ← precompiled kernels (tp-size=32)
+    │
+    └─── Inter-node network (ICI + GKE overlay)
+            ├─ JAX distributed rendezvous (port 6006, coordinator node)
+            ├─ Orbax multi-host checkpoint sync (all-barrier before/after restore)
+            └─ Inference: all-reduce per transformer layer (~2× per layer, 70 layers)
+```
+
+**Critical path**: GitHub clone → JAX init → checkpoint restore (GCS) → KV cache →
+XLA precompile (cache hit) → serve. The only external bottleneck is GCS bandwidth.
 
 ---
 
 ## Related Documents
 
+- [mimo_v25_pro_progress.md](mimo_v25_pro_progress.md) — overall status and bug log
 - [mimo_v25_pro_inference_pipeline.md](mimo_v25_pro_inference_pipeline.md) — weight loading pipeline detail
-- [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) — performance measurements
-- [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) — HBM/RAM allocation
+- [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) — throughput benchmarks
+- [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) — full HBM/RAM allocation tables
+- [fp8_restore_workaround/README.md](fp8_restore_workaround/README.md) — FP8 device_put bug and fix
