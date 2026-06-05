@@ -37,3 +37,61 @@ CONCLUSION:
 
   Option B (increase mem_fraction_static for tp-16) is INFEASIBLE.
   Only viable path to 2-node: EP > 1 to halve MoE weight per TC.
+
+─────────────────────────────────────────────────────────────────────────────
+XLA OOM ANALYSIS — mem_fraction_static=0.85 failure
+─────────────────────────────────────────────────────────────────────────────
+
+Error: "Used 100.28G of 94.75G hbm. Exceeded hbm capacity by 5.54G."
+
+Interpretation:
+  - 94.75 GB = XLA's HBM budget for the EXTEND compilation step
+  - 100.28 GB = total HBM XLA tried to allocate (model params + KV cache +
+                peak intermediate activations for a single EXTEND step)
+  - 5.54 GB = excess (only ~5.5% over the limit)
+
+The model is VERY CLOSE to fitting at mem_fraction_static=0.85 (14.4 GB XLA
+temp). The 5.54 GB overage means reducing peak intermediates by just 5.54 GB
+would enable the more aggressive static pool allocation.
+
+POTENTIAL MITIGATIONS (for future investigation):
+
+1. XLA Compiler Flags (no code changes, easiest to try):
+   a. Force aggressive rematerialization:
+      XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"
+      Changes the XLA scheduler to strictly minimize peak HBM over speed.
+      Automatically recomputes tensors instead of storing them.
+
+   b. Reduce max parallel loop iterations (if model uses while_loops):
+      XLA_FLAGS="$XLA_FLAGS --maximum_parallel_iterations=1"
+      Prevents XLA from prefetching too many iterations simultaneously.
+
+   c. Artificially lower XLA's HBM budget to force aggressive optimization:
+      XLA_FLAGS="$XLA_FLAGS --xla_tpu_max_hbm_size_mib=90000"
+      Tricks the compiler into believing it has 90 GB instead of 94.75 GB,
+      forcing hyper-aggressive optimization passes.
+
+2. JAX Rematerialization (code change, high impact):
+   Wrap the EPMoE forward pass or attention computation in jax.remat():
+     @functools.partial(jax.remat, policy=jax.checkpoint_policies.nothing_saveable)
+     def epmoe_forward(...): ...
+   This discards intermediate activations during compile and recomputes them
+   on-the-fly, reducing peak HBM by 5-20 GB at the cost of ~10-30% slower compute.
+
+3. Buffer Donation (verify existing usage):
+   sglang-jax already uses donate_argnums=["memory_pools"] in jitted_run_model.
+   Verify all donatable inputs are listed — any non-donated large input that XLA
+   can't reuse will inflate the peak.
+
+4. Reduce prefill batch size (max_prefill_tokens):
+   Activations during EXTEND scale with max_prefill_tokens (currently 16384).
+   Reducing to 8192 would halve attention intermediate tensors.
+   Trade-off: lower prefill throughput per step.
+
+PRIORITIZED NEXT STEPS FOR tp-16 ENABLEMENT:
+  Step 1: Try XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY" with
+          mem_fraction_static=0.85 at tp-32. If EXTEND now passes (< 14.4 GB),
+          apply the same flag to the tp-16 run.
+  Step 2: If Step 1 insufficient, add jax.remat() to the EPMoE forward call.
+  Step 3: EP > 1 (changes model architecture, halves MoE weight per TC).
+          Most reliable but requires the most code changes.

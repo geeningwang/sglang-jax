@@ -219,19 +219,77 @@ This determines whether the overhead is:
 - **TC-proportional**: scales 1/TP_size (doubles at tp-16)
 - **Expert-proportional**: scales with experts_per_TC
 
-### Phase 5 — Reduction strategies (1–3 days, after Phase 1–4)
+### Phase 5 — Reduction strategies (updated with measurements)
 
-Based on findings, implement and test reduction strategies:
+Strategies are now ranked by feasibility given Phase 1–4 findings.
 
-| Strategy | Savings potential | Risk | Condition |
-|----------|-----------------|------|-----------|
-| **S1**: Offload weight scales to host RAM (pinned) | ~1 GB | Latency on dereference | If scales are accessed once per forward |
-| **S2**: Move BF16 attention weights to host RAM | ~2.76 GB (tp-16) | Latency per layer | If attention compute is latency-tolerant |
-| **S3**: Delete intermediate arrays early after restore | ? | Complexity | If H8 confirmed |
-| **S4**: Use `jax.clear_caches()` before KV profiling | ~5–10 GB? | Cache miss cost | If H3 (XLA code) confirmed |
-| **S5**: Reduce `max_prefill_tokens` or `chunked_prefill_size` | ? | Prefill throughput | If prefill buffers are the source |
-| **S6**: Reduce `mem_fraction_static` just enough to get XLA temp from 24→18 GB | +6 GB static | EPMoE may OOM | Benchmark EPMoE temp requirement precisely |
-| **S7**: EP > 1 to distribute experts across nodes | Reduces wi_0/wi_1/wo per TC | Architecture change | Separate optimization track |
+#### S7: EP > 1 — Only reliable path to 2-node (Recommended)
+
+With `ep_size=2`, each TC handles 192 of 384 experts. MoE weight per TC halves,
+reducing the total model footprint from ~102 GB to ~34 GB at tp-16.
+
+#### XLA EXTEND OOM Analysis (from EPMoE min-temp test)
+
+The error `"Used 100.28G of 94.75G hbm. Exceeded hbm capacity by 5.54G"` during
+EXTEND precompile at `mem_fraction_static=0.85` (14.4 GB XLA temp) means:
+
+- 94.75 GB = XLA's HBM budget for the compilation step
+- 100.28 GB = total HBM XLA tried to allocate: model params (64.68 GB) + KV cache
+  (20.3 GB) + peak intermediate activations during a single EXTEND step
+- 5.54 GB over — only ~5.5% excess, very close to fitting
+
+Because the overage is small, the following tweaks could push it under the limit
+without requiring EP > 1:
+
+**XLA compiler flags (no code changes):**
+
+```bash
+# Force XLA to minimize peak HBM over execution speed
+export XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"
+
+# Trick compiler into believing less HBM is available → hyper-aggressive opts
+export XLA_FLAGS="$XLA_FLAGS --xla_tpu_max_hbm_size_mib=90000"
+
+# Reduce parallel loop prefetch if model uses while_loops
+export XLA_FLAGS="$XLA_FLAGS --maximum_parallel_iterations=1"
+```
+
+**JAX rematerialization (code change, high impact):**
+
+Wrap EPMoE forward pass in `jax.remat()` to discard intermediate activations
+during compilation and recompute them on-the-fly:
+
+```python
+@functools.partial(jax.remat,
+                   policy=jax.checkpoint_policies.nothing_saveable)
+def epmoe_forward(...): ...
+```
+Trades ~10–30% slower compute for 5–20 GB reduction in peak compilation HBM.
+
+**Reduce prefill batch size:**
+
+EXTEND activations scale with `--max-prefill-tokens` (currently 16384). Halving
+to 8192 reduces attention intermediates proportionally.
+
+**Buffer donation (verify):**
+
+`jitted_run_model` already uses `donate_argnums=["memory_pools"]`. Verify all
+large donatable inputs are listed — un-donated inputs inflate peak HBM by forcing
+XLA to hold old + new copies simultaneously.
+
+#### Updated strategy table
+
+| Strategy | Savings | Risk | Status |
+|----------|---------|------|--------|
+| **S3**: Delete intermediate arrays early after restore | 0 GB | — | **RULED OUT** (H8: GC frees < 10 MB) |
+| **S4**: `jax.clear_caches()` before profiler | 0 GB | — | **RULED OUT** (delta = 0.00 GB measured) |
+| **S6**: Reduce `mem_fraction_static` | Blocked | EPMoE needs ~20 GB XLA min | **RULED OUT** (all 0.85–0.97 fail) |
+| **S1**: Offload apply_moe_quantization scales to host RAM | ~11 GB | Each-step latency | Feasible; requires pinned-memory transfer |
+| **S5**: `--xla_tpu_rematerialization_algo=PEAK_PRIORITY` XLA flag | ~5 GB? | Slower compile | **TO TEST** — low-risk, might fix 0.85 |
+| **S5b**: `jax.remat()` on EPMoE forward | ~5–20 GB? | ~10–30% slower | **TO TEST** — higher impact, needs code |
+| **S5c**: Reduce `--max-prefill-tokens` 16384→8192 | ~2–5 GB? | Prefill throughput | **TO TEST** — easy flag change |
+| **S2**: Move BF16 attention weights to host RAM | ~2.76 GB (tp-16) | Per-layer latency | Feasible; small savings |
+| **S7**: EP > 1 (ep_size=2, tp_size=8) | ~30 GB weights | Architecture change | **RECOMMENDED — most reliable** |
 
 ---
 
