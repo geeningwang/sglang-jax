@@ -1,0 +1,53 @@
+# HBM Timeline — tp-32 NFS SLOW PATH (4-node 2x2x4)
+# Measured 2026-06-05, commit 3a9c163, SGLANG_HBM_TRACE=1 SGLANG_HBM_ATTRIBUTE=1
+# No SGLANG_CHECKPOINT_DIR — forces load_weights() via NFS (~42 min MoE loading)
+# HBM limit per TC: 101.73 GB
+
+Checkpoint                                       used      delta     free
+─────────────────────────────────────────────────────────────────────────
+T0:  baseline (pre-sampler)                    0.00 GB   +0.00 GB  101.73 GB
+T1:  after Sampler init                        0.00 GB   +0.00 GB  101.73 GB
+T2:  after get_available_device_memory         0.00 GB   +0.00 GB  101.73 GB  ← total_before
+T3:  after init_attention_backend              0.00 GB   +0.00 GB  101.73 GB
+T4a: before nnx.eval_shape                    0.00 GB   +0.00 GB  101.73 GB
+T4b: after nnx.eval_shape                     0.00 GB   +0.00 GB  101.73 GB  ← abstract, no HBM
+T4c: after apply_moe_quantization            11.07 GB  +11.07 GB   90.66 GB  ← FP32 scales (REAL!)
+T4d: after apply_linear_quantization         11.07 GB   +0.00 GB   90.66 GB  ← no-op (not LinearBase)
+T4e: before load_weights [NFS slow path]     11.07 GB   +0.00 GB   90.66 GB
+T4f: after load_weights [weights in HBM]     64.70 GB  +53.63 GB   37.04 GB  ← ~42 min NFS loading
+T4g: after print_parameter_shardings        64.70 GB   +0.00 GB   37.04 GB
+T5:  after model_loader.load_model           64.70 GB   +0.00 GB   37.04 GB
+T6:  after load_model                        64.70 GB   +0.00 GB   37.04 GB
+T7:  before nnx.split(model)                 64.70 GB   +0.00 GB   37.04 GB
+T8a: after nnx.split(model)                  64.70 GB   +0.00 GB   37.04 GB  ← H7 RULED OUT
+T8b: after tree_flatten(model_state)         64.70 GB   +0.00 GB   37.04 GB
+T9:  after initialize_jit                    64.70 GB   +0.00 GB   37.04 GB
+T10: in profiler [free=37.04GB, xla=25.43GB] 64.70 GB   +0.00 GB   37.04 GB
+T11: after init_memory_pool [KV allocated]   76.30 GB  +11.60 GB   25.43 GB
+T12: after init_routed_experts_capturer      76.30 GB   +0.00 GB   25.43 GB
+─────────────────────────────────────────────────────────────────────────
+TOTAL ALLOCATED: +76.30 GB
+
+COMPARISON WITH FAST PATH (checkpoint restore):
+─────────────────────────────────────────────────────────────────────────
+Checkpoint               Fast path    Slow path    Delta
+T4c apply_moe_quant      11.07 GB     11.07 GB     +0.00 GB
+T4f after weights        64.68 GB     64.70 GB     +0.02 GB  ← within noise
+T10 KV available         11.62 GB     11.60 GB     −0.02 GB  ← within noise
+T11 KV allocated        +11.62 GB    +11.60 GB     −0.02 GB
+Total footprint          76.30 GB     76.30 GB      0.00 GB
+
+CONCLUSION:
+  NFS slow path and checkpoint fast path produce IDENTICAL HBM footprint
+  (within 0.02 GB measurement noise = 20 MB).
+
+  The scale conversion (_maybe_convert_epmoe_scale_for_kernel), FP8→BF16
+  dequantization, and GMM layout reshaping done during load_weights() leave
+  NO extra permanent HBM compared to Orbax checkpoint restore.
+
+  All intermediate arrays from NFS loading are correctly freed by Python GC
+  before the KV profiler runs. The 53.63 GB delta at T4e→T4f is the final
+  steady-state weight footprint, same as after checkpoint restore.
+
+  This rules out NFS loading as a source of extra overhead at tp-16.
+  The tp-16 OOM is fundamentally due to 2× weight shard size per TC.
