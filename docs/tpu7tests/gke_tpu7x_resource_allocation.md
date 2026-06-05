@@ -277,11 +277,15 @@ The only viable path to 2-node is **EP > 1** (expert parallelism):
 - With ep_size=2: each TC handles 192 experts → MoE weight per TC halves
 - Combined with tp=8 within each node → same footprint per TC as 4-node tp-32
 
-| Config | ep | tp | Experts/TC | Model footprint/TC | KV/TC | Status |
-|--------|----|----|-----------|-------------------|-------|--------|
-| 4-node (tp-32, ep-1) | 1 | 32 | 384 | 64.68 GB | 11.62 GB | ✅ Production |
-| 2-node (tp-16, ep-1) | 1 | 16 | 384 | ~102 GB | OOM | ❌ Infeasible |
-| 2-node (tp-8, ep-2) | 2 | 8 | 192 | ~34 GB (est.) | ~42 GB (est.) | ⬜ Planned |
+**Key formula**: `per-TC weight = total_weight / total_TCs`
+EP factoring (ep × tp) does NOT change per-TC weight. Only total TC count matters.
+
+| Config | Total TCs | wi_0/TC | Model footprint | KV/TC | Status |
+|--------|-----------|---------|----------------|-------|--------|
+| 4-node ep=1 tp=32 | 32 | 151 MB | 64.68 GB | 11.62 GB | ✅ Production |
+| 4-node ep=2 tp=16 | 32 | 151 MB | ~64 GB (same) | ~11 GB | ⬜ Throughput opt |
+| 2-node ep=1 tp=16 | 16 | 302 MB | ~112 GB | OOM | ❌ Infeasible |
+| 2-node ep=2 tp=8 | 16 | 302 MB | ~112 GB (same!) | OOM | ❌ Infeasible (tested) |
 
 ---
 

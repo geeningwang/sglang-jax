@@ -333,16 +333,32 @@ XLA to hold old + new copies simultaneously.
 
 ## 4. Next Step Actions
 
-### Recommended: EP > 1 to enable 2-node inference
+### 2-node is fundamentally infeasible for MiMo-V2.5-Pro (confirmed 2026-06-05)
 
-With `ep_size=2` + `tp_size=8` on 2 nodes (16 TCs total, 8 per node):
-- Each TC handles 192 of 384 experts → MoE weight per TC halves to ~31 GB
-- Estimated model footprint: ~34 GB/TC (comparable to 4-node ep-1 today)
-- Available KV: 101.73 − 34 − 25.43 ≈ **42 GB/TC** — healthy production budget
-- Required changes:
-  - `model_config.hf_config.ep_size = 2`
-  - EP sub-mesh wiring in `weight_utils.py`
-  - Expert routing dispatch across nodes
+**Key formula**: `per-TC weight = total_weight / total_TCs`
+
+EP factoring (ep_size × tp_size) does **NOT** change per-TC weight — only total TC
+count matters. Both ep=1 tp=16 and ep=2 tp=8 on 2 nodes have 16 TCs and thus
+identical per-TC footprint (~62.5 GB MoE weights + scales + overhead = ~112 GB > 101.73 GB).
+
+| Config | Total TCs | wi_0/TC | Model footprint | Feasible? |
+|--------|-----------|---------|----------------|-----------|
+| 4-node ep=1 tp=32 | 32 | 151 MB | 64.68 GB | ✅ |
+| 4-node ep=2 tp=16 | 32 | 151 MB | ~64 GB | ✅ (same) |
+| 2-node ep=1 tp=16 | 16 | 302 MB | ~112 GB | ❌ OOM |
+| 2-node ep=2 tp=8 | 16 | 302 MB | ~112 GB | ❌ OOM (same!) |
+
+Tested: ep=2 tp=8 on 2 nodes OOMs at the same point as ep=1 tp=16 (FP8
+restore accumulation, 157 MB free when trying to allocate 288 MB wi_0 shard).
+
+**For 2-node to work, model per-TC footprint must drop to < ~40 GB**, requiring either:
+- Weight dtype change (less than FP8) — impractical for this model
+- FP8 monkey-patch restore overhead eliminated — would save ~39 GB but still tight
+- Pruning 50%+ of model parameters — changes model identity
+
+**Correct role for EP > 1**: throughput improvement at 4 nodes, not HBM reduction.
+With ep=2 tp=16 on 4 nodes: same per-TC weight as ep=1 tp=32, but better expert
+load balancing and potentially higher MoE throughput (separate track from 2-node).
 
 ### Low-risk optimization for tp-32 (try first)
 

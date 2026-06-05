@@ -197,21 +197,20 @@ The `#running-req: 2` ceiling is structural — all flag-level fixes failed. Nex
 add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to trace
 `batch_is_full` state and `add_one_req` return codes per queued request.
 
-### 9. EP > 1 for 2-node (Opt-2) ⬜ — Primary next action
+### 9. 2-node inference — CONFIRMED INFEASIBLE (2026-06-05) ✅
 
-**Only viable path to 2-node inference.** HBM investigation (§6 above) confirmed
-that ep=1 is fundamentally infeasible at tp-16: model footprint ~116 GB during
-restore >> 101.73 GB HBM limit. Reducing `mem_fraction_static` does not help
-(EPMoE compilation needs ~20 GB XLA temp minimum).
+Tested ep=1 tp=16, ep=2 tp=8 — both OOM identically.
 
-With `ep_size=2` + `tp_size=8` per node:
-- Each TC handles 192 of 384 experts → MoE weight per TC halves to ~31 GB
-- Model footprint: ~34 GB/TC (comparable to 4-node ep-1 today)
-- KV available: 101.73 − 34 − 25.43 ≈ **42 GB/TC** — healthy production budget
-- Required changes:
-  - `model_config.hf_config.ep_size = 2`
-  - EP sub-mesh wiring in `weight_utils.py`
-  - Expert routing dispatch across 2 nodes (MoE all-to-all)
+**Root cause**: `per-TC weight = total_weight / total_TCs`. EP factoring does not
+reduce per-TC weight — only total TC count does. At 16 TCs (2 nodes), per-TC
+wi_0 shard = 302 MB regardless of ep_size. Total model footprint ~112 GB >> 101.73 GB limit.
+
+EP > 1 is fully implemented in `moe.py` (auto-creates moe_mesh, psum combine)
+but provides no HBM benefit at the same TC count. EP > 1 on 4 nodes would
+provide throughput improvements (better expert balancing) without memory savings.
+
+**2-node is not achievable for MiMo-V2.5-Pro with 96 GB HBM per chip.**
+Would require: smaller model, different quantization, or future TPU with more HBM.
 
 ### 9b. XLA rematerialization flag for tp-32 (low-risk optimization) ⬜
 
