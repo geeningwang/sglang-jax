@@ -1,0 +1,39 @@
+# EPMoE Minimum XLA Temp Pool Test
+# Measured 2026-06-05, tp-32 (4-node 2x2x4), checkpoint fast-restore
+# Binary search on mem_fraction_static to find minimum XLA temp for EPMoE inference
+
+mem_fraction_static  XLA_temp    KV_profiler        EXTEND_compile   Result
+─────────────────────────────────────────────────────────────────────────────
+0.75 (baseline)      25.43 GB    PASS (11.62 GB)    PASS             SUCCESS ✓
+0.85                 14.40 GB    PASS (20.3 GB)     FAIL (OOM+5.54G) FAIL ✗
+0.90                  9.60 GB    PASS (25.0 GB)     FAIL             FAIL ✗
+0.93                  6.72 GB    PASS (~28 GB)      FAIL             FAIL ✗
+0.95                  5.09 GB    PASS (~30 GB)      FAIL             FAIL ✗
+0.97                  3.05 GB    PASS (~32 GB)      FAIL             FAIL ✗
+
+ANALYSIS:
+  Failure mode: XLA EXTEND prefill compile OOMs during precompile_all().
+  Error at 0.85: "Used 100.28G of 94.75G hbm. Exceeded hbm capacity by 5.54G."
+
+  Minimum XLA temp for EPMoE EXTEND compile ≈ 14.4 + 5.54 = ~20 GB
+  → mem_fraction_static must be ≤ (101.73 - 20) / 101.73 ≈ 0.803
+  → At 0.75 we have 25.43 GB temp — 5 GB headroom above minimum.
+
+IMPLICATIONS FOR 2-NODE (tp-16):
+  At tp-16, model footprint = ~102 GB (OOM even before KV profiler).
+  Even if model footprint were reduced:
+    - Minimum XLA temp ~20 GB is fixed (doesn't scale with TP)
+    - ep_size=1 means same 384 experts on all TCs
+    - EXTEND compilation has the same temp requirement regardless of TP
+
+  Any 2-node solution MUST keep XLA temp ≥ 20 GB (mem_fraction_static ≤ 0.80).
+
+CONCLUSION:
+  EPMoE (384 experts, block-wise FP8 GEMM) requires ~20 GB XLA temp pool
+  for EXTEND prefill kernel compilation on TPU v7x.
+  The current 0.75 setting gives 25.43 GB → 5 GB safety margin.
+  Reducing mem_fraction_static to save static pool for tp-16 weights
+  does NOT work — EPMoE compilation would fail before serving requests.
+
+  Option B (increase mem_fraction_static for tp-16) is INFEASIBLE.
+  Only viable path to 2-node: EP > 1 to halve MoE weight per TC.
