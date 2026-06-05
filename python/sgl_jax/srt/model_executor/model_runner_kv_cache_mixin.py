@@ -220,6 +220,19 @@ class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
+        import gc, os
+
+        # SGLANG_HBM_GC_BEFORE_PROFILER=1: force JAX cache clear + Python GC
+        # before measuring, to test whether unreleased intermediates are the
+        # source of the 27 GB overhead.
+        if os.environ.get("SGLANG_HBM_GC_BEFORE_PROFILER"):
+            import jax
+            self._hbm.snap("T10-pre: before explicit gc + jax.clear_caches()")
+            gc.collect()
+            jax.clear_caches()
+            gc.collect()
+            self._hbm.snap("T10-post: after explicit gc + jax.clear_caches()")
+
         available_device_memory = self.get_available_device_memory()
         # T10: this is the exact "available_kv_cache" measurement point.
         # bytes_free_after_load - total_before * (1 - mem_fraction_static)

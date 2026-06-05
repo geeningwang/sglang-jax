@@ -166,16 +166,16 @@ that:
 
 For each confirmed hypothesis, a standalone K8s job that tests it in isolation:
 
-| Job | Tests | Expected result |
-|-----|-------|----------------|
-| `test_epmoe_init.yaml` | EPMoE layer init (no model) | Measures EPMoE-specific overhead |
-| `test_checkpoint_restore.yaml` | Orbax restore alone, no model | Measures restore intermediate buffers |
-| `test_jit_overhead.yaml` | `initialize_jit()` with dummy model | Measures JIT closure overhead |
-| `test_pallas_workspace.yaml` | FlashAttention backend init alone | Measures FA workspace allocation |
-| `test_hbm_baseline.yaml` | Bare JAX distributed init, no model | Measures JAX runtime baseline |
+| Job | Tests | Hypothesis | Expected result |
+|-----|-------|-----------|----------------|
+| `test_hbm_baseline.yaml` | Bare JAX, no model, 1 node | baseline | JAX runtime overhead (J term) < 2 GB |
+| `test_split_overhead.yaml` | `nnx.split()` on dummy model | H7 | delta ≈ 0 GB (no copy) |
+| `test_epmoe_min_temp.yaml` | Binary search on XLA temp pool | H-temp | Minimum EPMoE temp requirement |
+| `test_gc_effect.yaml` | GC+clear_caches before profiler | H8 | If delta > 5 GB: intermediates are the source |
+| `hbm_timeline_tp32_slowpath.yaml` | Full trace, NFS slow path | H8 | Compare overhead vs fast path |
+| `hbm_timeline_tp16.yaml` | Full trace, tp-16 fast restore | H-scale | Overhead at tp-16; TP-scaling factor |
 
-Each job reports: `bytes_in_use` before and after the tested operation, and
-`live_arrays()` diff showing what was allocated.
+Each job reports per-step `bytes_in_use` deltas and optional `live_arrays()` attribution.
 
 ### Phase 4 — TP-scaling characterization (1 day)
 

@@ -1,0 +1,200 @@
+# Test: What is the minimum XLA temp pool EPMoE needs at tp-32?
+#
+# At tp-32, we assumed 24 GB XLA temp (25% of 96 GB) is required.
+# This test reduces mem-fraction-static step by step to find the minimum
+# temp pool where inference still succeeds.
+#
+# The test script tries mem-fraction-static = [0.85, 0.90, 0.93, 0.95, 0.97]
+# (XLA temp = [14.4, 9.6, 6.7, 4.8, 2.9] GB) and runs a single decode step
+# at each setting. Reports the minimum that succeeds.
+#
+# This directly answers: "If we increase mem_fraction_static, how much static
+# pool do we get, and does EPMoE still fit in the reduced temp pool?"
+#
+# Critical for 2-node feasibility: if EPMoE needs only 8 GB temp instead of
+# 24 GB, we could use mem_fraction_static=0.92 and get 88.3 - 67.5 = 20.8 GB
+# minus overhead for KV.
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: test-epmoe-min-temp-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: test-epmoe-min-temp
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: test-epmoe-min-temp-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: test-epmoe-min-temp-dws-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-epmoe-min-temp
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: test-epmoe-min-temp
+  ports:
+  - name: dist-init
+    port: 6006
+  - name: http
+    port: 8080
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-epmoe-min-temp
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: test-epmoe-min-temp-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: test-epmoe-min-temp
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: test-epmoe-min-temp
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="test-epmoe-min-temp-0.test-epmoe-min-temp.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
+          for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
+            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+          done
+
+          # Try mem_fraction_static values from aggressive to conservative.
+          # XLA temp at tp-32: 96 * (1 - frac)
+          # 0.85 → 14.4 GB temp  |  0.90 → 9.6 GB  |  0.93 → 6.7 GB
+          # 0.95 → 4.8 GB temp   |  0.97 → 2.9 GB
+          for FRAC in 0.85 0.90 0.93 0.95 0.97; do
+            TEMP_GB=$(python3 -c "print(f'{96*(1-${FRAC}):.1f}')")
+            echo ""
+            echo "$(ts) ===== Testing mem_fraction_static=${FRAC} (XLA_temp=${TEMP_GB} GB) ====="
+
+            timeout 600 bash -c "
+              JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+              python3 -m sgl_jax.launch_server \
+                --model-path /mnt/weights \
+                --trust-remote-code \
+                --tp-size 32 \
+                --device tpu \
+                --dtype bfloat16 \
+                --mem-fraction-static ${FRAC} \
+                --page-size 16 \
+                --chunked-prefill-size 512 \
+                --max-running-requests 1 \
+                --nnodes 4 \
+                --node-rank ${INDEX} \
+                --dist-init-addr ${COORDINATOR}:6006 \
+                --host 0.0.0.0 \
+                --port 8080 &
+              SERVER_PID=\$!
+              # Wait for health
+              for i in \$(seq 1 180); do
+                if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                  echo 'HEALTHY'
+                  # Run one inference to test EPMoE compute
+                  curl -sf --max-time 60 http://localhost:8080/v1/chat/completions \
+                    -H 'Content-Type: application/json' \
+                    -d '{\"model\": \"m\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"max_tokens\": 8}' \
+                    && echo 'INFERENCE_OK' || echo 'INFERENCE_FAIL'
+                  kill \$SERVER_PID
+                  exit 0
+                fi
+                if ! kill -0 \$SERVER_PID 2>/dev/null; then echo 'SERVER_DIED'; exit 1; fi
+                sleep 5
+              done
+              echo 'TIMEOUT'
+              kill \$SERVER_PID
+            " && RESULT="SUCCESS" || RESULT="FAIL"
+
+            echo "$(ts) mem_fraction_static=${FRAC} (XLA_temp=${TEMP_GB}GB): ${RESULT}"
+          done
+
+          echo ""
+          echo "$(ts) === EPMoE minimum temp pool sweep complete ==="
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: SGLANG_CHECKPOINT_DIR
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"

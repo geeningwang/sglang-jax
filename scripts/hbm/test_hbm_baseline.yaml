@@ -1,0 +1,101 @@
+# Test: bare JAX HBM baseline — no model, no computation.
+#
+# Measures how much HBM JAX consumes just by initializing on 1 TPU node
+# (distributed service, PRNG state, XLA runtime, libtpu overhead).
+# This is the "J" term in the formula:
+#   KV = total_HBM - J - weights - overhead - XLA_temp
+#
+# Expected: < 2 GB (PRNG keys, XLA runtime tables)
+# Run time: < 2 min
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-hbm-baseline
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: test-hbm-baseline
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          python3 - << 'PYEOF'
+          import gc
+          import jax
+          import jax.numpy as jnp
+
+          def snap(label, prev=None):
+              gc.collect()
+              stats = [d.memory_stats() for d in jax.local_devices()]
+              used = min(s["bytes_in_use"] for s in stats)
+              limit = stats[0]["bytes_limit"]
+              delta = used - prev if prev is not None else 0
+              print(f"[HBM] {label:<50} used={used/1e9:6.3f}GB  delta={delta/1e9:+.3f}GB  free={( limit-used)/1e9:6.3f}GB")
+              return used
+
+          limit = jax.local_devices()[0].memory_stats()["bytes_limit"]
+          print(f"\n=== HBM BASELINE TEST ===")
+          print(f"JAX version: {jax.__version__}")
+          print(f"Devices: {jax.local_devices()}")
+          print(f"HBM limit per TC: {limit/1e9:.2f} GB\n")
+
+          u = snap("T0: after jax import (pre-device-use)")
+
+          # Force JAX to initialize devices
+          _ = jnp.array(1.0)
+          u = snap("T1: after first jnp op (devices initialized)", u)
+
+          # PRNG key
+          key = jax.random.PRNGKey(42)
+          u = snap("T2: after PRNGKey creation", u)
+
+          # Dummy computation to force XLA compilation
+          @jax.jit
+          def f(x): return x + 1
+          result = f(jnp.array(1.0))
+          result.block_until_ready()
+          u = snap("T3: after first jit compile + run", u)
+
+          # Second jit (cached, no recompile)
+          result2 = f(jnp.array(2.0))
+          result2.block_until_ready()
+          u = snap("T4: after second jit call (cached)", u)
+
+          # Large dummy allocation to see how much is truly free
+          available = jax.local_devices()[0].memory_stats()["bytes_limit"] - \
+                      jax.local_devices()[0].memory_stats()["bytes_in_use"]
+          print(f"\n=== SUMMARY ===")
+          print(f"JAX runtime baseline HBM: {u/1e9:.3f} GB")
+          print(f"Available for model:       {available/1e9:.3f} GB of {limit/1e9:.1f} GB total")
+          print(f"This is the 'J' (runtime overhead) in the KV formula:")
+          print(f"  KV = total_before*mem_frac - weights - model_overhead - XLA_temp")
+          print(f"  total_before ≈ {available/1e9:.3f} GB (not 96 GB)")
+          PYEOF
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"

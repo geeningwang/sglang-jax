@@ -1,0 +1,163 @@
+# HBM Timeline — 2-node tp-16, FAST RESTORE PATH
+#
+# Uses the tp-16 checkpoint saved at gs://.../95dc2640/tp16_bfloat16/.
+# Runs SGLANG_HBM_TRACE=1 + SGLANG_HBM_ATTRIBUTE=1 to measure overhead
+# at every step on the fast path (Orbax restore, no NFS loading).
+#
+# Key question: Is the overhead at tp-16 ~27 GB (fixed) or ~55 GB (2× tp-32)?
+# If fixed → there's hope for 2-node with overhead reduction.
+# If 2×    → overhead scales with TP, 2-node needs EP > 1.
+#
+# The job will OOM at init_memory_pool unless overhead < 4.5 GB.
+# Even on OOM, the T0-T10 snaps give us the exact overhead at tp-16.
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: hbm-timeline-tp16-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x2
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: hbm-timeline-tp16
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: hbm-timeline-tp16-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: hbm-timeline-tp16-dws-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hbm-timeline-tp16
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: hbm-timeline-tp16
+  ports:
+  - name: dist-init
+    port: 6006
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hbm-timeline-tp16
+  namespace: default
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: hbm-timeline-tp16-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: hbm-timeline-tp16
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: hbm-timeline-tp16
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="hbm-timeline-tp16-0.hbm-timeline-tp16.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
+          for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
+            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+          done
+
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/weights \
+            --trust-remote-code \
+            --tp-size 16 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 16 \
+            --chunked-prefill-size 512 \
+            --max-running-requests 1 \
+            --nnodes 2 \
+            --node-rank ${INDEX} \
+            --dist-init-addr ${COORDINATOR}:6006 \
+            --host 0.0.0.0 \
+            --port 8080 || true
+          echo "Server exited (expected: OOM at KV profiler). Timeline logged above."
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: SGLANG_CHECKPOINT_DIR
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
+        - name: SGLANG_HBM_TRACE
+          value: "1"
+        - name: SGLANG_HBM_ATTRIBUTE
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"

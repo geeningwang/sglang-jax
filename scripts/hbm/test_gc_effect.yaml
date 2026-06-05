@@ -1,0 +1,164 @@
+# Test: Does explicit gc.collect() + jax.clear_caches() before init_memory_pool
+# recover any of the 27.45 GB overhead?
+#
+# Hypothesis H8: Some overhead is unreleased load intermediates that GC hasn't
+# collected yet. An explicit GC sweep before the profiler might free them.
+#
+# Uses SGLANG_HBM_GC_BEFORE_PROFILER=1 which adds T10-pre and T10-post snaps
+# around the GC call in _profile_available_bytes().
+#
+# Expected outcomes:
+#   Delta(T10-pre → T10-post) ≈ 0 GB → intermediates are already freed → H8 RULED OUT
+#   Delta(T10-pre → T10-post) > 5 GB → GC frees significant overhead → H8 CONFIRMED
+#
+# Fast path (checkpoint restore) — results in ~5 min from pod start.
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: test-gc-effect-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: test-gc-effect
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: test-gc-effect-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "10800"
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: test-gc-effect-dws-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-gc-effect
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: test-gc-effect
+  ports:
+  - name: dist-init
+    port: 6006
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-gc-effect
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: test-gc-effect-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: test-gc-effect
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: test-gc-effect
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="test-gc-effect-0.test-gc-effect.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
+          for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
+            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+          done
+
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/weights \
+            --trust-remote-code \
+            --tp-size 32 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 16 \
+            --chunked-prefill-size 512 \
+            --max-running-requests 2 \
+            --nnodes 4 \
+            --node-rank ${INDEX} \
+            --dist-init-addr ${COORDINATOR}:6006 \
+            --host 0.0.0.0 \
+            --port 8080 || true
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: SGLANG_CHECKPOINT_DIR
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
+        - name: SGLANG_HBM_TRACE
+          value: "1"
+        - name: SGLANG_HBM_GC_BEFORE_PROFILER
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
