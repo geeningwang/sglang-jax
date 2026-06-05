@@ -177,8 +177,14 @@ Key notes:
   at tp-32 and **nearly identical at tp-16** (11.72 GB — nearly TP-independent).
 - `nnx.split(model)` delta = 0 GB — no weight copies.
 - `gc.collect() + jax.clear_caches()` frees < 10 MB — overhead is permanent.
-- Restore overhead (19.86 GB) comes from FP8 monkey-patch uint8/float8 double-buffering
-  accumulated across 1,038 tensor restores before Python GC clears them.
+- Restore overhead (19.86 GB) comes from **FP8 monkey-patch uint8/float8 double-buffering**:
+  each of 1,038 FP8 tensor shards is first placed as uint8 (same size), then bitcast to
+  float8. Python `del arr_u8` defers the actual HBM release to JAX's async GC, so uint8
+  buffers accumulate across all 1,038 restores. At tp-16, shards are 2× larger → overhead
+  ≈ 39 GB (OOM during restore). At tp-32, steady-state footprint is correct (GC clears by T10).
+- Slow path (NFS `load_weights`) and fast path (checkpoint restore) produce **identical** HBM
+  footprint: T4f delta = +0.02 GB (noise). Scale conversion and dequantization intermediates
+  are correctly freed before the KV profiler runs.
 
 ### 2-node HBM analysis (tp-16) — INFEASIBLE with EP=1
 

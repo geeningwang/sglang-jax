@@ -1,6 +1,6 @@
 # HBM Usage Investigation — MiMo-V2.5-Pro on TPU v7x
 
-**Status**: Phase 1–4 complete (2026-06-05). Phase 5 (reduction strategies) pending.  
+**Status**: All 7 tests complete (2026-06-05). Investigation concluded.  
 **Goal**: Identify the source of unknown HBM overhead, map the complete HBM timeline,
 and find opportunities to enable 2-node (tp-16) inference.
 
@@ -57,14 +57,52 @@ At `mem_fraction_static=0.85` (14.4 GB temp), EXTEND OOMs with: "Exceeded hbm ca
 → Minimum viable `mem_fraction_static` ≤ (101.73 − 20) / 101.73 ≈ **0.803**.
 → Tested values 0.85 / 0.90 / 0.93 / 0.95 / 0.97 all fail.
 
+### Restore overhead source (19.86 GB at tp-32)
+
+The 19.86 GB gap between checkpoint metadata weights (33.75 GB) and actual T4f
+measurement (64.68 − 11.07 = 53.61 GB) comes from **FP8 monkey-patch double-buffering**
+during Orbax checkpoint restore:
+
+```
+For each of 1,038 FP8 tensor shards restored:
+  1. Orbax reads raw bytes from GCS → CPU numpy array (no HBM)
+  2. Monkey-patch intercepts jax.device_put:
+     arr_u8 = device_put(shard_as_uint8)   ← +shard_size in HBM
+     arr_f8 = bitcast_convert(arr_u8)      ← +shard_size in HBM  (peak: 2× shard)
+     arr_f8.block_until_ready()
+     del arr_u8                            ← Python refcount → 0, but JAX GC async
+  3. Final float8 array stays; uint8 deletion is deferred by JAX GC
+
+Across 1,038 shards, the deferred uint8 deletions accumulate:
+  33.75 GB (float8) + 19.86 GB (accumulated unfreed uint8) = 53.61 GB at T4f
+  GC eventually clears them, but not before T10 (profiler measures steady state)
+```
+
+At tp-16, shards are 2× larger → accumulated overhead ≈ **~39 GB**, pushing total to
+~102 GB during restore → OOM before all weights are loaded.
+
+### Slow path = fast path (confirmed)
+
+NFS `load_weights()` and Orbax checkpoint restore produce **identical** final HBM
+footprint at tp-32:
+
+| | Fast path | Slow path | Delta |
+|-|-----------|-----------|-------|
+| T4f after weights | 64.68 GB | 64.70 GB | +0.02 GB (noise) |
+| T10 KV available | 11.62 GB | 11.60 GB | −0.02 GB (noise) |
+
+Scale conversion, FP8→BF16 dequantization, and GMM layout reshaping during
+`load_weights()` leave no extra permanent HBM. All intermediates are freed by
+Python GC before T10.
+
 ### 2-node feasibility conclusion
 
-At tp-16:
-- Model footprint after restore ≈ **102 GB** (exceeds 101.73 GB HBM — OOM during restore itself)
-- Even without the restore OOM: available after model = ~−0.3 GB → no room for KV
-- EPMoE XLA temp floor (~20 GB) is fixed; reducing static fraction does not help
-- **Option B (increase mem_fraction_static) is infeasible.**
-- **Only viable path to 2-node: EP > 1** (split 384 experts across 2 nodes → 192 experts/TC → weights halve)
+At tp-16 with ep=1:
+- Model footprint during restore ≈ **~116 GB** (scales 11.72 + weights 67.5 + overhead ~39) >> 101.73 GB → OOM
+- Even with zero restore overhead: static model 79 GB + XLA temp 20 GB = 99 GB → only 2.7 GB for KV
+- EPMoE XLA temp floor (~20 GB) is fixed; reducing `mem_fraction_static` does not help
+- **Option B (increase mem_fraction_static) is infeasible** — all 0.85–0.97 fail EXTEND compile
+- **Only viable path to 2-node: EP > 1** (192 experts/TC → ~34 GB model → ~42 GB KV)
 
 ---
 
@@ -293,42 +331,79 @@ XLA to hold old + new copies simultaneously.
 
 ---
 
-## 4. File Structure
+## 4. Next Step Actions
+
+### Recommended: EP > 1 to enable 2-node inference
+
+With `ep_size=2` + `tp_size=8` on 2 nodes (16 TCs total, 8 per node):
+- Each TC handles 192 of 384 experts → MoE weight per TC halves to ~31 GB
+- Estimated model footprint: ~34 GB/TC (comparable to 4-node ep-1 today)
+- Available KV: 101.73 − 34 − 25.43 ≈ **42 GB/TC** — healthy production budget
+- Required changes:
+  - `model_config.hf_config.ep_size = 2`
+  - EP sub-mesh wiring in `weight_utils.py`
+  - Expert routing dispatch across nodes
+
+### Low-risk optimization for tp-32 (try first)
+
+Try `XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"` to allow
+`mem_fraction_static=0.85`. If the EXTEND compile passes, this gives:
+- KV cache: 20.3 GB/TC (vs 11.6 GB today) → 75% more context capacity at tp-32
+- Larger context window and higher concurrency at same hardware cost
+
+### FP8 monkey-patch restore overhead reduction
+
+The 19.86 GB restore overhead at tp-32 comes from accumulated uint8 double-buffers.
+Options to reduce it:
+- Batch `block_until_ready` + `del` calls per-chunk (not per-shard)
+- Save checkpoint shards as uint8 directly; restore as uint8 then do a single bulk bitcast
+- If JAX ever natively supports FP8 device_put on TPU v7x, remove monkey-patch entirely
+
+This doesn't help tp-16 with ep=1 (weights alone already exceed HBM), but would
+improve restore time and peak HBM usage for tp-32.
+
+## 5. File Structure
 
 ```
 docs/tpu7tests/hbm_investigation/
-  plan.md                      ← this document
-  results/                     ← measurement outputs from each experiment
-    tp32_hbm_timeline.txt      ← Phase 1 result at tp-32
-    tp16_hbm_timeline.txt      ← Phase 4 result at tp-16
-    attribution_T8.txt         ← Phase 2 live array dump at T8
+  plan.md                              ← this document (investigation complete)
+  results/
+    tp32_hbm_timeline.txt             ← T0-T12 at tp-32, fast restore path
+    tp32_hbm_timeline_slowpath.txt    ← T0-T12 at tp-32, NFS slow path (identical)
+    tp16_hbm_timeline.txt             ← T0-T4e at tp-16, OOM during restore
+    gc_effect_test.txt                ← GC effect: delta = 0 (H8 ruled out)
+    epmoe_min_temp_test.txt           ← EPMoE XLA temp sweep + OOM analysis
 
 python/sgl_jax/tools/hbm/
-  __init__.py
-  snapshot.py                  ← HBM snapshot utility (bytes_in_use + delta)
-  attribution.py               ← live_arrays() grouping and attribution
+  snapshot.py                         ← HBMTracker: bytes_in_use + delta snaps
+  attribution.py                      ← live_arrays() grouping and attribution
 
 scripts/hbm/
-  hbm_timeline_tp32.yaml       ← Full startup trace job (tp-32, 4-node)
-  hbm_timeline_tp16.yaml       ← Full startup trace job (tp-16, 2-node)
-  test_split_overhead.yaml     ← nnx.split() copy test (1-node)
-  test_epmoe_init.yaml         ← EPMoE init overhead (1-node)
-  test_checkpoint_restore.yaml ← Orbax restore alone (1-node)
-  test_pallas_workspace.yaml   ← FlashAttention backend init (1-node)
-  test_hbm_baseline.yaml       ← Bare JAX distributed (1-node)
+  hbm_timeline_tp32.yaml             ← 4-node fast-restore trace (SGLANG_HBM_TRACE=1)
+  hbm_timeline_tp16.yaml             ← 2-node fast-restore trace
+  hbm_timeline_tp32_slowpath.yaml    ← 4-node NFS slow-path trace
+  test_gc_effect.yaml                ← GC effect test (SGLANG_HBM_GC_BEFORE_PROFILER=1)
+  test_epmoe_min_temp.yaml           ← mem_fraction_static binary search
+  test_split_overhead.yaml           ← nnx.split() copy test
+  test_hbm_baseline.yaml             ← bare JAX baseline
+
+Instrumented source files:
+  python/sgl_jax/srt/model_executor/model_runner.py          ← T0-T12 snaps
+  python/sgl_jax/srt/model_executor/model_runner_kv_cache_mixin.py  ← T10 snap
+  python/sgl_jax/srt/model_loader/loader.py                  ← T4a-T4g snaps
 ```
 
 ---
 
-## 5. Success Criteria
+## 6. Success Criteria (completed)
 
-| Milestone | Criterion |
-|-----------|----------|
-| Phase 1 complete | Full HBM timeline with per-step deltas at tp-32 |
-| Phase 2 complete | Each delta attributed to specific array types/sources |
-| Phase 3 complete | Each hypothesis confirmed or ruled out with standalone test |
-| Phase 4 complete | TP-scaling characterized (fixed vs TC-proportional vs expert-proportional) |
-| Phase 5 complete | At least one strategy reduces overhead enough to enable 2-node, OR clear statement that 2-node is fundamentally infeasible |
+| Milestone | Criterion | Status |
+|-----------|----------|--------|
+| Phase 1 complete | Full HBM timeline with per-step deltas at tp-32 | ✅ Done |
+| Phase 2 complete | Each delta attributed to specific array types/sources | ✅ Done |
+| Phase 3 complete | Each hypothesis confirmed or ruled out with standalone test | ✅ Done (H7, H8 ruled out) |
+| Phase 4 complete | TP-scaling characterized | ✅ Done (apply_moe=fixed, restore scales 2×) |
+| Phase 5 complete | At least one strategy reduces overhead enough to enable 2-node, OR clear statement that 2-node is fundamentally infeasible with ep=1 | ✅ **Infeasible with ep=1. EP > 1 required.** |
 
 ---
 

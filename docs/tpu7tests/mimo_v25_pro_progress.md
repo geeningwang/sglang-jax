@@ -197,12 +197,28 @@ The `#running-req: 2` ceiling is structural — all flag-level fixes failed. Nex
 add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to trace
 `batch_is_full` state and `add_one_req` return codes per queued request.
 
-### 9. EP > 1 for 2-node (Opt-2) ⬜
+### 9. EP > 1 for 2-node (Opt-2) ⬜ — Primary next action
 
-**Only viable path to 2-node inference.** With ep_size=2 + tp=8:
-- Each TC handles 192 experts (not 384) → MoE weight per TC halves
-- Estimated model footprint ≈ 34 GB/TC → ~42 GB KV headroom
-- Requires: mesh wiring for EP sub-mesh, model routing changes in `weight_utils.py`
+**Only viable path to 2-node inference.** HBM investigation (§6 above) confirmed
+that ep=1 is fundamentally infeasible at tp-16: model footprint ~116 GB during
+restore >> 101.73 GB HBM limit. Reducing `mem_fraction_static` does not help
+(EPMoE compilation needs ~20 GB XLA temp minimum).
+
+With `ep_size=2` + `tp_size=8` per node:
+- Each TC handles 192 of 384 experts → MoE weight per TC halves to ~31 GB
+- Model footprint: ~34 GB/TC (comparable to 4-node ep-1 today)
+- KV available: 101.73 − 34 − 25.43 ≈ **42 GB/TC** — healthy production budget
+- Required changes:
+  - `model_config.hf_config.ep_size = 2`
+  - EP sub-mesh wiring in `weight_utils.py`
+  - Expert routing dispatch across 2 nodes (MoE all-to-all)
+
+### 9b. XLA rematerialization flag for tp-32 (low-risk optimization) ⬜
+
+Try `XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"` with
+`mem_fraction_static=0.85`. EPMoE EXTEND OOMs by only 5.54 GB at 0.85 — this
+flag might close the gap. If it works: KV cache grows from 11.6 GB to **20.3 GB/TC**
+(75% more context capacity at tp-32, no hardware cost).
 
 ### 10. FP8 GMM kernel tuning (Opt-3) ⬜
 
@@ -216,7 +232,8 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 |----------|--------|-------|
 | `jingnw-nfs-weights-1/2/3` | **RUNNING** | 3 × n2-highmem-48, ~$15–18/hr — weights in RAM |
 | TPU DWS nodes | ✅ 0 nodes | Pool empty, no active job |
-| GCS checkpoint | **LIVE ✅** | `95dc2640/tp32_bfloat16/` — validated, ~98s restore |
+| GCS checkpoint (tp-32) | **LIVE ✅** | `95dc2640/tp32_bfloat16/` — validated, ~98s restore |
+| GCS checkpoint (tp-16) | SAVED | `95dc2640/tp16_bfloat16/` — saved but unusable with ep=1 |
 | XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` (tp-size=32) |
 | Container image (current) | `jax0.9.0-rev1` | FP8 restore via monkey-patch + structure fix |
 
@@ -226,10 +243,11 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 
 | Commit | Description |
 |--------|-------------|
+| `ef0101d` | docs(hbm): slow-path timeline — fast vs slow path identical footprint |
+| `3a9c163` | docs(hbm): XLA OOM analysis and reduction strategies for EXTEND compile |
+| `aadd32b` | docs: record HBM investigation findings (Phases 1-4 complete) |
+| `4601d8e` | docs(hbm): EPMoE min temp test — ~20 GB XLA required for EXTEND compile |
 | `4f238a2` | fix(checkpoint): skip apply_linear_quantization when restoring from checkpoint |
 | `9b44f29` | fix(checkpoint): skip sharding upgrade for sub-mesh axes (e.g. expert) |
-| `71e5794` | fix(checkpoint): revert allow_narrow_n_blockwise — keep default False |
-| `fccc688` | fix(checkpoint): remove stale NOTE — FP8 restore unblocked by monkey-patch |
-| `9c400b1` | fix(checkpoint): patch allow_narrow_n_blockwise post-restore |
-| `3004a85` | feat: orbax checkpoint save/load initial implementation |
+| `c6588a7` | docs: checkpoint restore validated — ~98s restore, ~6.6 min total startup |
 | `4458f86` | feat: NFS weight loading demo job |
