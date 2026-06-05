@@ -1,6 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import logging
+import os
 from functools import partial
 
 import jax
@@ -129,11 +130,21 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         except Exception:
             pass
 
+        # HBM timeline tracing — enabled by SGLANG_HBM_TRACE=1.
+        # Uses the module-level singleton so loader.py snaps go to the same tracker.
+        from sgl_jax.tools.hbm.snapshot import get_tracker
+        self._hbm = get_tracker()
+
         # Load the model
+        self._hbm.snap("T0: baseline (pre-sampler)")
         self.sampler = Sampler(nnx.Rngs(server_args.random_seed), mesh=self.mesh)
+        self._hbm.snap("T1: after Sampler init")
         total_device_memory = self.get_available_device_memory()
+        self._hbm.snap("T2: after get_available_device_memory [= total_before]")
         self.init_attention_backend()
+        self._hbm.snap("T3: after init_attention_backend")
         self.load_model()
+        self._hbm.snap("T6: after load_model")
 
         # Check if the model is using hybrid SWA
         if (
@@ -152,6 +163,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if not self.is_draft_worker:
             self.initialize_jit()
 
+        self._hbm.snap("T9: after initialize_jit")
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
@@ -160,8 +173,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             dp_size=server_args.dp_size,
         )
 
+        self._hbm.snap("T11: after init_memory_pool [KV allocated]")
+
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+        self._hbm.snap("T12: after init_routed_experts_capturer")
+        self._hbm.report()
 
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
@@ -184,9 +201,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
     def initialize_jit(self):
+        self._hbm.snap("T7: before nnx.split(model)")
         model_def, model_state = nnx.split(self.model)
+        self._hbm.snap("T8a: after nnx.split(model)")
+
+        # When SGLANG_HBM_ATTRIBUTE=1, dump a live-array attribution at this point.
+        # This directly tests hypothesis H7 (nnx.split copies arrays).
+        if os.environ.get("SGLANG_HBM_ATTRIBUTE"):
+            from sgl_jax.tools.hbm.attribution import live_snapshot, print_top
+            snap = live_snapshot()
+            print_top(snap, label="after nnx.split(model)", top_n=25)
+
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        self._hbm.snap("T8b: after tree_flatten(model_state)")
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
@@ -323,9 +351,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             with jax.set_mesh(self.mesh):
                 init_expert_location_metadata(self.server_args, self.model_config)
 
+        self._hbm.snap("T4: before model_loader.load_model (eval_shape+quant+restore)")
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
         )
+        self._hbm.snap("T5: after model_loader.load_model (weights in HBM)")
         if self.is_draft_worker:
             # if draft model and target model share same safetensor files, we should hack here to avoid create redundant layer kv cache
             self.model_config.num_hidden_layers = getattr(

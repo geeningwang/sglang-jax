@@ -221,6 +221,12 @@ class ModelRunnerKVCacheMixin:
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
         available_device_memory = self.get_available_device_memory()
+        # T10: this is the exact "available_kv_cache" measurement point.
+        # bytes_free_after_load - total_before * (1 - mem_fraction_static)
+        self._hbm.snap(
+            f"T10: in profiler [free={available_device_memory/1e9:.2f}GB,"
+            f" xla_temp={total_device_memory*(1-self.mem_fraction_static)/1e9:.2f}GB]"
+        )
         rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")

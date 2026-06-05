@@ -419,15 +419,20 @@ class JAXModelLoader(DefaultModelLoader):
     # ── Model initialization ──────────────────────────────────────────────────
 
     def _get_model(self, model_class: Any, model_config: ModelConfig) -> nnx.Module:
+        import os
+        from sgl_jax.tools.hbm.snapshot import snap as hbm_snap
+
         if not isinstance(model_config, ModelConfig):
             config = model_config
         else:
             config = model_config.hf_config
 
+        hbm_snap("T4a: before nnx.eval_shape")
         with jax.set_mesh(self.mesh):
             model = nnx.eval_shape(
                 lambda: model_class(config, dtype=model_config.dtype, mesh=self.mesh)
             )
+        hbm_snap("T4b: after nnx.eval_shape [abstract, no HBM]")
 
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
@@ -447,6 +452,7 @@ class JAXModelLoader(DefaultModelLoader):
 
                 if model_config.quantization_config.has_moe_quantization():
                     model = apply_moe_quantization(model_config, model, is_static_input=True)
+                    hbm_snap("T4c: after apply_moe_quantization [still abstract]")
 
                 # Skip apply_linear_quantization when restoring from checkpoint.
                 # The saved checkpoint uses BF16 for linear attention/MLP layers
@@ -456,6 +462,7 @@ class JAXModelLoader(DefaultModelLoader):
                 # checkpoint's weight structure — causing Orbax tree-mismatch errors.
                 if model_config.quantization_config.get_linear_rules() and not checkpoint_ready:
                     model = apply_linear_quantization(model_config, model, is_static_input=True)
+                    hbm_snap("T4d: after apply_linear_quantization [still abstract]")
             else:
                 logger.info("Dynamic quantization detected. Skipping structure change in loader.")
         else:
@@ -463,16 +470,29 @@ class JAXModelLoader(DefaultModelLoader):
 
         if checkpoint_ready:
             # Fast path: load pre-converted sharded checkpoint (~5 min)
+            hbm_snap("T4e: before _load_checkpoint [Orbax restore]")
             self._load_checkpoint(model, checkpoint_path)
+            hbm_snap("T4f: after _load_checkpoint [weights in HBM]")
+
+            # Attribution: dump live arrays after restore when SGLANG_HBM_ATTRIBUTE=1
+            if os.environ.get("SGLANG_HBM_ATTRIBUTE"):
+                from sgl_jax.tools.hbm.attribution import live_snapshot, print_top
+                print_top(live_snapshot(), label="after _load_checkpoint", top_n=30)
         else:
             # Slow path: load from raw weights (~40 min), then save checkpoint
+            hbm_snap("T4e: before load_weights [NFS/gcsfuse slow path]")
             model.load_weights(model_config)
+            hbm_snap("T4f: after load_weights [weights in HBM]")
+            if os.environ.get("SGLANG_HBM_ATTRIBUTE"):
+                from sgl_jax.tools.hbm.attribution import live_snapshot, print_top
+                print_top(live_snapshot(), label="after load_weights", top_n=30)
             if checkpoint_path:
                 try:
                     self._save_checkpoint(model, checkpoint_path)
                 except Exception as e:
                     logger.warning("Checkpoint save failed (non-fatal): %s", e)
 
+        hbm_snap("T4g: after print_parameter_shardings [before returning model]")
         print_parameter_shardings(model)
 
         return model
