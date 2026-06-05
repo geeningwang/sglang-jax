@@ -1,15 +1,15 @@
 # MiMo-V2.5-Pro Weight Checkpoint Conversion
 
-## Status: Workaround Validated ✅ — Ready for Production Integration
+## Status: Complete ✅ — Validated in Production (2026-06-05)
 
-**Root cause**: JAX's libtpu cannot create `float8_e4m3fn` arrays via
-`jax.device_put(numpy_float8, tpu_device)`. Orbax silently returns `ShapeDtypeStruct`.
+**Result**: End-to-end checkpoint save and restore working on 4-node 2x2x4 (tp-size=32).
+Restore takes **~98.6s** (~1m38s) vs ~42 min NFS load. Total startup ~6.6 min vs ~57 min.
 
-**Workaround (validated 2026-06-03)**: Monkey-patch `jax.device_put` — transfer FP8
-as `uint8`, then `bitcast_convert_type` on-device. All 4 validation tests passed
-on JAX 0.9.0 + Orbax 0.12.0, TPU v7x 2x2x4. See `fp8_restore_workaround/README.md`.
+**Checkpoint**: `gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp32_bfloat16/`
 
-**Next step**: Integrate patch into `loader.py _load_checkpoint()`.
+Enabled via env var: `SGLANG_CHECKPOINT_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint`
+
+See `mimo_v25_pro_progress.md` §5 for full bug list and fix details.
 
 **Previously failed approaches**:
 - Orbax 0.11.28/0.12.0 + JAX 0.8.1/0.9.0: ShapeDtypeStruct ✗

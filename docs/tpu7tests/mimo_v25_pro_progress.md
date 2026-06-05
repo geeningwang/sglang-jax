@@ -1,6 +1,6 @@
 # MiMo-V2.5-Pro on TPU v7x — Progress Summary
 
-**Last updated**: 2026-06-03  
+**Last updated**: 2026-06-05  
 **Branch**: `tpu7` (`geeningwang/sglang-jax`)  
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
@@ -71,54 +71,74 @@ See: [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md)
 
 ---
 
-### 5. Orbax checkpoint — save/load investigation ✅ (workaround validated)
+### 5. Orbax checkpoint — save/load ✅ COMPLETE (2026-06-05)
 
 **Goal**: Replace ~42 min NFS loading with ~90s GCS checkpoint restore.
 
-**Checkpoint mechanics work**: Orbax saves at ~4.5 GiB/s, restores at ~5.5 GiB/s in 88–94s. The checkpoint IO is fast and correct.
+**Result**: End-to-end checkpoint save and restore validated on 4-node 2x2x4 (tp-size=32).
+Inference confirmed working after restore.
 
-**Root cause**: JAX's libtpu cannot create `float8_e4m3fn` arrays via
-`jax.device_put(numpy_float8, tpu_device)`. Since MiMo-V2.5-Pro is 100% FP8,
-all 1038 tensors fail — returning `ShapeDtypeStruct` instead of `jax.Array`.
+| Metric | Value |
+|--------|-------|
+| Checkpoint save time | ~155s (~2.6 min) |
+| Checkpoint restore time | **98.6s (~1m38s)** |
+| GCS read throughput | 5.3 GiB/s per host |
+| Total startup (restore + KV cache + XLA warmup) | **~395s (~6.6 min)** |
+| vs NFS slow-path | ~57 min |
+| **Startup reduction** | **~50 min saved per run** |
 
-**Workaround validated** (2026-06-03): Monkey-patch `jax.device_put` to transfer
-FP8 as `uint8` then `bitcast_convert_type` back to `float8_e4m3fn` on-device.
-All 4 validation tests passed:
-
-| Test | Result |
-|------|--------|
-| `bitcast_convert_type(uint8→float8)` on TPU v7x | ✅ PASS |
-| Patch under ~14 MB free HBM (post-model-load) | ✅ PASS |
-| Orbax shard concurrency = 1 (no semaphore needed) | ✅ PASS |
-| 4-node 32-TC multi-host `device_put` intercepted | ✅ PASS |
-
-**Next step**: Integrate the monkey-patch into `loader.py _load_checkpoint()`.
-See `fp8_restore_workaround/README.md` for implementation code.
-
-**Approaches that failed**:
-
-| Attempt | Outcome |
-|---------|---------|
-| Orbax 0.11.28, float8 direct | ShapeDtypeStruct (FP8 restore fails) |
-| Orbax 0.12.0, float8 direct | ShapeDtypeStruct (same) |
-| uint8 workaround (save as uint8, restore+bitcast) | HBM OOM during bitcast (only 14 MB free) |
-| Per-shard addressable_shards bitcast | HBM OOM (still needs temp buffer) |
-| Option B: hybrid (non-FP8 from ckpt, FP8 from NFS) | N/A — model is 100% FP8 |
-| JAX 0.9.0 container (`jax0.9.0-rev1`) | ShapeDtypeStruct (libtpu still blocks FP8) |
-
-**Path forward**: Requires a container where libtpu natively supports float8 buffer
-allocation. No `jax0.10.x-rev1` container exists yet in the public registry.
-The JAX Python changelog (0.9.x, 0.10.x) contains no float8 TPU mentions.
-
-**Checkpoint location** (saved, not yet usable):
+**Checkpoint location** (live, in use):
 ```
 gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/
   95dc2640/
-    tp32_bfloat16/           ← Orbax checkpoint with FP8 arrays
-    tp32_bfloat16_abstract_state.pkl
+    tp32_bfloat16/                      ← Orbax OCDBT checkpoint (sharded across 32 TCs)
+    tp32_bfloat16_abstract_state.pkl    ← abstract state metadata for restore
 ```
 
-Implementation: `python/sgl_jax/srt/model_loader/loader.py`
+**Implementation**: `python/sgl_jax/srt/model_loader/loader.py`
+
+Enabled via env var: `SGLANG_CHECKPOINT_DIR=gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint`
+
+---
+
+#### Bugs fixed during integration (2026-06-03 to 2026-06-05)
+
+**Bug 1 — FP8 host-to-device allocation (JAX/libtpu)**
+`jax.device_put(numpy_float8, tpu)` silently returns `ShapeDtypeStruct` on TPU v7x.
+Fix: monkey-patch `jax.device_put` — transfer FP8 as `uint8`, `bitcast_convert_type`
+back to `float8_e4m3fn` on-device. All 4 validation tests passed
+(see `fp8_restore_workaround/README.md`).
+
+**Bug 2 — PartitionSpec → NamedSharding upgrade crashes on MoE sub-mesh axes**
+MoE params have `PartitionSpec('expert', None, 'tensor')` but the main mesh only has
+`('data', 'tensor')`. Fix: skip the upgrade for PartitionSpec axes not in `self.mesh`.
+
+**Bug 3 — apply_linear_quantization creates weight_q mismatch with checkpoint**
+In the fast-restore path, `apply_linear_quantization` converts attention/MLP layers
+to `QuantizedLinear` (adding `weight_q`). The checkpoint stores BF16 `weight` for
+those layers (they remain BF16 by design — only MoE experts are FP8 via
+`apply_moe_quantization`).
+Fix: skip `apply_linear_quantization` when `checkpoint_ready=True` so the model
+structure (BF16 `weight` for linear layers, `wi_0/wi_1/wo` FP8 for MoE experts)
+matches the checkpoint exactly.
+
+**Bug 4 — allow_narrow_n_blockwise post-restore kernel error**
+After checkpoint restore, FP8 layers restored from `apply_moe_quantization` have
+`allow_narrow_n_blockwise=False`, causing `RuntimeError: Block-wise kernel does not
+support out_dim=128` during KV cache profiling (v_proj, q_proj with 128 output/TC).
+Fix: `_patch_narrow_blockwise()` sets `allow_narrow_n_blockwise=True` on all FP8
+layers after restore.
+
+#### Checkpoint tensor structure
+
+| Layer type | Format in checkpoint | Notes |
+|-----------|---------------------|-------|
+| MoE expert weights | `wi_0`, `wi_1`, `wo` (FP8) | via `apply_moe_quantization` |
+| MoE expert scales | `wi_0_scale`, `wi_1_scale`, `wo_scale` | blockwise float32 |
+| Attention q/k/v/o_proj | `weight` (BF16) | NOT quantized at linear level |
+| Dense MLP gate/up/down_proj | `weight` (BF16) | NOT quantized at linear level |
+| Layer norms | `scale` (BF16) | unchanged |
+| Embeddings | `embedding` (BF16) | unchanged |
 
 ---
 
@@ -131,7 +151,8 @@ Implementation: `python/sgl_jax/srt/model_loader/loader.py`
 | [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) | Test 1–6 runbooks |
 | [mimo_v25_pro_inference_pipeline.md](mimo_v25_pro_inference_pipeline.md) | Module-by-module pipeline |
 | [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) | Benchmark results + optimization roadmap |
-| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint analysis (blocked — see above) |
+| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint design and analysis |
+| [fp8_restore_workaround/README.md](fp8_restore_workaround/README.md) | FP8 restore bug + workaround (all tests passed) |
 | [mimo_v25_pro_progress.md](mimo_v25_pro_progress.md) | This document |
 
 ---
@@ -149,26 +170,21 @@ add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to tra
 Change `ep_size > 1` in model config + update MoE sub-mesh wiring in `weight_utils.py`.
 Expected: proportional MoE throughput gain (up to 8× with EP=8).
 
-### 9. FP8 checkpoint unblock ⬜
-
-Wait for a TPU container image where libtpu supports float8 device buffer allocation
-(e.g., `jax0.10.x-rev1` when available), then retry the checkpoint restore.
-
-### 10. FP8 GMM kernel tuning (Opt-3) ⬜
+### 9. FP8 GMM kernel tuning (Opt-3) ⬜
 
 Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency.
 
 ---
 
-## Key Infrastructure State (as of 2026-06-03)
+## Key Infrastructure State (as of 2026-06-05)
 
 | Resource | Status | Notes |
 |----------|--------|-------|
 | `jingnw-nfs-weights-1/2/3` | **RUNNING** | 3 × n2-highmem-48, ~$15–18/hr — weights in RAM |
 | TPU DWS nodes | ✅ 0 nodes | Pool empty, no active job |
-| GCS checkpoint | SAVED ✅ | `95dc2640/tp32_bfloat16/` — usable with monkey-patch workaround |
+| GCS checkpoint | **LIVE ✅** | `95dc2640/tp32_bfloat16/` — validated, ~98s restore |
 | XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` (tp-size=32) |
-| Container image (current) | `jax0.9.0-rev1` | FP8 restore unblocked via monkey-patch |
+| Container image (current) | `jax0.9.0-rev1` | FP8 restore via monkey-patch + structure fix |
 
 ---
 
@@ -176,10 +192,10 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 
 | Commit | Description |
 |--------|-------------|
-| `90ba338` | feat: upgrade container to jax0.9.0-rev1 (FP8 still blocked) |
-| `ed35748` | docs: JAX 0.8.1+0.9.0 FP8 restore confirmed blocked at libtpu |
-| `f00a4c0` | feat: Option C — Orbax 0.12, revert uint8 (also blocked) |
+| `4f238a2` | fix(checkpoint): skip apply_linear_quantization when restoring from checkpoint |
+| `9b44f29` | fix(checkpoint): skip sharding upgrade for sub-mesh axes (e.g. expert) |
+| `71e5794` | fix(checkpoint): revert allow_narrow_n_blockwise — keep default False |
+| `fccc688` | fix(checkpoint): remove stale NOTE — FP8 restore unblocked by monkey-patch |
 | `9c400b1` | fix(checkpoint): patch allow_narrow_n_blockwise post-restore |
-| `7519803` | fix(checkpoint): save FP8 as uint8 for Orbax (HBM OOM on restore) |
 | `3004a85` | feat: orbax checkpoint save/load initial implementation |
 | `4458f86` | feat: NFS weight loading demo job |
