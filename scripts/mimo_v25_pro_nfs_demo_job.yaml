@@ -145,9 +145,8 @@ spec:
               --tp-size 32 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.85 \
+              --mem-fraction-static 0.75 \
               --page-size 16 \
-              --max-prefill-tokens 8192 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
@@ -205,9 +204,8 @@ spec:
               --tp-size 32 \
               --device tpu \
               --dtype bfloat16 \
-              --mem-fraction-static 0.85 \
+              --mem-fraction-static 0.75 \
               --page-size 16 \
-              --max-prefill-tokens 8192 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
