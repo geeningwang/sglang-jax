@@ -1,0 +1,235 @@
+# 2-node EP=2 TP=16 demo job for MiMo-V2.5-Pro
+#
+# Configuration: ep_size=2, tp_size=16, 2 nodes × 8 TCs = 16 TCs total
+#
+# EPMoE mesh (auto-created inside EPMoE.__init__):
+#   moe_mesh = devices.reshape(ep_size=2, tp_size=8)
+#   Axes: ("expert", "tensor")
+#   Expert shard 0 (first 8 TCs): experts 0–191
+#   Expert shard 1 (last 8 TCs):  experts 192–383
+#
+# Expected HBM per TC (estimated):
+#   apply_moe_quantization scales: ~11 GB (TP-independent)
+#   MoE weights (192 experts, tp=8): ~16 GB   (half of ep=1 tp=16)
+#   Attention/MLP weights (tp=16):    ~2.76 GB
+#   Restore overhead:                 ~10 GB   (half of ep=1)
+#   Total model footprint:           ~40 GB   (vs ~102 GB with ep=1)
+#   XLA temp pool (25%):              25.43 GB
+#   KV available:                    ~36 GB   (vs OOM with ep=1)
+#
+# SGLANG_CHECKPOINT_DIR is set — first run loads from NFS (~42 min) then
+# saves a tp16_ep2 checkpoint for fast-restore on subsequent runs.
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v25-pro-2node-ep2-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x2
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v25-pro-2node-ep2-demo
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v25-pro-2node-ep2-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "129600"
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: mimo-v25-pro-2node-ep2-dws-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-v25-pro-2node-ep2-demo
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-v25-pro-2node-ep2-demo
+  ports:
+  - name: dist-init
+    port: 6006
+  - name: http
+    port: 8080
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v25-pro-2node-ep2-demo
+  namespace: default
+spec:
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v25-pro-2node-ep2-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: mimo-v25-pro-2node-ep2-demo
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x2
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v25-pro-2node-ep2-demo
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="mimo-v25-pro-2node-ep2-demo-0.mimo-v25-pro-2node-ep2-demo.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "=== [rank${INDEX}] Installing sglang-jax ==="
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          echo "=== [rank${INDEX}] Mounting NFS weight servers ==="
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
+          for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
+            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+          done
+
+          SAFETENSORS=$(ls /mnt/weights/*.safetensors | wc -l)
+          echo "$(ts) [rank${INDEX}] NFS ready: ${SAFETENSORS} safetensors files at /mnt/weights"
+
+          if [ "${INDEX}" = "0" ]; then
+            T_START=$(date +%s)
+            echo "$(ts) [rank0] PHASE: launching server  [T=0s]"
+            JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+            python3 -m sgl_jax.launch_server \
+              --model-path /mnt/weights \
+              --trust-remote-code \
+              --tp-size 16 \
+              --ep-size 2 \
+              --device tpu \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.75 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 1 \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --nnodes 2 \
+              --node-rank 0 \
+              --dist-init-addr ${COORDINATOR}:6006 &
+            SERVER_PID=$!
+            echo "$(ts) [rank0] PHASE: waiting for /health (PID=$SERVER_PID)"
+
+            for i in $(seq 1 25920); do
+              if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                T_HEALTHY=$(date +%s)
+                echo "$(ts) [rank0] PHASE: server healthy after $((i * 5))s  [total elapsed: $((T_HEALTHY - T_START))s]"
+                break
+              fi
+              if ! kill -0 $SERVER_PID 2>/dev/null; then
+                echo "$(ts) [rank0] ERROR: server process died after $((i * 5))s"
+                exit 1
+              fi
+              if [ $((i % 60)) -eq 0 ]; then
+                echo "$(ts) [rank0] still waiting for /health ($((i * 5))s elapsed)"
+              fi
+              sleep 5
+            done
+
+            echo ""
+            echo "$(ts) [rank0] PHASE: sending demo inference request"
+            RESPONSE=$(curl -sf --max-time 300 http://localhost:8080/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d '{
+                "model": "MiMo-V2.5-Pro",
+                "messages": [{"role": "user", "content": "What is mixture-of-experts and why does expert parallelism help scale inference?"}],
+                "max_tokens": 256,
+                "temperature": 0.7
+              }')
+            echo "$(ts) [rank0] PHASE: inference response received"
+            echo "$RESPONSE"
+            echo ""
+            echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); u=d['usage']; print(d['choices'][0]['message']['content']); print(); print('[tokens: prompt=%d, completion=%d]' % (u['prompt_tokens'], u['completion_tokens']))" 2>/dev/null || true
+            echo ""
+            echo "=== Demo complete ==="
+            kill $SERVER_PID
+          else
+            echo "$(ts) [rank${INDEX}] PHASE: launching worker server"
+            JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+            python3 -m sgl_jax.launch_server \
+              --model-path /mnt/weights \
+              --trust-remote-code \
+              --tp-size 16 \
+              --ep-size 2 \
+              --device tpu \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.75 \
+              --page-size 16 \
+              --chunked-prefill-size 512 \
+              --max-running-requests 1 \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --nnodes 2 \
+              --node-rank ${INDEX} \
+              --dist-init-addr ${COORDINATOR}:6006
+          fi
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: SGLANG_CHECKPOINT_DIR
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
