@@ -352,10 +352,16 @@ class JAXModelLoader(DefaultModelLoader):
             # Orbax takes a different (non-device_put) code path when only PartitionSpec is
             # given, bypassing our monkey-patch. Reconstruct full NamedSharding from the
             # PartitionSpec + current mesh so Orbax uses the standard device_put broadcast path.
+            # MoE params may have sub-mesh axes (e.g. 'expert') not present in self.mesh;
+            # skip the upgrade for those rather than crashing.
+            mesh_axes = set(self.mesh.axis_names)
             def _upgrade_sharding(sds):
                 if hasattr(sds, "sharding") and isinstance(
                     sds.sharding, jax.sharding.PartitionSpec
                 ):
+                    spec_axes = {a for a in sds.sharding if a is not None}
+                    if not spec_axes.issubset(mesh_axes):
+                        return sds  # sub-mesh axis — leave as PartitionSpec
                     sharding = jax.sharding.NamedSharding(self.mesh, sds.sharding)
                     return jax.ShapeDtypeStruct(sds.shape, sds.dtype, sharding=sharding)
                 return sds
