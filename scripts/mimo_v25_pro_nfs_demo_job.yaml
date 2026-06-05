@@ -147,6 +147,7 @@ spec:
               --dtype bfloat16 \
               --mem-fraction-static 0.85 \
               --page-size 16 \
+              --max-prefill-tokens 8192 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
@@ -206,6 +207,7 @@ spec:
               --dtype bfloat16 \
               --mem-fraction-static 0.85 \
               --page-size 16 \
+              --max-prefill-tokens 8192 \
               --chunked-prefill-size 512 \
               --max-running-requests 2 \
               --host 0.0.0.0 \
@@ -218,7 +220,7 @@ spec:
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: XLA_FLAGS
-          value: "--xla_tpu_rematerialization_algo=PEAK_PRIORITY"
+          value: "--xla_enable_hlo_rematerialization=true"
         - name: SGLANG_CHECKPOINT_DIR
           value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
         resources:
