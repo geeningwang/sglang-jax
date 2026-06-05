@@ -1,0 +1,24 @@
+# HBM Timeline — tp-16 fast-restore (2-node 2x2x2)
+# Measured 2026-06-05, commit d20a4a3, SGLANG_HBM_TRACE=1 SGLANG_HBM_ATTRIBUTE=1
+# HBM limit per TC: 101.73 GB
+
+Checkpoint                                       used      delta     free
+─────────────────────────────────────────────────────────────────────────
+T0:  baseline (pre-sampler)                    0.00 GB   +0.00 GB  101.73 GB
+T4b: after nnx.eval_shape                     0.00 GB   +0.00 GB  101.73 GB
+T4c: after apply_moe_quantization            11.72 GB  +11.72 GB   90.01 GB  ← FP32 scales
+T4e: before _load_checkpoint                 11.72 GB   +0.00 GB   90.01 GB
+OOM: RESOURCE_EXHAUSTED during restore at layer 42 wi_0
+     Attempting to allocate 288.00M; only 229.07M free
+     Total used at OOM: ~101.50 GB (= 101.73 - 0.229)
+─────────────────────────────────────────────────────────────────────────
+OOM ANALYSIS:
+  At T4e: 90.01 GB free
+  Expected weights at tp-16: ~67.5 GB  (checkpoint metadata × 2)
+  But OOM at ~101.5 GB used → only 90.01 - 101.5 + 101.73 = 90.24 GB allocated during restore
+  This exceeds 67.5 GB by ~22.74 GB (FP8 monkey-patch double-buffering accumulated)
+
+TP SCALING COMPARISON:
+  apply_moe_quantization:  tp-32 = 11.07 GB,  tp-16 = 11.72 GB  → nearly FIXED (not TP-scaled)
+  Checkpoint restore:      tp-32 = 53.61 GB,  tp-16 = OOM at ~90 GB → scales ~1.68×
+  Total model footprint:   tp-32 = 64.68 GB,  tp-16 = ~102 GB → exceeds HBM limit

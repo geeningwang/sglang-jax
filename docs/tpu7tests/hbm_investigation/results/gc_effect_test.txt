@@ -1,0 +1,11 @@
+# GC Effect Test — tp-32 fast-restore with SGLANG_HBM_GC_BEFORE_PROFILER=1
+# Measured 2026-06-05, H8 hypothesis test
+
+T10-pre:  before explicit GC:  64.68 GB used  (37.05 GB free)
+T10-post: after  explicit GC:  64.68 GB used  (37.06 GB free)
+Delta: -0.00 GB  (< 10 MB freed)
+
+CONCLUSION: H8 RULED OUT
+  gc.collect() + jax.clear_caches() frees essentially nothing (<10 MB).
+  The 64.68 GB model footprint is permanent committed HBM — not leaked intermediates.
+  No opportunity to free overhead via GC before the KV profiler runs.

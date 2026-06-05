@@ -1,0 +1,40 @@
+# HBM Timeline — tp-32 fast-restore (4-node 2x2x4)
+# Measured 2026-06-05, commit d20a4a3, SGLANG_HBM_TRACE=1 SGLANG_HBM_ATTRIBUTE=1
+# HBM limit per TC: 101.73 GB (TPU v7x, JAX-visible)
+
+Checkpoint                                       used      delta     free
+─────────────────────────────────────────────────────────────────────────
+T0:  baseline (pre-sampler)                    0.00 GB   +0.00 GB  101.73 GB
+T1:  after Sampler init                        0.00 GB   +0.00 GB  101.73 GB
+T2:  after get_available_device_memory         0.00 GB   +0.00 GB  101.73 GB  ← total_before
+T3:  after init_attention_backend              0.00 GB   +0.00 GB  101.73 GB
+T4:  before model_loader.load_model            0.00 GB   +0.00 GB  101.73 GB
+T4a: before nnx.eval_shape                    0.00 GB   +0.00 GB  101.73 GB
+T4b: after nnx.eval_shape                     0.00 GB   +0.00 GB  101.73 GB  ← abstract, no HBM
+T4c: after apply_moe_quantization            11.07 GB  +11.07 GB   90.66 GB  ← FP32 scales (REAL!)
+T4e: before _load_checkpoint                 11.07 GB   +0.00 GB   90.66 GB
+T4f: after _load_checkpoint                  64.68 GB  +53.61 GB   37.05 GB  ← weights in HBM
+T4g: after print_parameter_shardings        64.68 GB   +0.00 GB   37.05 GB
+T5:  after model_loader.load_model           64.68 GB   +0.00 GB   37.05 GB
+T6:  after load_model                        64.68 GB   +0.00 GB   37.05 GB
+T7:  before nnx.split(model)                 64.68 GB   +0.00 GB   37.05 GB
+T8a: after nnx.split(model)                  64.68 GB   +0.00 GB   37.05 GB  ← H7 RULED OUT
+T8b: after tree_flatten(model_state)         64.68 GB   +0.00 GB   37.05 GB
+T9:  after initialize_jit                    64.68 GB   +0.00 GB   37.05 GB
+T10: in profiler [free=37.05GB, xla=25.43GB] 64.68 GB   +0.00 GB   37.05 GB
+T11: after init_memory_pool [KV allocated]   76.30 GB  +11.62 GB   25.43 GB
+T12: after init_routed_experts_capturer      76.30 GB   +0.00 GB   25.43 GB
+─────────────────────────────────────────────────────────────────────────
+TOTAL ALLOCATED: +76.30 GB
+
+Key formula:
+  KV_available = free_after_load - XLA_temp_reservation
+               = 37.05 GB - 25.43 GB = 11.62 GB ✓ (matches TPU Memory profiling log)
+  XLA_temp = total_before × (1 - mem_fraction_static) = 101.73 × 0.25 = 25.43 GB
+
+Model footprint breakdown at tp-32:
+  apply_moe_quantization (FP32 scales):  11.07 GB  (permanent, created before restore)
+  checkpoint weights + restore overhead: 53.61 GB  (weights 33.75 GB + 19.86 GB overhead)
+  TOTAL:                                 64.68 GB
+  Expected from metadata:                33.75 GB (weights only)
+  Delta (overhead):                      30.93 GB  ← FP8 monkey-patch double-buffering + unreleased scale zeros
