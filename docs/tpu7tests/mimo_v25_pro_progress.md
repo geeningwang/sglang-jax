@@ -1,6 +1,6 @@
 # MiMo-V2.5-Pro on TPU v7x — Progress Summary
 
-**Last updated**: 2026-06-05  
+**Last updated**: 2026-06-05 (HBM investigation complete)  
 **Branch**: `tpu7` (`geeningwang/sglang-jax`)  
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
@@ -142,35 +142,69 @@ layers after restore.
 
 ---
 
-### 6. Documentation ✅
+### 6. HBM investigation — 2-node feasibility ✅ Complete (2026-06-05)
+
+**Goal**: Understand whether 2-node (tp-16) inference is feasible and what the
+27 GB unexplained HBM overhead was.
+
+**Conclusion**: 2-node with ep_size=1 is **infeasible**. Only viable path: **EP > 1**.
+
+**Investigation**: 7 measurement tests across two TPU configurations. All results
+in `docs/tpu7tests/hbm_investigation/`.
+
+Key confirmed facts:
+
+| Finding | Value | Notes |
+|---------|-------|-------|
+| JAX-visible HBM per TC | **101.73 GB** | Not 96 GB as assumed |
+| JAX runtime overhead | **0 GB** | T0 = 0.00 GB |
+| `apply_moe_quantization` HBM | **11.07 GB** (tp-32) / 11.72 GB (tp-16) | Real FP32 scale arrays; nearly TP-independent |
+| `nnx.split()` overhead | **0 GB** | No copies (H7 ruled out) |
+| GC effect | **0 GB** | Overhead is permanent (H8 ruled out) |
+| Total model footprint at tp-32 | **64.68 GB/TC** | scales + weights + restore overhead |
+| KV cache at tp-32 | **11.62 GB/TC** (346 GB total) | precisely measured |
+| EPMoE min XLA temp | **~20 GB** | 0.85 mem_fraction fails; min = 0.803 frac |
+| tp-16 model footprint | **~102 GB** | OOM during restore (layer 42/70) |
+| 2-node (ep-1) | **INFEASIBLE** | OOM during restore; no KV headroom |
+
+**Tools built**: `SGLANG_HBM_TRACE=1` + `SGLANG_HBM_ATTRIBUTE=1` + `SGLANG_HBM_GC_BEFORE_PROFILER=1`
+instrumentation in `model_runner.py`, `model_runner_kv_cache_mixin.py`, `loader.py`.
+Snapshot/attribution tools: `python/sgl_jax/tools/hbm/`.
+
+---
+
+### 7. Documentation ✅
 
 | Doc | Contents |
 |-----|----------|
 | [gke_tpu7x_env_setup.md](gke_tpu7x_env_setup.md) | DWS node pool setup, resubmit workflow, pitfalls |
-| [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) | HBM/RAM/GCS for 4-node and 2-node |
+| [gke_tpu7x_resource_allocation.md](gke_tpu7x_resource_allocation.md) | HBM/RAM/GCS — corrected measurements (2026-06-05) |
 | [gke_tpu7x_smoke_tests.md](gke_tpu7x_smoke_tests.md) | Test 1–6 runbooks |
 | [mimo_v25_pro_inference_pipeline.md](mimo_v25_pro_inference_pipeline.md) | Module-by-module pipeline |
 | [mimo_v25_pro_perf_benchmark.md](mimo_v25_pro_perf_benchmark.md) | Benchmark results + optimization roadmap |
-| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint design and analysis |
+| [mimo_v25_pro_weight_checkpoint.md](mimo_v25_pro_weight_checkpoint.md) | Checkpoint design, timing, memory, data dependencies |
 | [fp8_restore_workaround/README.md](fp8_restore_workaround/README.md) | FP8 restore bug + workaround (all tests passed) |
+| [hbm_investigation/plan.md](hbm_investigation/plan.md) | HBM investigation — findings, hypotheses, test results |
 | [mimo_v25_pro_progress.md](mimo_v25_pro_progress.md) | This document |
 
 ---
 
 ## Pending / Planned
 
-### 7. Scheduler throughput (Opt-1d) ⬜
+### 8. Scheduler throughput (Opt-1d) ⬜
 
 The `#running-req: 2` ceiling is structural — all flag-level fixes failed. Next:
 add debug logging to `get_new_batch_prefill()` in `managers/scheduler.py` to trace
 `batch_is_full` state and `add_one_req` return codes per queued request.
 
-### 8. EP > 1 (Opt-2) ⬜
+### 9. EP > 1 for 2-node (Opt-2) ⬜
 
-Change `ep_size > 1` in model config + update MoE sub-mesh wiring in `weight_utils.py`.
-Expected: proportional MoE throughput gain (up to 8× with EP=8).
+**Only viable path to 2-node inference.** With ep_size=2 + tp=8:
+- Each TC handles 192 experts (not 384) → MoE weight per TC halves
+- Estimated model footprint ≈ 34 GB/TC → ~42 GB KV headroom
+- Requires: mesh wiring for EP sub-mesh, model routing changes in `weight_utils.py`
 
-### 9. FP8 GMM kernel tuning (Opt-3) ⬜
+### 10. FP8 GMM kernel tuning (Opt-3) ⬜
 
 Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency.
 

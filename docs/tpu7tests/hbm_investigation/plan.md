@@ -1,42 +1,74 @@
 # HBM Usage Investigation — MiMo-V2.5-Pro on TPU v7x
 
-**Status**: Investigation in progress  
-**Goal**: Identify the source of ~27.45 GB/TC unexplained HBM overhead, map the
-complete HBM timeline during inference startup, and find opportunities to reduce
-HBM pressure to enable 2-node (tp-16) inference.
+**Status**: Phase 1–4 complete (2026-06-05). Phase 5 (reduction strategies) pending.  
+**Goal**: Identify the source of unknown HBM overhead, map the complete HBM timeline,
+and find opportunities to enable 2-node (tp-16) inference.
 
 ---
 
-## 1. Motivation
+## Confirmed Findings (2026-06-05)
 
-At tp-32 (4-node, 32 TCs), HBM breaks down as:
+### Corrected HBM baseline
 
-```
-96 GB total per TC
-  24 GB  XLA temp pool (25% of 96 GB; required for EPMoE 384-expert GEMM)
-  33.75 GB  model weights (from checkpoint metadata: wi_0/wi_1/wo FP8 + BF16 attn)
-  10.80 GB  KV cache (measured: available_kv_cache from profiler log)
-  ─────────
-  27.45 GB  UNKNOWN (the gap — not accounted for by any of the above)
-```
+The actual JAX-visible HBM per TensorCore on TPU v7x is **101.73 GB**, not 96 GB.
+At `mem_fraction_static=0.75`:
+- XLA temp pool: 101.73 × 0.25 = **25.43 GB**
+- Static pool: 101.73 × 0.75 = **76.30 GB**
 
-At tp-16 (2-node), weights double to ~67.5 GB/TC:
+### Correct HBM breakdown at tp-32 (fast-restore, measured)
 
 ```
-96 GB total
-  24 GB  XLA temp pool (unchanged — EPMoE still needs it)
-  67.5 GB  model weights (doubled)
-  27+ GB  unknown overhead (unknown scaling)
-  ─────────
-  < 0 GB  available for KV → likely OOM
+101.73 GB  HBM per TC (JAX-visible limit)
+─── Static pool (75%) = 76.30 GB ────────────────────────────
+   11.07 GB  apply_moe_quantization FP32 scales  [REAL HBM, not abstract]
+   53.61 GB  checkpoint weights + restore overhead
+             (33.75 GB actual weights + 19.86 GB restore overhead)
+   11.62 GB  KV cache (SWA pool: 286.64 GB + 59.72 GB total / 32 TCs)
+─── XLA temp pool (25%) = 25.43 GB ──────────────────────────
+   25.43 GB  EPMoE EXTEND/DECODE XLA compilation buffers
+─────────────────────────────────────────────────────────────
+   101.73 GB  total accounted for ✓
 ```
 
-The 2-node case is currently infeasible. To unlock it, we need to:
-1. Identify what the 27.45 GB is
-2. Determine if it scales with TP size (if not: 4.5 GB left for KV at tp-16)
-3. Find ways to move or reduce it
+### Hypotheses resolved
+
+| Hypothesis | Test | Result |
+|-----------|------|--------|
+| H7: `nnx.split()` copies weight arrays | T7→T8a delta in timeline | **RULED OUT** — delta = 0.00 GB |
+| H8: Overhead is unreleased intermediates | GC effect test | **RULED OUT** — GC frees < 10 MB |
+| JAX runtime overhead ('J' term) | T0 baseline | **ZERO** — T0 = 0.00 GB |
+| apply_moe_quantization allocates real HBM | T4c timeline snap | **CONFIRMED** — 11.07 GB at tp-32, 11.72 GB at tp-16 (nearly fixed) |
+| init_attention_backend allocates HBM | T3 timeline snap | **ZERO** — FlashAttention backend is pure Python metadata |
+| nnx.eval_shape allocates HBM | T4b timeline snap | **ZERO** — abstract shapes, no device allocation |
+
+### TP-scaling of overhead
+
+| Component | tp-32 | tp-16 | Scales? |
+|-----------|-------|-------|---------|
+| apply_moe_quantization (FP32 scales) | 11.07 GB | 11.72 GB | **Nearly fixed** (+0.65 GB) |
+| Checkpoint weights + restore | 53.61 GB | ~90 GB (OOM) | **~1.68× scales** |
+| Total model footprint | 64.68 GB | ~102 GB | OOM at tp-16 |
+| XLA temp requirement (EXTEND compile) | 25.43 GB | 25.43 GB | **Fixed** |
+
+### EPMoE XLA temp pool minimum
+
+EPMoE EXTEND precompile (384 experts, block-wise FP8 GEMM) requires **~20 GB XLA temp**.
+At `mem_fraction_static=0.85` (14.4 GB temp), EXTEND OOMs with: "Exceeded hbm capacity by 5.54G".
+→ Minimum viable `mem_fraction_static` ≤ (101.73 − 20) / 101.73 ≈ **0.803**.
+→ Tested values 0.85 / 0.90 / 0.93 / 0.95 / 0.97 all fail.
+
+### 2-node feasibility conclusion
+
+At tp-16:
+- Model footprint after restore ≈ **102 GB** (exceeds 101.73 GB HBM — OOM during restore itself)
+- Even without the restore OOM: available after model = ~−0.3 GB → no room for KV
+- EPMoE XLA temp floor (~20 GB) is fixed; reducing static fraction does not help
+- **Option B (increase mem_fraction_static) is infeasible.**
+- **Only viable path to 2-node: EP > 1** (split 384 experts across 2 nodes → 192 experts/TC → weights halve)
 
 ---
+
+## 1. Motivation (original)
 
 ## 2. What We Know
 

@@ -136,43 +136,81 @@ not fully fit, so hot MoE experts stayed resident. Load time: ~2h25m.
 
 ## HBM (TPU High Bandwidth Memory)
 
-`--mem-fraction-static 0.75` divides each TensorCore's 96 GB into two pools
-for **both** configurations:
+> **Corrected baseline (measured 2026-06-05)**: JAX-visible HBM per TensorCore on
+> TPU v7x is **101.73 GB**, not 96 GB. All pool sizes below use this figure.
+
+`--mem-fraction-static 0.75` divides each TensorCore's 101.73 GB into two pools:
 
 | Pool | Per TensorCore | Notes |
 |------|---------------|-------|
-| Static (weights + KV cache) | 72 GB | 75% |
-| XLA temporaries | 24 GB | 25%; required for 384-expert MoE GEMM |
+| Static (weights + KV cache) | **76.30 GB** | 75% of 101.73 GB |
+| XLA temporaries | **25.43 GB** | 25%; EPMoE EXTEND compile needs ~20 GB minimum |
 
-### 4-node static pool breakdown (per node, 8 TensorCores, 768 GB total)
+### EPMoE XLA temp pool requirement (measured)
 
-| Use | Per node | Per TensorCore | Notes |
-|-----|----------|----------------|-------|
-| Model weights (FP8 MoE + BF16 attn, sharded ÷ 32 TCs) | ~240 GB | ~30 GB | 962 GB ÷ 32 |
-| KV cache — full layers (60 SWA layers) | 286.64 GB | ~35.8 GB | 156,528 tokens; bfloat16 (measured) |
-| KV cache — SWA layers (10 layers) | 59.72 GB | ~7.5 GB | 195,664 tokens; bfloat16 (measured) |
-| **Total static used** | **~586 GB** | **~73 GB** | |
+EPMoE with 384 experts, block-wise FP8 GEMM requires **~20 GB XLA temp** for EXTEND
+(prefill) kernel compilation. Tested at tp-32:
 
-### 2-node static pool breakdown (per node, 8 TensorCores, 768 GB total)
+| `mem_fraction_static` | XLA temp | EXTEND compile | Result |
+|---|---|---|---|
+| 0.75 | 25.43 GB | ✅ PASS | **baseline** |
+| 0.85 | 14.40 GB | ❌ OOM +5.54 GB | FAIL |
+| 0.90–0.97 | < 10 GB | ❌ OOM | FAIL |
 
-| Use | Per node | Per TensorCore | Notes |
-|-----|----------|----------------|-------|
-| Model weights (FP8, sharded ÷ 16 TCs) | ~480 GB | ~60 GB | 962 GB ÷ 16 |
-| KV cache (minimal) | ~96 GB | ~12 GB | weights double per TC vs 4-node |
-| **Total static used** | **~576 GB** | **~72 GB** | |
+Minimum viable `mem_fraction_static` ≤ 0.803 (leaves ≥ 20 GB for XLA).
+**Do not reduce `mem_fraction_static` below 0.75** without profiling EPMoE compilation.
 
-### KV cache capacity
+### 4-node HBM breakdown per TensorCore (measured, fast-restore path)
 
-| Metric | 4-node | 2-node |
-|--------|--------|--------|
-| KV cache per TC | ~43 GB | ~12 GB |
-| Total KV cache | ~1384 GB | ~192 GB |
-| KV cache dtype | bfloat16 | bfloat16 |
-| Page size | 16 tokens | 16 tokens |
-| Max running requests | 2 | 1 (minimal) |
+| Allocation | Per TC | 32-TC total | How allocated |
+|-----------|--------|-------------|---------------|
+| `apply_moe_quantization` FP32 scales | **11.07 GB** | 354 GB | Real HBM (not abstract) — created at model init |
+| Checkpoint weights + restore overhead | **53.61 GB** | 1,716 GB | 33.75 GB actual + 19.86 GB restore double-buffering |
+| KV cache — 60 SWA layers | **8.96 GB** | 286.64 GB | 156,528 tokens, bfloat16 |
+| KV cache — 10 full layers | **1.87 GB** | 59.72 GB | 195,664 tokens, bfloat16 |
+| XLA temp pool | **25.43 GB** | 813 GB | 25% reservation |
+| **Total** | **101.34 GB** | **3,243 GB** | ≤ 101.73 GB ✓ |
 
-The 2-node KV cache is intentionally minimal — just enough for a single-request
-smoke test. The tight budget (~12 GB per TC) leaves no room for concurrent requests.
+Key notes:
+- `apply_moe_quantization(is_static_input=True)` allocates **real** FP32 scale arrays
+  even though weight arrays remain abstract until checkpoint restore. This is 11 GB
+  at tp-32 and **nearly identical at tp-16** (11.72 GB — nearly TP-independent).
+- `nnx.split(model)` delta = 0 GB — no weight copies.
+- `gc.collect() + jax.clear_caches()` frees < 10 MB — overhead is permanent.
+- Restore overhead (19.86 GB) comes from FP8 monkey-patch uint8/float8 double-buffering
+  accumulated across 1,038 tensor restores before Python GC clears them.
+
+### 2-node HBM analysis (tp-16) — INFEASIBLE with EP=1
+
+> **Status**: 2-node with ep_size=1 is infeasible. OOM occurs during checkpoint
+> restore before the KV profiler even runs. The only viable path is **EP > 1**.
+
+At tp-16, weight shards double per TC. Measured/estimated breakdown:
+
+| Allocation | Per TC | Notes |
+|-----------|--------|-------|
+| `apply_moe_quantization` FP32 scales | **11.72 GB** | Nearly same as tp-32 (TP-independent) |
+| Checkpoint weights at tp-16 | **~90 GB** | OOM at layer 42/70 during restore |
+| XLA temp (required for EPMoE) | **25.43 GB** | Same as tp-32 |
+| **Available for KV** | **< 0 GB** | OOM before KV profiler runs |
+
+Root cause: `apply_moe_quantization` (11.72 GB) + MoE weight shards (~67.5 GB) +
+restore double-buffering overhead = **~102 GB**, which exceeds the 101.73 GB HBM limit.
+The OOM occurs mid-restore (at layer 42 of 70 `wi_0` tensors).
+
+Reducing `mem_fraction_static` does not help — EPMoE compilation needs ~20 GB XLA temp,
+which is already close to the 25.43 GB available.
+
+### KV cache capacity (4-node only, measured)
+
+| Metric | 4-node (tp-32) | 2-node (tp-16) |
+|--------|---------------|----------------|
+| KV cache per TC | **11.62 GB** (measured) | N/A — OOM before KV alloc |
+| Total KV cache | **346.36 GB** (286.64 + 59.72) | N/A |
+| Max tokens | 195,664 (SWA) / 156,528 (full) | N/A |
+| KV cache dtype | bfloat16 | — |
+| Page size | 16 tokens | — |
+| Max running requests | 2 | — |
 
 ---
 
@@ -220,36 +258,43 @@ python3 -m sgl_jax.launch_server \
 
 ---
 
-## Why 4 nodes vs 2 nodes
+## Why 4 nodes vs 2 nodes (updated 2026-06-05)
 
-At tp-size=16 (2 nodes, 16 TensorCores), model weights occupy ~60 GB per TensorCore
-out of the 72 GB static pool, leaving only ~12 GB for KV cache. This is sufficient
-for a single-request smoke test but too small for production use.
+At tp-size=16 (2 nodes, 16 TensorCores), the MoE weight shards per TC double.
+The full model footprint (~102 GB) exceeds the 101.73 GB HBM limit, causing OOM
+**during checkpoint restore** before the server even starts.
 
-At tp-size=32 (4 nodes, 32 TensorCores), weights halve to ~30 GB per TensorCore,
-freeing ~43 GB for KV cache (~3.5× more context capacity).
+This is not a KV cache headroom issue — the model simply cannot fit in HBM at tp-16
+with ep_size=1 (all 384 experts on every TC).
 
-| Config | Weights/TC | KV cache/TC | Usable for |
-|--------|-----------|-------------|------------|
-| 2-node (tp-16) | ~60 GB | ~12 GB | Smoke test, single request |
-| 4-node (tp-32) | ~30 GB | ~43 GB | Production, concurrent requests |
+The only viable path to 2-node is **EP > 1** (expert parallelism):
+- With ep_size=2: each TC handles 192 experts → MoE weight per TC halves
+- Combined with tp=8 within each node → same footprint per TC as 4-node tp-32
+
+| Config | ep | tp | Experts/TC | Model footprint/TC | KV/TC | Status |
+|--------|----|----|-----------|-------------------|-------|--------|
+| 4-node (tp-32, ep-1) | 1 | 32 | 384 | 64.68 GB | 11.62 GB | ✅ Production |
+| 2-node (tp-16, ep-1) | 1 | 16 | 384 | ~102 GB | OOM | ❌ Infeasible |
+| 2-node (tp-8, ep-2) | 2 | 8 | 192 | ~34 GB (est.) | ~42 GB (est.) | ⬜ Planned |
 
 ---
 
-## Summary
+## Summary (corrected 2026-06-05)
 
-| Resource | 4-node | 2-node |
-|----------|--------|--------|
-| GCS checkpoint | ~482 GB logical | — |
+| Resource | 4-node | 2-node (ep-1) |
+|----------|--------|---------------|
+| HBM per TC (JAX-visible) | **101.73 GB** | **101.73 GB** |
+| HBM limit reported in logs | 101.73 GB | 101.73 GB |
+| HBM static pool (75%) | **76.30 GB/TC** | 76.30 GB/TC |
+| HBM XLA temp (25%) | **25.43 GB/TC** | 25.43 GB/TC |
+| apply_moe_quantization scales | **11.07 GB/TC** | 11.72 GB/TC |
+| Checkpoint weights + overhead | **53.61 GB/TC** | ~90 GB/TC (OOM) |
+| HBM KV cache (measured) | **11.62 GB/TC** (346 GB total) | N/A |
+| EPMoE EXTEND min XLA temp | **~20 GB** | same |
+| GCS checkpoint | ~482 GB logical | ~962 GB logical (tp-16 saved) |
 | GCS weights (HF safetensors) | ~962 GB | ~962 GB (shared) |
-| GCS compilation cache | ~85 MB | ~85 MB (separate cache key) |
-| Hard disk total | 400 GB | 200 GB |
-| **RAM — TPU nodes (pods, limit)** | **3600 Gi** | **1800 Gi** |
-| RAM — TPU nodes, peak (restore) | ~400–440 GB | — |
-| RAM — TPU nodes, steady-state | ~60–80 GB | — |
-| RAM — NFS weight servers (tmpfs) | **~964 GB** (3 VMs) | ~964 GB (slow path only) |
-| HBM total | 3072 GB | 1536 GB |
-| HBM static pool (75%) | 2304 GB | 1152 GB |
-| HBM XLA temp (25%) | 768 GB | 384 GB |
-| HBM weights | ~962 GB | ~962 GB |
-| HBM KV cache (measured) | **346 GB** (286.6 + 59.7) | ~192 GB |
+| GCS compilation cache | ~85 MB | ~85 MB (separate key) |
+| RAM — TPU pods (limit) | 900 Gi × 4 | 900 Gi × 2 |
+| RAM — peak during restore | ~400–440 GB | — |
+| RAM — steady-state serving | ~60–80 GB | — |
+| RAM — NFS servers (tmpfs) | ~964 GB (3 VMs) | ~964 GB (slow path) |
