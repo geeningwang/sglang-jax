@@ -432,8 +432,6 @@ class JAXModelLoader(DefaultModelLoader):
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
 
-        # Quantization config is already unified in model_config
-        # No need for any conversion logic here
         if (
             hasattr(model_config, "quantization_config")
             and model_config.quantization_config is not None
@@ -450,7 +448,13 @@ class JAXModelLoader(DefaultModelLoader):
                 if model_config.quantization_config.has_moe_quantization():
                     model = apply_moe_quantization(model_config, model, is_static_input=True)
 
-                if model_config.quantization_config.get_linear_rules():
+                # Skip apply_linear_quantization when restoring from checkpoint.
+                # The saved checkpoint uses BF16 for linear attention/MLP layers
+                # (apply_linear_quantization was a no-op on the slow-path save because
+                # those layers are handled by MoE quantization or stay BF16 by design).
+                # Applying it here produces weight_q structure that mismatches the
+                # checkpoint's weight structure — causing Orbax tree-mismatch errors.
+                if model_config.quantization_config.get_linear_rules() and not checkpoint_ready:
                     model = apply_linear_quantization(model_config, model, is_static_input=True)
             else:
                 logger.info("Dynamic quantization detected. Skipping structure change in loader.")
