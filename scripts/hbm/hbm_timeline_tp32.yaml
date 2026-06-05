@@ -1,0 +1,160 @@
+# HBM Timeline — 4-node tp-32 (Phase 1 of HBM investigation)
+#
+# Runs sglang-jax startup with SGLANG_HBM_TRACE=1 to log bytes_in_use
+# at every key checkpoint in model_runner.__init__. Reports a full timeline
+# with per-step deltas to identify the 27.45 GB unexplained overhead.
+#
+# After Phase 1 instrumentation is added to model_runner.py, submit with:
+#   kubectl apply -f scripts/hbm/hbm_timeline_tp32.yaml
+#   kubectl logs -l job-name=hbm-timeline-tp32 --prefix -f
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: hbm-timeline-tp32-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: hbm-timeline-tp32
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: hbm-timeline-tp32-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: hbm-timeline-tp32-dws-template
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hbm-timeline-tp32
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: hbm-timeline-tp32
+  ports:
+  - name: dist-init
+    port: 6006
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hbm-timeline-tp32
+  namespace: default
+spec:
+  completions: 4
+  parallelism: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: hbm-timeline-tp32-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      subdomain: hbm-timeline-tp32
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+        cloud.google.com/gke-accelerator-count: "4"
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: hbm-timeline-tp32
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          INDEX=${JOB_COMPLETION_INDEX}
+          COORDINATOR="hbm-timeline-tp32-0.hbm-timeline-tp32.default.svc.cluster.local"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
+          mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
+          for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
+            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+          done
+
+          # Launch server with HBM trace enabled and exit after KV profiling
+          # (no need to serve requests — just need the timeline up to T10)
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          SGLANG_HBM_TRACE=1 \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/weights \
+            --trust-remote-code \
+            --tp-size 32 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 16 \
+            --chunked-prefill-size 512 \
+            --max-running-requests 2 \
+            --nnodes 4 \
+            --node-rank ${INDEX} \
+            --dist-init-addr ${COORDINATOR}:6006 \
+            --host 0.0.0.0 \
+            --port 8080
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: SGLANG_CHECKPOINT_DIR
+          value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
+        - name: SGLANG_HBM_TRACE
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"

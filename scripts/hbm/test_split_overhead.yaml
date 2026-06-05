@@ -1,0 +1,109 @@
+# Test: does nnx.split() copy parameter arrays or share them?
+#
+# H7 hypothesis: nnx.split(model) doubles HBM by creating copies.
+# If true, HBM jumps by ~33 GB (tp-32) right after nnx.split() in initialize_jit().
+#
+# This is a minimal single-node test (no model loading — uses random weights).
+# It measures HBM before and after nnx.split() on a dummy model of known size.
+#
+# Expected: delta ≈ 0 GB (references only, no copy)
+# If delta ≈ N GB: nnx.split() copies all parameters → H7 confirmed
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: test-hbm-split-overhead
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: test-hbm-split
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          pip install -q flax
+
+          python3 - << 'PYEOF'
+          import gc
+          import jax
+          import jax.numpy as jnp
+          from flax import nnx
+
+          def bytes_in_use():
+              gc.collect()
+              return min(d.memory_stats()["bytes_in_use"] for d in jax.local_devices())
+
+          def snap(label, prev=None):
+              used = bytes_in_use()
+              delta = used - prev if prev is not None else 0
+              print(f"[HBM] {label:<45} used={used/1e9:.3f} GB  delta={delta/1e9:+.3f} GB")
+              return used
+
+          print(f"JAX devices: {jax.local_devices()}")
+          limit = jax.local_devices()[0].memory_stats()["bytes_limit"]
+          print(f"HBM limit per TC: {limit/1e9:.1f} GB\n")
+
+          # --- Allocate a known-size dummy parameter matrix on device ---
+          # Match the scale of MiMo MoE weights at tp-32: ~33 GB total
+          # Use a 4 GB dummy for fast test (can scale up)
+          PARAM_BYTES = 4 * 1024**3  # 4 GB
+          n = int((PARAM_BYTES / 2) ** 0.5)  # BF16, square matrix
+          print(f"Allocating dummy param: shape=({n}, {n}), BF16, size={n*n*2/1e9:.2f} GB")
+
+          u = snap("baseline (no alloc)")
+
+          class DummyModel(nnx.Module):
+              def __init__(self):
+                  self.w = nnx.Param(jnp.zeros((n, n), dtype=jnp.bfloat16))
+
+          with jax.default_device(jax.local_devices()[0]):
+              model = DummyModel()
+
+          u = snap("after DummyModel __init__", u)
+
+          # --- Test nnx.split ---
+          model_def, model_state = nnx.split(model)
+          u = snap("after nnx.split(model)", u)
+
+          leaves, treedef = jax.tree_util.tree_flatten(model_state)
+          u = snap("after tree_flatten(model_state)", u)
+
+          del model_state
+          gc.collect()
+          u = snap("after del model_state + gc", u)
+
+          del leaves
+          gc.collect()
+          u = snap("after del leaves + gc", u)
+
+          print("\n=== CONCLUSION ===")
+          print("If delta after nnx.split() ≈ 0: no copy (references only) → H7 RULED OUT")
+          print("If delta after nnx.split() ≈ 4 GB: full copy → H7 CONFIRMED")
+          PYEOF
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            google.com/tpu: "4"
+          requests:
+            google.com/tpu: "4"
