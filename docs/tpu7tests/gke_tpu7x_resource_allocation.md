@@ -160,6 +160,11 @@ EPMoE with 384 experts, block-wise FP8 GEMM requires **~20 GB XLA temp** for EXT
 Minimum viable `mem_fraction_static` ≤ 0.803 (leaves ≥ 20 GB for XLA).
 **Do not reduce `mem_fraction_static` below 0.75** without profiling EPMoE compilation.
 
+Attempted `mem_fraction_static=0.85` with XLA rematerialization flags to close
+the 5.54 GB gap — blocked: flags `--xla_tpu_rematerialization_algo=PEAK_PRIORITY`
+and `--xla_enable_hlo_rematerialization` are **not available in jax0.9.0-rev1**.
+Would require jax0.10.x+ container. Reverted to baseline 0.75.
+
 ### 4-node HBM breakdown per TensorCore (measured, fast-restore path)
 
 | Allocation | Per TC | 32-TC total | How allocated |

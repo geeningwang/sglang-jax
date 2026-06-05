@@ -360,12 +360,15 @@ restore accumulation, 157 MB free when trying to allocate 288 MB wi_0 shard).
 With ep=2 tp=16 on 4 nodes: same per-TC weight as ep=1 tp=32, but better expert
 load balancing and potentially higher MoE throughput (separate track from 2-node).
 
-### Low-risk optimization for tp-32 (try first)
+### XLA rematerialization flag for tp-32 — BLOCKED (2026-06-05)
 
-Try `XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"` to allow
-`mem_fraction_static=0.85`. If the EXTEND compile passes, this gives:
-- KV cache: 20.3 GB/TC (vs 11.6 GB today) → 75% more context capacity at tp-32
-- Larger context window and higher concurrency at same hardware cost
+Attempted `mem_fraction_static=0.85` (would give 20.3 GB KV, 75% more context):
+- `--xla_tpu_rematerialization_algo=PEAK_PRIORITY` → Unknown flag in jax0.9.0
+- `--xla_enable_hlo_rematerialization=true` → Unknown flag in jax0.9.0
+- `--max-prefill-tokens 8192` → No effect on EXTEND peak HBM
+
+EXTEND always OOMs by exactly 5.54 GB at mem_fraction_static=0.85.
+Flags become available in jax0.10.x+. Not actionable with current container.
 
 ### FP8 monkey-patch restore overhead reduction
 

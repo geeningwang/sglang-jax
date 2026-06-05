@@ -1,6 +1,6 @@
 # MiMo-V2.5-Pro on TPU v7x — Progress Summary
 
-**Last updated**: 2026-06-05 (HBM investigation complete)  
+**Last updated**: 2026-06-05 (2-node confirmed infeasible, next-step actions complete)  
 **Branch**: `tpu7` (`geeningwang/sglang-jax`)  
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
@@ -212,14 +212,30 @@ provide throughput improvements (better expert balancing) without memory savings
 **2-node is not achievable for MiMo-V2.5-Pro with 96 GB HBM per chip.**
 Would require: smaller model, different quantization, or future TPU with more HBM.
 
-### 9b. XLA rematerialization flag for tp-32 (low-risk optimization) ⬜
+### 9b. XLA rematerialization flag — BLOCKED (2026-06-05) ❌
 
-Try `XLA_FLAGS="--xla_tpu_rematerialization_algo=PEAK_PRIORITY"` with
-`mem_fraction_static=0.85`. EPMoE EXTEND OOMs by only 5.54 GB at 0.85 — this
-flag might close the gap. If it works: KV cache grows from 11.6 GB to **20.3 GB/TC**
-(75% more context capacity at tp-32, no hardware cost).
+Attempted `mem_fraction_static=0.85` (XLA temp 14.4 GB, KV 20.3 GB) with:
+- `--xla_tpu_rematerialization_algo=PEAK_PRIORITY` → **Unknown flag** in jax0.9.0-rev1
+- `--xla_enable_hlo_rematerialization=true` → **Unknown flag** in jax0.9.0-rev1
+- `--max-prefill-tokens 8192` → No effect on EXTEND compile peak
 
-### 10. FP8 GMM kernel tuning (Opt-3) ⬜
+EXTEND precompile OOMs by exactly 5.54 GB at 0.85 regardless of all approaches.
+The rematerialization flags required exist only in newer XLA versions (jax0.10+).
+
+**Status**: Blocked by JAX 0.9.0 XLA version. Would require upgrading to
+jax0.10.x-rev1 container when available. Reverted to `mem_fraction_static=0.75`.
+
+### 10. EP > 1 at 4 nodes for throughput (Opt-2) ⬜
+
+EP > 1 is fully implemented in `moe.py` (auto-creates moe_mesh, psum combine,
+`--ep-size` flag already plumbed through). EP > 1 at 4 nodes provides:
+- Better expert load balancing
+- Reduced per-TC token processing (routing only to assigned experts)
+- No HBM benefit (per-TC weight = total_weight / total_TCs, unchanged)
+
+Try `--ep-size 2 --tp-size 16 --nnodes 4` (32 TCs, ep=2 groups × tp=16 each).
+
+### 11. FP8 GMM kernel tuning (Opt-3) ⬜
 
 Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency.
 
@@ -231,8 +247,9 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 |----------|--------|-------|
 | `jingnw-nfs-weights-1/2/3` | **RUNNING** | 3 × n2-highmem-48, ~$15–18/hr — weights in RAM |
 | TPU DWS nodes | ✅ 0 nodes | Pool empty, no active job |
-| GCS checkpoint (tp-32) | **LIVE ✅** | `95dc2640/tp32_bfloat16/` — validated, ~98s restore |
-| GCS checkpoint (tp-16) | SAVED | `95dc2640/tp16_bfloat16/` — saved but unusable with ep=1 |
+| GCS checkpoint (tp-32 ep-1) | **LIVE ✅** | `95dc2640/tp32_bfloat16/` — validated, ~98s restore |
+| GCS checkpoint (tp-16 ep-1) | SAVED | `95dc2640/tp16_bfloat16/` — saved but unusable (OOM) |
+| GCS checkpoint (tp-16 ep-2) | NOT SAVED | ep=2 OOMs during restore, no checkpoint created |
 | XLA compilation cache | WARM | `gs://.../jax-compilation-cache/` (tp-size=32) |
 | Container image (current) | `jax0.9.0-rev1` | FP8 restore via monkey-patch + structure fix |
 
@@ -242,11 +259,12 @@ Sweep `tm`, `tn`, `tk` block sizes for EPMoE GEMM to improve per-step efficiency
 
 | Commit | Description |
 |--------|-------------|
+| `cc89152` | docs+test: 2-node confirmed infeasible — EP > 1 does not help HBM |
+| `63fd964` | feat(ep2): add 2-node ep=2 tp=16 demo job (EP already implemented in moe.py) |
+| `5e7c740` | docs: complete HBM investigation — all 7 tests done, conclusions recorded |
 | `ef0101d` | docs(hbm): slow-path timeline — fast vs slow path identical footprint |
 | `3a9c163` | docs(hbm): XLA OOM analysis and reduction strategies for EXTEND compile |
-| `aadd32b` | docs: record HBM investigation findings (Phases 1-4 complete) |
 | `4601d8e` | docs(hbm): EPMoE min temp test — ~20 GB XLA required for EXTEND compile |
 | `4f238a2` | fix(checkpoint): skip apply_linear_quantization when restoring from checkpoint |
-| `9b44f29` | fix(checkpoint): skip sharding upgrade for sub-mesh axes (e.g. expert) |
 | `c6588a7` | docs: checkpoint restore validated — ~98s restore, ~6.6 min total startup |
 | `4458f86` | feat: NFS weight loading demo job |
