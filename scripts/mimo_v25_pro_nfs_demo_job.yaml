@@ -219,8 +219,6 @@ spec:
         env:
         - name: PYTHONUNBUFFERED
           value: "1"
-        - name: XLA_FLAGS
-          value: "--xla_enable_hlo_rematerialization=true"
         - name: SGLANG_CHECKPOINT_DIR
           value: "gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint"
         resources:
