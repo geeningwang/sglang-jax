@@ -200,14 +200,7 @@ spec:
             echo "$(ts) [rank0] PHASE: inference response received"
             echo "$RESPONSE"
             echo ""
-            echo "$RESPONSE" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-u = d['usage']
-print(d['choices'][0]['message']['content'])
-print()
-print(f'[tokens: prompt={u[\"prompt_tokens\"]}, completion={u[\"completion_tokens\"]}]')
-" 2>/dev/null || true
+            echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); u=d['usage']; print(d['choices'][0]['message']['content']); print(); print('[tokens: prompt=%d, completion=%d]' % (u['prompt_tokens'], u['completion_tokens']))" 2>/dev/null || true
             echo ""
             echo "=== Demo complete ==="
             kill $SERVER_PID
