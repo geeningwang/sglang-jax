@@ -139,7 +139,13 @@ Use a single-pod download job that writes directly to GCS via `huggingface_hub`.
 Flash weights are expected to be **much smaller than V2.5-Pro** (~20–100 GB
 vs ~962 GB) so download completes in minutes.
 
-### §3. Create job YAML: `scripts/mimo_v2_flash_2node_demo_job.yaml` ⬜
+### §3. Create job YAMLs ✅
+
+Two YAMLs created:
+- [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml) — **primary**: NFS weight loading (fast retries)
+- [`scripts/mimo_v2_flash_2node_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_demo_job.yaml) — fallback: gcsfuse loading
+
+### §3 (original). Create job YAML: `scripts/mimo_v2_flash_2node_demo_job.yaml` ✅
 
 Key differences from `mimo_v25_pro_nfs_demo_job.yaml`:
 - `--tp-size 16 --nnodes 2` (2-node, same as attempted for Pro)
@@ -192,12 +198,30 @@ a single fused KV pool works across both layer types.
 
 | Resource | Status | Notes |
 |----------|--------|-------|
-| Flash HF weights on GCS | ⬜ NOT YET | Step §2 required |
+| Flash HF weights on GCS | 🔄 IN PROGRESS | Downloading 313 GB; ~30/145 files done |
+| Flash HF weights on NFS VMs | 🔄 IN PROGRESS | Copying from GCS to NFS VMs in parallel |
 | Flash Orbax checkpoint | ⬜ NOT YET | Created on first run |
 | DWS 8ch node pool (`jingnw-dws-tpu7-8ch`) | ✅ Available | Used for 2-node ep2 test |
 | DWS 4ch node pool (`jingnw-dws-tpu7-4ch`) | ❓ Check | For 1-node if needed |
-| NFS weight servers | **RUNNING** | Not needed for Flash (gcsfuse) |
+| NFS weight servers | ✅ READY (cleared + loading Flash) | Pro weights deleted; Flash loading |
 | XLA compilation cache | ✅ | Shared; Flash will populate its own entries |
+
+### NFS VM file split
+
+| VM | IP | Files | Approx size | Pattern |
+|----|-----|-------|-------------|---------|
+| jingnw-nfs-weights-1 | 10.128.0.92 | 49 | ~104 GB | model_0, \*_linear_fc1 (even layers) |
+| jingnw-nfs-weights-2 | 10.128.15.231 | 48 | ~104 GB | model_1, \*_linear_fc2 (even layers) |
+| jingnw-nfs-weights-3 | 10.128.0.45 | 48 | ~104 GB | model_10..47 (regular attn files) |
+
+Merged via symlinks into `/mnt/weights` on each TPU pod (same as V2.5-Pro approach).
+
+### Checkpoint paths
+
+| Run type | model-path | checkpoint hash | GCS checkpoint path |
+|----------|-----------|-----------------|---------------------|
+| NFS (primary) | `/mnt/weights` | `95dc2640` | `sglang-checkpoint/95dc2640/tp16_bfloat16/` |
+| gcsfuse (fallback) | `/mnt/gcs/mimo-v2-flash-hf-weights` | `e0e89a7d` | `sglang-checkpoint/e0e89a7d/tp16_bfloat16/` |
 
 ---
 
