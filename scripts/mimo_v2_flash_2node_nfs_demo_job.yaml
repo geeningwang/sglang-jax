@@ -18,8 +18,11 @@
 #   VM-2: model_1, model_10_linear_fc2, model_11_linear_fc2, ...
 #   VM-3: model_10, model_11, model_12, ... (regular attention files)
 #
-# Checkpoint path (model-path hash = md5("/mnt/weights")[:8]):
-#   gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/95dc2640/tp16_bfloat16/
+# Checkpoint path (model-path hash = md5("/mnt/flash-weights")[:8]):
+#   gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/9d3df1bf/tp16_bfloat16/
+#
+# NOTE: /mnt/flash-weights (not /mnt/weights) avoids hash collision with the
+# V2.5-Pro checkpoint at 95dc2640 (also loaded from /mnt/weights).
 #
 # First run: loads from NFS (~3-5 min at 3x NIC bandwidth), saves Orbax checkpoint.
 # Subsequent runs: restores from checkpoint (~90s, same as V2.5-Pro).
@@ -136,18 +139,18 @@ spec:
 
           echo "=== [rank${INDEX}] Mounting NFS weight servers ==="
           apt-get update -qq && apt-get install -y -qq nfs-common
-          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/weights
+          mkdir -p /mnt/nfs1 /mnt/nfs2 /mnt/nfs3 /mnt/flash-weights
 
           mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.92:/mnt/weights   /mnt/nfs1
           mount -t nfs -o ro,hard,intr,nconnect=8 10.128.15.231:/mnt/weights /mnt/nfs2
           mount -t nfs -o ro,hard,intr,nconnect=8 10.128.0.45:/mnt/weights   /mnt/nfs3
 
           for f in /mnt/nfs1/* /mnt/nfs2/* /mnt/nfs3/*; do
-            ln -sf "$f" /mnt/weights/$(basename "$f") 2>/dev/null || true
+            ln -sf "$f" /mnt/flash-weights/$(basename "$f") 2>/dev/null || true
           done
 
-          SAFETENSORS=$(ls /mnt/weights/*.safetensors 2>/dev/null | wc -l)
-          echo "$(ts) [rank${INDEX}] NFS ready: ${SAFETENSORS} safetensors files at /mnt/weights (expect 145)"
+          SAFETENSORS=$(ls /mnt/flash-weights/*.safetensors 2>/dev/null | wc -l)
+          echo "$(ts) [rank${INDEX}] NFS ready: ${SAFETENSORS} safetensors files at /mnt/flash-weights (expect 145)"
 
           if [ "${INDEX}" = "0" ]; then
             T_START=$(date +%s)
@@ -155,7 +158,7 @@ spec:
             JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
             SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
             python3 -m sgl_jax.launch_server \
-              --model-path /mnt/weights \
+              --model-path /mnt/flash-weights \
               --trust-remote-code \
               --tp-size 16 \
               --device tpu \
@@ -210,7 +213,7 @@ spec:
             JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
             SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
             python3 -m sgl_jax.launch_server \
-              --model-path /mnt/weights \
+              --model-path /mnt/flash-weights \
               --trust-remote-code \
               --tp-size 16 \
               --device tpu \

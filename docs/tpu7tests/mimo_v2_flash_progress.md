@@ -1,7 +1,7 @@
 # MiMo-V2-Flash on TPU v7x — Progress
 
-**Last updated**: 2026-06-08 (plan drafted)  
-**Branch**: `tpu7` (`geeningwang/sglang-jax`)  
+**Last updated**: 2026-06-08 (2-node demo + checkpoint restore COMPLETE)
+**Branch**: `tpu7` (`geeningwang/sglang-jax`)
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
 ---
@@ -11,6 +11,9 @@
 Run MiMo-V2-Flash inference on GKE TPU v7x using the same infrastructure as
 MiMo-V2.5-Pro (Orbax checkpoint, DWS nodes, GCS). Target: 2-node demo first
 (tp-size=16), then 1-node if feasible for cost.
+
+**Status: COMPLETE** — first run (NFS → Orbax save) and second run (Orbax
+restore) both succeeded on 2026-06-08.
 
 ---
 
@@ -35,14 +38,17 @@ HF repo: **`XiaomiMiMo/MiMo-V2-Flash`**
 | Attention | Full only | Hybrid (SWA + Full) |
 | QKV weights | Fused `qkv_proj` | Separate `q/k/v_proj` |
 | MLP | All MoE | Mix MoE + Dense |
-| Model size | ~962 GB FP8 | TBD (much smaller) |
-| 2-node feasible? | No (OOM at tp-16) | Likely yes |
+| Layers | 70 | **48** |
+| Routed experts/layer | 384 | **256** |
+| Hidden size | 6144 | **4096** |
+| HF weights size | ~962 GB FP8 | **~313 GB FP8** |
+| 2-node feasible? | No (OOM at tp-16) | **Yes** ✅ |
 
 ---
 
 ## Code Status
 
-**Model class**: `MiMoV2FlashForCausalLM` — **already implemented** in
+**Model class**: `MiMoV2FlashForCausalLM` — **implemented and verified** in
 [`python/sgl_jax/srt/models/mimo_v2_flash.py`](../../python/sgl_jax/srt/models/mimo_v2_flash.py).
 
 Supports:
@@ -55,192 +61,183 @@ Supports:
 - `attention_value_scale` scaling
 
 **Registry**: Auto-registered via `EntryClass = [MiMoV2FlashForCausalLM]`.
-No code changes needed for model inference logic.
+No code changes were needed for model inference logic.
 
 **Checkpoint infrastructure**: Same Orbax/OCDBT path as V2.5-Pro. The loader
 auto-derives the checkpoint path from `SGLANG_CHECKPOINT_DIR` + model hash.
 
----
-
-## HBM Feasibility Estimate
-
-MiMo-V2-Flash is much smaller than V2.5-Pro. Conservative upper-bound analysis:
-
-| Metric | V2.5-Pro (tp-32) | Flash (tp-16, estimated) |
-|--------|------------------|--------------------------|
-| HBM per TC | 101.73 GB | 101.73 GB |
-| Model weights | ~47 GB/TC | **~3–10 GB/TC** |
-| `apply_moe_quantization` scales | ~11 GB/TC | **~1–3 GB/TC** |
-| XLA temp (25%) | 25.43 GB | 25.43 GB |
-| KV cache available | 11.62 GB/TC | **~60–70 GB/TC** |
-
-Flash should fit comfortably in 2 nodes (tp-16, 16 TCs × 101.73 GB).
-Even 1 node (tp-8, 8 TCs) may be sufficient.
-
-**Note**: Exact model size TBD — verify after fetching HF config.json.
-
----
-
-## GCS Structure Plan
-
-Reuse the existing bucket with Flash-specific subfolders:
-
-```
-gs://jingnw-mimo-v2-5-pro-us-central1/
-  mimo-v2-flash-hf-weights/          ← HF safetensors (download once)
-  sglang-checkpoint/
-    {flash_model_hash}/
-      tp16_bfloat16/                 ← Orbax checkpoint (2-node run)
-      tp8_bfloat16/                  ← Orbax checkpoint (1-node run, if tested)
-  jax-compilation-cache/             ← shared XLA cache (reuse)
-```
-
-The Flash model hash is derived from the GCS path used as `--model-path`:
-`md5("gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights")[:8]`
-
----
-
-## Step-by-Step Plan
-
-### §1. Fetch HF config to confirm model spec ⬜
-
-```bash
-# Run from this VM or a GCS-connected VM
-huggingface-cli download XiaomiMiMo/MiMo-V2-Flash config.json \
-  --local-dir /tmp/mimo-v2-flash-config
-cat /tmp/mimo-v2-flash-config/config.json | python3 -c "
-import json, sys; c = json.load(sys.stdin)
-print('arch:', c.get('architectures'))
-print('layers:', c.get('num_hidden_layers'))
-print('experts:', c.get('n_routed_experts', c.get('num_experts')))
-print('hidden:', c.get('hidden_size'))
-print('moe_freq:', c.get('moe_layer_freq', 'n/a')[:5], '...')
-print('hybrid:', c.get('hybrid_layer_pattern', 'n/a')[:5], '...')
-"
-```
-
-Confirm: model size, FP8 vs BF16 weights, expected safetensors file list.
-
-### §2. Download HF weights to GCS ⬜
-
-Option A — from this operator VM (most direct):
-```bash
-pip install huggingface-hub
-huggingface-cli download XiaomiMiMo/MiMo-V2-Flash \
-  --local-dir /tmp/mimo-v2-flash \
-  --include "*.safetensors" "*.json" "*.txt"
-gsutil -m cp -r /tmp/mimo-v2-flash/* \
-  gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights/
-```
-
-Option B — from a GKE pod (if VM disk space is limited):
-Use a single-pod download job that writes directly to GCS via `huggingface_hub`.
-
-Flash weights are expected to be **much smaller than V2.5-Pro** (~20–100 GB
-vs ~962 GB) so download completes in minutes.
-
-### §3. Create job YAMLs ✅
-
-Two YAMLs created:
-- [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml) — **primary**: NFS weight loading (fast retries)
-- [`scripts/mimo_v2_flash_2node_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_demo_job.yaml) — fallback: gcsfuse loading
-
-### §3 (original). Create job YAML: `scripts/mimo_v2_flash_2node_demo_job.yaml` ✅
-
-Key differences from `mimo_v25_pro_nfs_demo_job.yaml`:
-- `--tp-size 16 --nnodes 2` (2-node, same as attempted for Pro)
-- `--model-path gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights`
-  (gcsfuse; Flash is small enough that gcsfuse is reasonable)
-- `--mem-fraction-static 0.75` (same XLA temp headroom)
-- No NFS mounts needed (gcsfuse sufficient for smaller model)
-- `SGLANG_CHECKPOINT_DIR` set to same GCS path (auto-save checkpoint on first run)
-- DWS node pool: `jingnw-dws-tpu7-8ch` (2x2x2 topology), 2 nodes
-
-### §4. Run 2-node demo and create checkpoint ⬜
-
-First run (~load from HF weights → save checkpoint):
-- Expected: Flash loads much faster than V2.5-Pro (smaller model)
-- Auto-saves checkpoint to `gs://.../sglang-checkpoint/{hash}/tp16_bfloat16/`
-- Run demo inference and verify output quality
-
-Second run (~restore from checkpoint):
-- Expected: ~90s restore (same infrastructure as V2.5-Pro)
-
-### §5. (Optional) 1-node run for cost efficiency ⬜
-
-If Flash fits in 8 TCs, 1-node (tp-8) reduces DWS cost by 2×.
-Same job YAML with `--tp-size 8 --nnodes 1` on `jingnw-dws-tpu7-4ch` pool.
-
----
-
-## Code Adjustments (if needed)
-
-The model class is complete. Potential gaps to verify during §3–4:
+### Code adjustments verified
 
 | Item | Status | Note |
 |------|--------|------|
-| `MiMoV2FlashForCausalLM` model class | ✅ Implemented | `mimo_v2_flash.py` |
-| Registry entry | ✅ Auto | `EntryClass = [MiMoV2FlashForCausalLM]` |
-| Orbax checkpoint save/restore | ✅ Inherited | Same loader as Pro |
-| FP8 monkey-patch | ✅ Inherited | `loader.py` `_load_checkpoint` |
-| gcsfuse weight loading path | ✅ Inherited | `_warmup_safetensors_cache` |
-| SWA KV cache head dim | ⚠️ Verify | `swa_head_dim` vs `head_dim` for KV pool sizing |
-| Dense MLP layer-0 dequant | ✅ Implemented | `load_weights` step 3 in Flash |
-| `noaux_tc` correction bias | ✅ Implemented | `_create_layer_mappings` |
-
-The KV cache pool sizing uses `head_dim` globally — need to verify that
-SWA layers (which may have a different `swa_head_dim`) pad correctly so
-a single fused KV pool works across both layer types.
+| `MiMoV2FlashForCausalLM` model class | ✅ Verified | `mimo_v2_flash.py` |
+| Registry entry | ✅ Verified | `EntryClass = [MiMoV2FlashForCausalLM]` |
+| Orbax checkpoint save/restore | ✅ Verified | Works end-to-end |
+| FP8 auto-detection | ✅ Verified | `_resolve_quantization_config()` reads HF config |
+| NFS weight loading path | ✅ Verified | `_warmup_safetensors_cache` reads all 145 files |
+| SWA KV cache head dim | ✅ Verified | Single fused KV pool works; head_dim=256 per-device |
+| Dense MLP layer-0 dequant | ✅ Verified | `load_weights` step 3 in Flash |
+| `noaux_tc` correction bias | ✅ Verified | `_create_layer_mappings` |
 
 ---
 
-## Infrastructure State (as of 2026-06-08)
+## HBM Resources (actual, tp-16)
 
-| Resource | Status | Notes |
-|----------|--------|-------|
-| Flash HF weights on GCS | 🔄 IN PROGRESS | Downloading 313 GB; ~30/145 files done |
-| Flash HF weights on NFS VMs | 🔄 IN PROGRESS | Copying from GCS to NFS VMs in parallel |
-| Flash Orbax checkpoint | ⬜ NOT YET | Created on first run |
-| DWS 8ch node pool (`jingnw-dws-tpu7-8ch`) | ✅ Available | Used for 2-node ep2 test |
-| DWS 4ch node pool (`jingnw-dws-tpu7-4ch`) | ❓ Check | For 1-node if needed |
-| NFS weight servers | ✅ READY (cleared + loading Flash) | Pro weights deleted; Flash loading |
-| XLA compilation cache | ✅ | Shared; Flash will populate its own entries |
+| Metric | Value |
+|--------|-------|
+| HBM per TC | 101.73 GB |
+| KV cache allocated | **156.40 GB per TC** |
+| XLA static pool (25%) | 25.43 GB |
+| Model weights + scales | ~19.9 GB/TC (FP8 experts + BF16 attn) |
+| `max_total_num_tokens` | 1,139,376 |
 
-### NFS VM file split
+KV cache is ~13× larger than V2.5-Pro at tp-32 (11.6 GB/TC) — huge room for long contexts.
 
-| VM | IP | Files | Approx size | Pattern |
-|----|-----|-------|-------------|---------|
-| jingnw-nfs-weights-1 | 10.128.0.92 | 49 | ~104 GB | model_0, \*_linear_fc1 (even layers) |
-| jingnw-nfs-weights-2 | 10.128.15.231 | 48 | ~104 GB | model_1, \*_linear_fc2 (even layers) |
-| jingnw-nfs-weights-3 | 10.128.0.45 | 48 | ~104 GB | model_10..47 (regular attn files) |
+---
 
-Merged via symlinks into `/mnt/weights` on each TPU pod (same as V2.5-Pro approach).
+## GCS Structure
+
+```
+gs://jingnw-mimo-v2-5-pro-us-central1/
+  mimo-v2-flash-hf-weights/          ← 145 HF safetensors + metadata
+  sglang-checkpoint/
+    9d3df1bf/
+      tp16_bfloat16/                 ← Flash Orbax checkpoint (151.5 GiB) ✅
+  jax-compilation-cache/             ← shared XLA cache (Flash entries populated)
+```
+
+**Checkpoint path naming** (`loader.py:252`):
+`{SGLANG_CHECKPOINT_DIR}/{md5(model_path)[:8]}/tp{tp_size}_{dtype}/`
+
+The `bfloat16` suffix reflects `--dtype bfloat16` (the compute/activation dtype),
+not the expert weight format. The checkpoint stores a **mixed format**: expert
+weights as `float8_e4m3fn` (FP8), attention/norm weights as `bfloat16`.
 
 ### Checkpoint paths
 
-| Run type | model-path | checkpoint hash | GCS checkpoint path |
-|----------|-----------|-----------------|---------------------|
-| NFS (primary) | `/mnt/weights` | `95dc2640` | `sglang-checkpoint/95dc2640/tp16_bfloat16/` |
+| Run type | `--model-path` | hash | GCS path |
+|----------|----------------|------|----------|
+| NFS (primary) ✅ | `/mnt/flash-weights` | `9d3df1bf` | `sglang-checkpoint/9d3df1bf/tp16_bfloat16/` |
 | gcsfuse (fallback) | `/mnt/gcs/mimo-v2-flash-hf-weights` | `e0e89a7d` | `sglang-checkpoint/e0e89a7d/tp16_bfloat16/` |
+
+`/mnt/flash-weights` (not `/mnt/weights`) avoids hash collision with the Pro
+checkpoint at `95dc2640` (Pro also uses `/mnt/weights` as its model-path).
+On the NFS VMs the safetensors live at `/mnt/weights/`; the job symlinks them
+into `/mnt/flash-weights/` inside the pod.
 
 ---
 
-## Open Questions
+## Results: 2-Node Demo (2026-06-08)
 
-1. **Flash model size**: Need to fetch `config.json` to confirm layers, experts,
-   hidden_size, and total weight size. Determines tp-size choice.
-2. **Weight format**: Does Flash use FP8 (like V2.5-Pro) or BF16 weights?
-   FP8 → `weight_q` + `weight_scale_inv` format; BF16 → `weight` only.
-3. **gcsfuse vs NFS**: If Flash weights are >100 GB MoE, NFS RAM servers
-   might be faster for first run. But Flash is expected small enough for gcsfuse.
-4. **DWS 4ch pool existence**: Need to verify `jingnw-dws-tpu7-4ch` exists
-   for potential 1-node test.
+### Run 1 — first run (NFS weight load + Orbax save)
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| NFS mount + git clone + install | ~60s | NFS VMs pre-loaded |
+| JAX distributed init | ~5s | Both nodes synced |
+| FP8 quantization auto-detected | ~1s | From `config.json` |
+| Sequential NFS warmup (291.6 GB) | ~120s | Page-cache prefetch |
+| Regular weights (557 tensors) | ~11s | Linear, embed, norm |
+| MoE weights (282 tensors) | ~455s | 256 experts × MoE layers, FP8 |
+| FP8 → BF16 attention dequant | ~1s | All 48 layers |
+| Orbax checkpoint save | ~78s | 151.5 GiB at 6.28 GiB/s |
+| EXTEND precompile (6 shapes) | 167s | ~28s/shape |
+| DECODE precompile (3 shapes) | ~81s | ~27s/shape |
+| **Total to server healthy** | **~952s (~16 min)** | |
+| Demo inference (512 tokens) | ~4s | |
+
+### Run 2 — checkpoint restore
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| NFS mount + git clone + install | ~60s | |
+| JAX distributed init | ~5s | |
+| Orbax checkpoint restore | **55s** | 4.26 GiB/s, 219 GiB read |
+| EXTEND precompile (6 shapes) | 157s | ~10s faster (XLA cache partial hits) |
+| DECODE precompile (3 shapes) | 54s | |
+| **Total to server healthy** | **~331s (~5.5 min)** | **2.9× faster** than run 1 |
+| Demo inference (512 tokens) | ~4s | |
+
+### Demo inference
+
+**Request**:
+```json
+{
+  "model": "MiMo-V2-Flash",
+  "messages": [{"role": "user", "content": "Explain mixture-of-experts and why sliding window attention helps efficiency."}],
+  "max_tokens": 512,
+  "temperature": 0.7
+}
+```
+
+**Response** (finish_reason: `length` — hit 512-token cap mid-sentence on SWA section):
+
+Structured explanation covering:
+- MoE: router selects 1–2 experts per token, only those activate; hospital-of-specialists analogy
+- Efficiency vs cost trade-off (inference speed vs memory footprint)
+- SWA intro started but truncated at cap
+
+**Usage**: prompt=40 tokens, completion=512 tokens.
+
+---
+
+## Infrastructure State
+
+| Resource | Status | Notes |
+|----------|--------|-------|
+| Flash HF weights on GCS | ✅ DONE | 145 safetensors + all metadata in `mimo-v2-flash-hf-weights/` |
+| Flash HF weights on NFS VMs | ✅ DONE | VM-1=49, VM-2=48, VM-3=48 files + Flash `config.json` + metadata |
+| Flash Orbax checkpoint | ✅ SAVED | `9d3df1bf/tp16_bfloat16/` (151.5 GiB, `commit_success.txt` present) |
+| DWS 8ch node pool (`jingnw-dws-tpu7-8ch`) | ✅ Available | 2x2x2 topology, used for 2-node demo |
+| DWS 4ch node pool (`jingnw-dws-tpu7-4ch`) | ❓ Unverified | For 1-node run if needed |
+| NFS weight servers | ✅ READY | Flash safetensors + Flash config on all 3 VMs |
+| XLA compilation cache | ✅ | Flash-specific entries populated |
+
+### NFS VM file split
+
+| VM | IP | Files | Pattern |
+|----|-----|-------|---------|
+| jingnw-nfs-weights-1 | 10.128.0.92 | 49 safetensors | `model_0`, `*_linear_fc1` (even layers) |
+| jingnw-nfs-weights-2 | 10.128.15.231 | 48 safetensors | `model_1`, `*_linear_fc2` (even layers) |
+| jingnw-nfs-weights-3 | 10.128.0.45 | 48 safetensors | `model_10`..`model_47` (regular attn files) |
+
+All 3 VMs also hold metadata: `config.json`, `tokenizer.json`, `model.safetensors.index.json`, etc.
+
+In each pod the job mounts all 3 NFS shares and symlinks their contents into
+`/mnt/flash-weights/`, which becomes the `--model-path`.
+
+---
+
+## Issues Encountered and Fixed
+
+| Issue | Root cause | Fix |
+|-------|-----------|-----|
+| Orbax restore crash (layer 64 not found) | Hash collision: Pro and Flash both used `--model-path /mnt/weights` → same hash `95dc2640`; server tried to restore a Pro checkpoint into Flash | Changed Flash job to use `/mnt/flash-weights` as the symlink dir → hash `9d3df1bf` |
+| Wrong architecture class loaded (`mimo_v2_pro.py`) | NFS VMs had the Pro `config.json` (70 layers, 384 experts); Flash metadata was never synced when clearing Pro weights | Copied all Flash metadata files from GCS to all 3 NFS VMs |
+
+---
+
+## Job YAMLs
+
+- [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml) — **primary** (NFS, fast retries)
+- [`scripts/mimo_v2_flash_2node_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_demo_job.yaml) — fallback (gcsfuse)
+
+---
+
+## Next Steps
+
+### §5. (Optional) 1-node run for cost efficiency
+
+If Flash fits in 8 TCs (tp-8), 1-node reduces DWS cost by 2×.
+Same job YAML with `--tp-size 8 --nnodes 1` on `jingnw-dws-tpu7-4ch` pool.
+With 156 GB/TC KV cache at tp-16, tp-8 should still have ample headroom.
 
 ---
 
 ## References
 
 - Model class: [`python/sgl_jax/srt/models/mimo_v2_flash.py`](../../python/sgl_jax/srt/models/mimo_v2_flash.py)
+- Job YAMLs: [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml)
 - V2.5-Pro checkpoint guide: [`mimo_v25_pro_weight_checkpoint.md`](mimo_v25_pro_weight_checkpoint.md)
 - V2.5-Pro progress (HBM data, infra): [`mimo_v25_pro_progress.md`](mimo_v25_pro_progress.md)
 - GKE env setup: [`gke_tpu7x_env_setup.md`](gke_tpu7x_env_setup.md)
