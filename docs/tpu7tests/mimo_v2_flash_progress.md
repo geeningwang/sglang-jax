@@ -1,6 +1,6 @@
 # MiMo-V2-Flash on TPU v7x — Progress
 
-**Last updated**: 2026-06-08 (2-node demo + checkpoint restore COMPLETE)
+**Last updated**: 2026-06-08 (1-node demo + checkpoint restore COMPLETE)
 **Branch**: `tpu7` (`geeningwang/sglang-jax`)
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
@@ -12,8 +12,8 @@ Run MiMo-V2-Flash inference on GKE TPU v7x using the same infrastructure as
 MiMo-V2.5-Pro (Orbax checkpoint, DWS nodes, GCS). Target: 2-node demo first
 (tp-size=16), then 1-node if feasible for cost.
 
-**Status: COMPLETE** — first run (NFS → Orbax save) and second run (Orbax
-restore) both succeeded on 2026-06-08.
+**Status: COMPLETE** — 2-node demo (tp=16) and 1-node demo (tp=8) both done
+on 2026-06-08. All runs include working Orbax checkpoint save + restore.
 
 ---
 
@@ -81,7 +81,9 @@ auto-derives the checkpoint path from `SGLANG_CHECKPOINT_DIR` + model hash.
 
 ---
 
-## HBM Resources (actual, tp-16)
+## HBM Resources
+
+### tp=16 (2-node, actual measured)
 
 | Metric | Value |
 |--------|-------|
@@ -93,6 +95,14 @@ auto-derives the checkpoint path from `SGLANG_CHECKPOINT_DIR` + model hash.
 
 KV cache is ~13× larger than V2.5-Pro at tp-32 (11.6 GB/TC) — huge room for long contexts.
 
+### tp=8 (1-node, confirmed fits)
+
+At tp=8, model weight per TC doubles (~40 GB/TC) but the HBM headroom is still
+ample. Flash has only 4 KV heads; at tp=8 each TC gets fewer than 1 head, so
+the loader replicates them 2× (4→8 heads per TC, logged as
+`KV head replication: layer N self_attn.k_proj 4->8 heads`). This is the same
+pattern as tp=16 on V2.5-Pro and is handled correctly by `load_weights`.
+
 ---
 
 ## GCS Structure
@@ -102,8 +112,10 @@ gs://jingnw-mimo-v2-5-pro-us-central1/
   mimo-v2-flash-hf-weights/          ← 145 HF safetensors + metadata
   sglang-checkpoint/
     9d3df1bf/
-      tp16_bfloat16/                 ← Flash Orbax checkpoint (151.5 GiB) ✅
-  jax-compilation-cache/             ← shared XLA cache (Flash entries populated)
+      tp16_bfloat16/                 ← Flash Orbax checkpoint tp=16 (151.5 GiB) ✅
+    e0e89a7d/
+      tp8_bfloat16/                  ← Flash Orbax checkpoint tp=8 (242.94 GiB) ✅
+  jax-compilation-cache/             ← shared XLA cache (Flash tp=8 + tp=16 entries)
 ```
 
 **Checkpoint path naming** (`loader.py:252`):
@@ -115,15 +127,18 @@ weights as `float8_e4m3fn` (FP8), attention/norm weights as `bfloat16`.
 
 ### Checkpoint paths
 
-| Run type | `--model-path` | hash | GCS path |
-|----------|----------------|------|----------|
-| NFS (primary) ✅ | `/mnt/flash-weights` | `9d3df1bf` | `sglang-checkpoint/9d3df1bf/tp16_bfloat16/` |
-| gcsfuse (fallback) | `/mnt/gcs/mimo-v2-flash-hf-weights` | `e0e89a7d` | `sglang-checkpoint/e0e89a7d/tp16_bfloat16/` |
+| Run type | `--model-path` | hash | GCS path | Size |
+|----------|----------------|------|----------|------|
+| NFS tp=16 ✅ | `/mnt/flash-weights` | `9d3df1bf` | `sglang-checkpoint/9d3df1bf/tp16_bfloat16/` | 151.5 GiB |
+| gcsfuse tp=8 ✅ | `/mnt/gcs/mimo-v2-flash-hf-weights` | `e0e89a7d` | `sglang-checkpoint/e0e89a7d/tp8_bfloat16/` | 242.94 GiB |
 
 `/mnt/flash-weights` (not `/mnt/weights`) avoids hash collision with the Pro
 checkpoint at `95dc2640` (Pro also uses `/mnt/weights` as its model-path).
 On the NFS VMs the safetensors live at `/mnt/weights/`; the job symlinks them
 into `/mnt/flash-weights/` inside the pod.
+
+The tp=8 checkpoint is larger than tp=16 (242 vs 152 GiB) because each TC
+holds a larger shard of the weight tensors when tp is smaller.
 
 ---
 
@@ -181,17 +196,74 @@ Structured explanation covering:
 
 ---
 
+## Results: 1-Node Demo (2026-06-08)
+
+Pool: `jingnw-dws-tpu7-4ch` (DWS, tpu7x-standard-4t, 2x2x1, cloud-platform scope)
+Weight source: gcsfuse (`/mnt/gcs/mimo-v2-flash-hf-weights` → hash `e0e89a7d`)
+
+### Run 1 — cold load + Orbax save
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| git clone + install | ~60s | |
+| gcsfuse mount + sglang launch | ~5s | cache to /dev/shm (400 GiB) |
+| Regular weights | ~25s | linear, embed, norm layers |
+| MoE weights (282 groups) | ~570s (~9.5 min) | gcsfuse, ~2s/group |
+| KV head replication (4→8) | ~3s | all 9 full-attn layers |
+| Orbax checkpoint save | ~3 min | 242.94 GiB to `e0e89a7d/tp8_bfloat16/` |
+| EXTEND precompile (6 shapes) | ~160s | ~27s/shape |
+| DECODE precompile (3 shapes) | ~80s | ~27s/shape |
+| **Total to server healthy** | **~24 min** | |
+| Demo inference (512 tokens) | ~4s | |
+
+### Run 2 — checkpoint restore
+
+| Phase | Duration | Notes |
+|-------|----------|-------|
+| git clone + install | ~60s | |
+| gcsfuse mount + sglang launch | ~5s | |
+| Orbax checkpoint restore | **~60s** | reads 242.94 GiB from GCS |
+| EXTEND precompile (6 shapes) | **153s** | XLA cache partial hits |
+| DECODE precompile (3 shapes) | **~65s** | XLA cache partial hits |
+| **Total to server healthy** | **~7 min** | **3.4× faster** than run 1 |
+| Demo inference (512 tokens) | ~4s | |
+
+### Demo inference (both runs)
+
+**Request**:
+```json
+{
+  "model": "MiMo-V2-Flash",
+  "messages": [{"role": "user", "content": "Explain mixture-of-experts and why sliding window attention helps efficiency."}],
+  "max_tokens": 512,
+  "temperature": 0.7
+}
+```
+
+**Response** (finish_reason: `length` — hit 512-token cap):
+
+Structured explanation covering MoE router/expert mechanics, sparse activation
+efficiency (Mixtral 8x7B analogy: 47B params, 12B active), then SWA intro
+truncated at token cap.
+
+**Usage**: prompt=40 tokens, completion=512 tokens.
+
+---
+
 ## Infrastructure State
 
 | Resource | Status | Notes |
 |----------|--------|-------|
-| Flash HF weights on GCS | ✅ DONE | 145 safetensors + all metadata in `mimo-v2-flash-hf-weights/` |
-| Flash HF weights on NFS VMs | ✅ DONE | VM-1=49, VM-2=48, VM-3=48 files + Flash `config.json` + metadata |
-| Flash Orbax checkpoint | ✅ SAVED | `9d3df1bf/tp16_bfloat16/` (151.5 GiB, `commit_success.txt` present) |
-| DWS 8ch node pool (`jingnw-dws-tpu7-8ch`) | ✅ Available | 2x2x2 topology, used for 2-node demo |
-| DWS 4ch node pool (`jingnw-dws-tpu7-4ch`) | ❓ Unverified | For 1-node run if needed |
-| NFS weight servers | ✅ READY | Flash safetensors + Flash config on all 3 VMs |
-| XLA compilation cache | ✅ | Flash-specific entries populated |
+| Flash HF weights on GCS | ✅ | 145 safetensors + all metadata in `mimo-v2-flash-hf-weights/` |
+| Flash HF weights on NFS VMs | ✅ | VM-1=49, VM-2=48, VM-3=48 files + Flash `config.json` + metadata |
+| Flash Orbax checkpoint (tp=16) | ✅ | `9d3df1bf/tp16_bfloat16/` (151.5 GiB, `commit_success.txt` present) |
+| Flash Orbax checkpoint (tp=8) | ✅ | `e0e89a7d/tp8_bfloat16/` (242.94 GiB, `commit_success.txt` present) |
+| DWS 8ch node pool (`jingnw-dws-tpu7-8ch`) | ✅ | 2x2x2 topology, cloud-platform scope, used for 2-node demo |
+| DWS 4ch node pool (`jingnw-dws-tpu7-4ch`) | ✅ | 2x2x1 topology, cloud-platform scope, used for 1-node demo |
+| Flex 4ch node pool (`jingnw-flex-tpu7`) | ❌ DELETED | Had devstorage.read_only scope; caused Orbax 403 — see Issues |
+| GCE workload policy (`jingnw-tpu7-policy-4ch`) | ✅ | 2x2x1, HIGH_THROUGHPUT; required for single-host DWS pool |
+| NFS weight servers | ✅ | Flash safetensors + Flash config on all 3 VMs |
+| XLA compilation cache | ✅ | Flash tp=8 and tp=16 entries populated |
 
 ### NFS VM file split
 
@@ -214,23 +286,45 @@ In each pod the job mounts all 3 NFS shares and symlinks their contents into
 |-------|-----------|-----|
 | Orbax restore crash (layer 64 not found) | Hash collision: Pro and Flash both used `--model-path /mnt/weights` → same hash `95dc2640`; server tried to restore a Pro checkpoint into Flash | Changed Flash job to use `/mnt/flash-weights` as the symlink dir → hash `9d3df1bf` |
 | Wrong architecture class loaded (`mimo_v2_pro.py`) | NFS VMs had the Pro `config.json` (70 layers, 384 experts); Flash metadata was never synced when clearing Pro weights | Copied all Flash metadata files from GCS to all 3 NFS VMs |
+| 1-node pod evicted (ephemeral storage OOM) | gcsfuse `--cache-dir=/mnt/gcsfuse-cache` wrote 72 GB to container overlay filesystem; node had <10 GB ephemeral → disk-pressure taint + eviction | Redirect cache to RAM: `mount -o remount,size=400g /dev/shm` then `--cache-dir=/dev/shm/gcsfuse-cache` |
+| Orbax checkpoint save 403 on 1-node | `jingnw-flex-tpu7` pool had OAuth scope `devstorage.read_only`; GCS writes return HTTP 403 | Created new DWS pool `jingnw-dws-tpu7-4ch` with `cloud-platform` scope (see below) |
+| Cannot recreate flex 4ch pool with cloud-platform scope | GCE rejects single-host `tpu7x-standard-4t` MIG with placement policy: "use workload policy instead" | Created GCE workload policy `jingnw-tpu7-policy-4ch` (2x2x1, HIGH_THROUGHPUT) via REST API |
+| Workload-policy pool misclassified as multi-host | GKE 1.35 overrides the resource label; autoscaler requires 2-pod gang for "multi-host" pools | Abandoned flex approach; used DWS (queued-provisioning) pool instead via REST API v1beta1 |
+| SA key creation blocked | `constraints/iam.disableServiceAccountKeyCreation` org policy active on project | No fix; abandoned SA key approach. DWS pool uses node's compute SA with cloud-platform scope |
 
 ---
 
 ## Job YAMLs
 
-- [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml) — **primary** (NFS, fast retries)
-- [`scripts/mimo_v2_flash_2node_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_demo_job.yaml) — fallback (gcsfuse)
+- [`scripts/mimo_v2_flash_2node_nfs_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_nfs_demo_job.yaml) — 2-node primary (NFS, fast retries, pool `jingnw-dws-tpu7-8ch`)
+- [`scripts/mimo_v2_flash_2node_demo_job.yaml`](../../scripts/mimo_v2_flash_2node_demo_job.yaml) — 2-node fallback (gcsfuse)
+- [`scripts/mimo_v2_flash_1node_demo_job.yaml`](../../scripts/mimo_v2_flash_1node_demo_job.yaml) — **1-node** (gcsfuse, pool `jingnw-dws-tpu7-4ch`, DWS ProvisioningRequest)
+
+### DWS pool creation notes (jingnw-dws-tpu7-4ch)
+
+Single-host `tpu7x-standard-4t` (2x2x1) pools cannot be created via `gcloud`
+with a placement policy — GCE returns "use workload policy instead". The
+workaround is to create via REST API v1beta1:
+
+1. Create GCE workload policy first:
+   ```bash
+   gcloud compute resource-policies create group-placement jingnw-tpu7-policy-4ch \
+     --region=us-central1 --tpu-topology=2x2x1 --workload-type=HIGH_THROUGHPUT
+   ```
+2. Create node pool via REST API with `queuedProvisioning.enabled=true`,
+   `placementPolicy.policyName=jingnw-tpu7-policy-4ch`,
+   `oauthScopes=[cloud-platform]`, `maxNodeCount=1`, **no `maxRunDuration`**
+   (DWS pools reject `maxRunDuration` at pool level — set it on the
+   ProvisioningRequest instead via `maxRunDurationSeconds`).
 
 ---
 
 ## Next Steps
 
-### §5. (Optional) 1-node run for cost efficiency
-
-If Flash fits in 8 TCs (tp-8), 1-node reduces DWS cost by 2×.
-Same job YAML with `--tp-size 8 --nnodes 1` on `jingnw-dws-tpu7-4ch` pool.
-With 156 GB/TC KV cache at tp-16, tp-8 should still have ample headroom.
+All planned demo runs are complete. No further work required unless:
+- Running production inference (would need a persistent service, not a demo job)
+- Testing higher tp or ep configurations
+- Benchmarking throughput at varying batch sizes
 
 ---
 

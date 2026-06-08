@@ -1,0 +1,201 @@
+# MiMo-V2-Flash 1-node demo job on GKE TPU v7x
+#
+# Model: XiaomiMiMo/MiMo-V2-Flash
+#   48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights (~313 GB)
+#
+# Configuration:
+#   tp-size=8, ep-size=1 (FusedEPMoE), 1 pod × 4 chips × 2 TCs = 8 TCs total
+#   Pool: jingnw-dws-tpu7-4ch (DWS queued-provisioning, tpu7x-standard-4t, topology 2x2x1)
+#   OAuth scope: cloud-platform (supports Orbax checkpoint + XLA cache writes to GCS)
+#
+# Weight loading: gcsfuse with RAM-backed cache (weights cached to /dev/shm, not disk)
+#   gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights/
+#
+# Checkpoint path (model-path hash = md5("/mnt/gcs/mimo-v2-flash-hf-weights")[:8]):
+#   gs://jingnw-mimo-v2-5-pro-us-central1/sglang-checkpoint/e0e89a7d/tp8_bfloat16/
+#
+# Purpose: verify Flash fits in 1 node (8 TCs) HBM. Confirmed: Flash fits.
+#   At tp-16, each TC had ~20 GB model weight and 156 GB KV cache.
+#   At tp-8, model weight doubles to ~40 GB/TC, KV cache remains ample.
+#
+# Note: jingnw-dws-tpu7-4ch was created via REST API with workload policy
+#   jingnw-tpu7-policy-4ch (acceleratorTopology=2x2x1, HIGH_THROUGHPUT).
+#   It uses DWS (queued-provisioning) instead of flex autoscaling because
+#   the single-host flex pool (jingnw-flex-tpu7) had read-only GCS scope
+#   and GKE 1.35 cannot recreate single-host flex pools via autoscaler.
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-1node-dws
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "86400"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-1node-dws-template
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-1node-dws-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-1node-demo
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-1node-demo
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-1node-dws
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-1node-demo
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "=== [1node] Installing sglang-jax ==="
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          echo "=== [1node] Mounting GCS bucket via gcsfuse ==="
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          # GCSFuse cache goes to RAM (/dev/shm) — DWS nodes also have <10 GB
+          # ephemeral disk but 900Gi memory. Remount /dev/shm at 400 GiB.
+          mount -o remount,size=400g /dev/shm
+          mkdir -p /mnt/gcs /dev/shm/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=400000 \
+            --cache-dir=/dev/shm/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          echo "$(ts) [1node] GCS mounted. Flash weights: $(ls /mnt/gcs/mimo-v2-flash-hf-weights/*.safetensors 2>/dev/null | wc -l) safetensors"
+
+          T_START=$(date +%s)
+          echo "$(ts) [1node] PHASE: launching server  [T=0s]"
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/gcs/mimo-v2-flash-hf-weights \
+            --trust-remote-code \
+            --tp-size 8 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 16 \
+            --chunked-prefill-size 2048 \
+            --max-running-requests 4 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            --nnodes 1 \
+            --node-rank 0 &
+          SERVER_PID=$!
+          echo "$(ts) [1node] PHASE: waiting for /health (PID=$SERVER_PID)"
+
+          for i in $(seq 1 25920); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              T_HEALTHY=$(date +%s)
+              echo "$(ts) [1node] PHASE: server healthy after $((i * 5))s  [total elapsed: $((T_HEALTHY - T_START))s]"
+              break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "$(ts) [1node] ERROR: server process died after $((i * 5))s"
+              exit 1
+            fi
+            if [ $((i % 60)) -eq 0 ]; then
+              echo "$(ts) [1node] still waiting for /health ($((i * 5))s elapsed)"
+            fi
+            sleep 5
+          done
+
+          echo ""
+          echo "$(ts) [1node] PHASE: sending demo inference request"
+          RESPONSE=$(curl -sf --max-time 300 http://localhost:8080/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "MiMo-V2-Flash",
+              "messages": [{"role": "user", "content": "Explain mixture-of-experts and why sliding window attention helps efficiency."}],
+              "max_tokens": 512,
+              "temperature": 0.7
+            }')
+          echo "$(ts) [1node] PHASE: inference response received"
+          echo "$RESPONSE"
+          echo ""
+          echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); u=d['usage']; print(d['choices'][0]['message']['content']); print(); print('[tokens: prompt=%d, completion=%d]' % (u['prompt_tokens'], u['completion_tokens']))" 2>/dev/null || true
+          echo ""
+          echo "=== Demo complete ==="
+          kill $SERVER_PID
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
