@@ -191,6 +191,14 @@ class EagleDraftWorker(BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> None:
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
+        # Reshard hidden_states to ('data', None) to match the sharding produced by
+        # the draft model's embed_tokens lookup. With data=1 this is a no-op physically
+        # (same layout), but JAX 0.9 requires matching logical specs for jnp.concatenate.
+        # Must happen outside JIT — jax.sharding.reshard inside JIT causes XLA crashes.
+        if self.mesh is not None:
+            hidden_states = jax.sharding.reshard(
+                hidden_states, NamedSharding(self.mesh, P("data", None))
+            )
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -235,8 +243,11 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
+        hs = batch_output.logits_output.hidden_states
+        if self.mesh is not None:
+            hs = jax.sharding.reshard(hs, NamedSharding(self.mesh, P("data", None)))
         draft_input = EagleDraftInput(
-            hidden_states=batch_output.logits_output.hidden_states,
+            hidden_states=hs,
             allocate_lens=batch_output.allocate_lens,
         )
         model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
@@ -285,7 +296,11 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        hs = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        # Reshard to ('data', None) so all decode steps match embed_tokens output sharding.
+        if self.mesh is not None:
+            hs = jax.sharding.reshard(hs, NamedSharding(self.mesh, P("data", None)))
+        draft_input.hidden_states = hs
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
