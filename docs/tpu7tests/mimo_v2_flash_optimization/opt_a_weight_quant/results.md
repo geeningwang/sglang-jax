@@ -1,7 +1,7 @@
 # Opt A — FP8 / Int8 Weight Quantization: Analysis Results
 
 **Date**: 2026-06-09
-**Status**: Scope revised — profiling blocked, decision made from baseline data + code inspection
+**Status**: A1 (expert quant) closed — already FP8. A2 (attention FP8) is next active work.
 
 ---
 
@@ -79,7 +79,32 @@ to capture a bounded trace via gRPC, bypassing the sglang-jax HTTP handler.
 
 ---
 
-## Decision: Skip Profiling, Pivot to Opt C
+## Decision: Pivot to Opt A2
+
+Opt C was fully investigated (code analysis + benchmark). Result: 0% gain —
+F=3.9ms is fixed TPU compute, not removable host overhead. See
+`../opt_c_host_sync/results.md`.
+
+**Opt A2 is now the active next step.** Goal: keep attention weights in FP8 at
+load time instead of dequantizing to BF16, saving ~1.6 GB/step bandwidth.
+
+### Opt A2 implementation plan
+
+Files to modify:
+- `python/sgl_jax/srt/model_loader/loader.py` — find and skip the BF16 dequantize
+  step for attention Q/K/V/O weights. Currently called via `dequant_fused_kv()` or
+  equivalent in the Flash model's `load_weights`.
+- `python/sgl_jax/srt/models/mimo_v2_flash.py` — verify `self_attn` forward accepts
+  FP8 weight dtype. The `q_proj / k_proj / v_proj / o_proj` matmuls may need a
+  cast before the `dot_general`, or the flash-attention kernel may already handle it.
+- `python/sgl_jax/srt/layers/attention/flashattention_backend.py` — confirm the
+  Pallas kernel input dtype requirements.
+
+Expected gain: ~4-5% TPOT reduction at conc=8 (371 → ~388-390 tok/s).
+
+---
+
+## [OLD] Decision: Skip Profiling, Pivot to Opt C
 
 The baseline TPOT scaling data gives a cleaner signal than profiling:
 

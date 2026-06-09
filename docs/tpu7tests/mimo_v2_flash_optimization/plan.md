@@ -3,7 +3,7 @@
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
 **Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-08
+**Last updated**: 2026-06-09
 
 ---
 
@@ -101,33 +101,37 @@ Ordered by expected decode throughput gain and implementation difficulty.
 
 ### Opt A — FP8 / Int8 weight quantization
 
-**Priority: Highest**
+**Priority: Highest** → **Revised: Opt A2 is next active work (see below)**
 
-**Rationale**: The opt4 post-mortem identified expert weight reads from HBM as the
-dominant decode bottleneck. At tp=8, each TC reads ~80 GB of expert weights per
-step (47 MoE layers × 3 projections × 256/8=32 experts × H × I × 2 bytes).
-Int8 or FP8 weight quantization halves those reads, potentially doubling decode
-throughput. This targets a fundamentally different data path than KV-int8 (which
-was rejected in Maxtext opt3 due to quality regression + performance regression).
+> **Finding (2026-06-09)**: MoE expert weights are already FP8 in HBM — the loader
+> does NOT dequantize them. The original plan assumption was wrong. See
+> [`opt_a_weight_quant/results.md`](opt_a_weight_quant/results.md) for full details.
+>
+> The remaining lever is **Opt A2: keep attention weights in FP8** instead of
+> dequantizing at load time. Attention weights (Q/K/V/O across 48 layers) are
+> currently loaded as BF16 (~3.2 GB/step per TC). Keeping them FP8 saves ~1.6 GB/step
+> (~4-5% decode bandwidth reduction). This is now the highest-priority next step.
 
-MiMo-V2-Flash already uses FP8 e4m3fn for MoE expert weights in the HF checkpoint.
-The current sglang-jax loader dequantizes to bfloat16 at load time for compute.
-The question is whether on-the-fly FP8 matmul (keeping weights in FP8, computing
-in BF16) is supported by TPU v7x XLA kernels.
+**Opt A1 (W8A8 activation quant for MoE)**: Deprioritized. MoE decode is
+bandwidth-bound, not compute-bound. Quantizing the tiny activation tensors
+(8 tokens × 4096 × 2B ≈ 3 MB) against 36 GB of weight reads is negligible.
 
-**Steps**:
-1. Verify whether TPU v7x supports FP8 (e4m3fn) weight × BF16 activation matmuls
-   natively (via XLA `dot_general` with mixed precision). Check the sglang-jax
-   `flash_gemm` / `gmm` kernel wrappers for FP8 support.
-2. If supported: modify `load_weights` to keep expert weights in FP8 (skip
-   dequantization step). Benchmark vs bf16 baseline.
-3. If not natively supported: explore int8 static quantization (post-training
-   calibration on a small prompt set).
-4. Quality gate: harmonic-mean prompt (expect 80 km/h), math reasoning sample.
+**Opt A2 (attention FP8 at load time)**: Active next step.
+- Attention weights: 48 layers × 4 proj × 4096² × 2B (BF16) = 3.2 GB/step per TC
+- With FP8: 1.6 GB/step per TC — saves 1.6 GB/step
+- Fraction of total weight bandwidth (~38 GB/step): ~4%
+- **Expected gain**: ~4-5% TPOT reduction at conc=8
 
-**Expected gain**: 1.5–2× decode throughput (weight-read bound).
-**Risk**: Quality regression (FP8 is lower risk than int8 for MoE experts since
-the FP8 checkpoint was already trained that way).
+**Steps for Opt A2**:
+1. In `loader.py`, identify where attention weights are dequantized from FP8 → BF16.
+   Check `dequant_fused_kv()` and any BF16 cast in `load_weights`.
+2. Modify to keep Q/K/V/O in FP8 in HBM. Ensure the attention kernel handles FP8 input.
+3. Check `flashattention_backend.py` — verify the Pallas flash-attention kernel
+   accepts FP8 weight dtype or needs a cast inserted before the matmul.
+4. Benchmark at conc=8. Quality gate: spot-check reasoning outputs.
+
+**Risk**: Medium — flash attention kernel may not accept FP8 weights directly;
+may need a per-layer cast or kernel modification.
 
 ---
 
@@ -158,22 +162,19 @@ The question is the optimal `max-running-requests` and `page-size` settings.
 
 ### Opt C — Remove per-step host sync in inference loop
 
-**Priority: Medium (quick win)**
+**Priority: Medium (quick win)** → **CLOSED: 0% measured gain**
 
-**Rationale**: Analogous to Maxtext's `effects_barrier` issue. The sglang-jax
-engine may have per-step host-device sync points in the generate loop (e.g.,
-sampling token → host, EOS check on CPU). Each sync stalls the TPU until the
-CPU processes the result. At 100–130 ms/step this can add 5–20 ms of avoidable
-latency.
-
-**Steps**:
-1. Profile the generate loop with `jax.profiler.trace` to identify sync points.
-2. Move EOS detection on-device (return a `done` flag as part of the XLA output).
-3. Batch token-to-host transfers (copy every N steps rather than every step).
-4. Verify latency improvement and correctness on a multi-turn conversation.
-
-**Expected gain**: 5–15% per-sequence latency reduction.
-**Risk**: Low (correctness risk manageable with quality gate).
+> **Finding (2026-06-09)**: Full code investigation + benchmark showed zero gain.
+> See [`opt_c_host_sync/results.md`](opt_c_host_sync/results.md).
+>
+> The overlap design (`future_token_ids_map` on-device, `jax.copy_to_host_async`,
+> `launch_done` event) is already well-optimized. The F=3.9ms fixed overhead per
+> step is **fixed TPU compute** — attention, layer norms, MoE router topk, and the
+> future token ID map round-trip — none of which can be pipelined away.
+>
+> Opt C-A (move ForwardBatch/SamplingMetadata prep to background thread, commit
+> `10a5699`) was implemented and benchmarked. TPOT at conc=8: 21.6ms → 21.6ms.
+> Code is kept (clean refactoring, no downside) but provides no throughput gain.
 
 ---
 
@@ -251,6 +252,22 @@ optimal for all workloads.
 
 ---
 
+## Status Summary (2026-06-09)
+
+| Opt | Description | Status | Gain |
+|-----|-------------|--------|------|
+| A (expert FP8) | MoE expert weights already FP8 — no action | ✅ Closed | 0% (already done) |
+| **A2 (attention FP8)** | Keep attention weights FP8 at load time | **⏳ Next** | **~4-5% expected** |
+| B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
+| C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
+| D (sparse prefill) | Not yet investigated | 🔲 Backlog | ~30-50% TTFT |
+| E (speculative) | Not yet investigated | 🔲 Backlog | ~2-3× per-seq latency |
+| F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
+
+**Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
+**Current**: 371 tok/s (no improvement yet — Opt A and C closed with 0% gain)
+**Next target**: ~388-390 tok/s (+4-5%) from Opt A2
+
 ## Tracking
 
 Results for each optimization go in subdirectories:
@@ -258,12 +275,13 @@ Results for each optimization go in subdirectories:
 ```
 docs/tpu7tests/mimo_v2_flash_optimization/
   plan.md                    ← this file
-  opt_a_weight_quant/        ← FP8/int8 weight quantization results
-  opt_b_batch_scaling/       ← batch size sweep results
-  opt_c_host_sync/           ← host sync removal results
-  opt_d_sparse_prefill/      ← sparse MoE prefill results
-  opt_e_speculative/         ← speculative decoding results
-  opt_f_paged_attention/     ← paged attention tuning results
+  baseline/results.md        ← baseline sweep (2026-06-08) ✅
+  opt_a_weight_quant/        ← FP8/int8 weight quantization ✅ closed (0%)
+  opt_b_batch_scaling/       ← batch size sweep (plateau at conc=8) ✅
+  opt_c_host_sync/           ← host sync removal ✅ closed (0% measured)
+  opt_d_sparse_prefill/      ← sparse MoE prefill 🔲 backlog
+  opt_e_speculative/         ← speculative decoding 🔲 backlog
+  opt_f_paged_attention/     ← paged attention tuning 🔲 backlog
 ```
 
 Each subdirectory should contain at minimum:

@@ -1,6 +1,6 @@
 # MiMo-V2-Flash on TPU v7x — Progress
 
-**Last updated**: 2026-06-08 (1-node demo + checkpoint restore COMPLETE)
+**Last updated**: 2026-06-09 (optimization work in progress)
 **Branch**: `tpu7` (`geeningwang/sglang-jax`)
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`
 
@@ -319,12 +319,35 @@ workaround is to create via REST API v1beta1:
 
 ---
 
-## Next Steps
+## Optimization Work (2026-06-09)
 
-All planned demo runs are complete. No further work required unless:
-- Running production inference (would need a persistent service, not a demo job)
-- Testing higher tp or ep configurations
-- Benchmarking throughput at varying batch sizes
+Full plan: [`mimo_v2_flash_optimization/plan.md`](mimo_v2_flash_optimization/plan.md)
+
+### Baseline performance (2026-06-08, tp=8, conc=8)
+
+| Metric | Value |
+|--------|-------|
+| Peak decode throughput | **371 tok/s** @ conc=8 |
+| TPOT @ conc=8 | **21.6ms** |
+| TTFT @ 512 tok | 56ms |
+| TPOT linear fit | `2.21ms × batch + 3.9ms` |
+
+Throughput plateaus at conc=8 — decode is HBM bandwidth-bound (weight reads dominate).
+
+### Findings so far
+
+| Opt | What we learned | Gain |
+|-----|----------------|------|
+| A (expert quant) | MoE expert weights already FP8 in HBM — no dequantization at load time | 0% (already done) |
+| C (host sync) | Overlap design is fully pipelined; F=3.9ms is fixed TPU compute, not host bubble | 0% measured |
+| A2 (attention FP8) | Attention Q/K/V/O weights loaded as BF16 (dequantized). Keeping FP8 saves ~1.6 GB/step | **~4-5% expected — next** |
+
+### Next step: Opt A2 — Attention FP8 at load time
+
+Attention weights (48 layers × Q/K/V/O projections) are dequantized FP8→BF16 at load,
+adding ~1.6 GB/step of unnecessary weight reads per TC. Keeping them FP8 in HBM is
+~4% of total weight bandwidth. Requires verifying the flash-attention Pallas kernel
+accepts FP8 weight inputs.
 
 ---
 
