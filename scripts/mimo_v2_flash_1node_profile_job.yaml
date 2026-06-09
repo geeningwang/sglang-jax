@@ -167,7 +167,7 @@ spec:
             --warmup-n 8 \
             --burst-n 64 \
             --burst-conc 8 \
-            --host-tracer-level 2 \
+            --host-tracer-level 1 \
             --profile-duration 30 \
             2>&1 | tee -a ${LOG}
 
