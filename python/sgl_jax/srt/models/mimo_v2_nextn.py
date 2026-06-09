@@ -327,4 +327,218 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         self.model.embed_tokens.embedding.value = embed
 
 
-EntryClass = MiMoV2MTPForCausalLM
+class MiMoV2FlashMTPForCausalLM(nnx.Module):
+    """MiMo-V2-Flash MTP draft model.
+
+    Same SWA-attention + dense-MLP block as MiMoV2MTPForCausalLM, but the Flash
+    checkpoint stores separate q/k/v FP8 weights (not fused QKV like V2.5-Pro).
+    After load_weights(), all layers are dequantized to BF16 LinearBase.
+    """
+
+    load_lm_head_from_target = True
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh | None = None,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.config = config
+        self.mesh = mesh
+        self.dtype = dtype
+        self.mtp_layer_idx = getattr(config, "mtp_layer_idx", 0)
+        self.model = MiMoV2ModelNextN(config, mesh=mesh, dtype=dtype)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
+        )
+        self.logits_processor = LogitsProcessor(config.vocab_size, mesh=self.mesh)
+        # Buffer for raw FP8 weights: {layer_idx: {q_weight, q_scale, k_weight, ...}}
+        self._kv_buffers: dict[int, dict] = {}
+        self.hot_token_ids = None
+
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        memory_pools: MemoryPools,
+        logits_metadata: LogitsMetadata,
+    ):
+        hidden_states, layers_kv_fused = self.model(forward_batch, memory_pools.token_to_kv_pool)
+        output = self.logits_processor(
+            hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
+        )
+        return output, layers_kv_fused, []
+
+    def load_weights(self, model_config: ModelConfig):
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        self.loader = WeightLoader(
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
+        )
+        mappings = self._create_weight_mappings()
+        self.loader.load_weights_from_safetensors(mappings)
+
+        is_fp8 = self.loader.is_static_quant
+        if is_fp8:
+            buf = self._kv_buffers.get(self.mtp_layer_idx, {})
+            attn = self.model.mtp_block.self_attn
+            quant_cfg = getattr(model_config, "quantization_config", None)
+            block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+
+            tp_no_shard = NamedSharding(self.mesh, P())
+            tp_out_shard = NamedSharding(self.mesh, P(None, "tensor"))
+            tp_in_shard = NamedSharding(self.mesh, P("tensor", None))
+
+            # Dequantize Q, K, V from FP8 buffers → BF16 LinearBase
+            for proj_name, weight_key, scale_key, kernel_axes, sharding_spec in [
+                ("q_proj", "q_weight", "q_scale", (None, "tensor"), tp_out_shard),
+                ("k_proj", "k_weight", "k_scale", (None, "tensor"), tp_out_shard),
+                ("v_proj", "v_weight", "v_scale", (None, "tensor"), tp_out_shard),
+            ]:
+                w_fp8 = buf[weight_key]   # [out, in], FP8
+                w_scale = buf[scale_key]  # [out_blocks, in_blocks]
+                w_bf16 = self.loader._uniform_block_dequant(w_fp8, w_scale, block_size)
+                w_bf16 = jax.device_put(jnp.transpose(w_bf16), sharding_spec)
+                setattr(attn, proj_name, self.loader.create_bf16_linear(
+                    w_bf16, kernel_axes, self.mesh
+                ))
+
+            # Load O proj (BF16, no scale) → BF16 LinearBase
+            o_w = buf["o_weight"].astype(jnp.bfloat16)  # [out, in]
+            o_w = jax.device_put(jnp.transpose(o_w), tp_in_shard)
+            attn.o_proj = self.loader.create_bf16_linear(o_w, ("tensor", None), self.mesh)
+
+            # Load eh_proj (BF16, no scale) → BF16 LinearBase
+            eh_w = buf["eh_weight"].astype(jnp.bfloat16)  # [out, in]
+            eh_w = jax.device_put(jnp.transpose(eh_w), tp_no_shard)
+            self.model.eh_proj = self.loader.create_bf16_linear(eh_w, (None, None), self.mesh)
+
+            # Dequantize MLP projections (already in QuantizedLinear after apply_linear_quant)
+            self.loader.dequant_fp8_layers(
+                [self.model.mtp_block],
+                specs=[
+                    ("mlp.gate_proj", None),
+                    ("mlp.up_proj", None),
+                    ("mlp.down_proj", None),
+                ],
+            )
+            self._kv_buffers.clear()
+
+        logger.info(
+            "MiMoV2Flash MTP layer %d weights loaded (FP8=%s)",
+            self.mtp_layer_idx,
+            is_fp8,
+        )
+
+    def _create_weight_mappings(self) -> dict[str, WeightMapping]:
+        idx = self.mtp_layer_idx
+        prefix = f"model.mtp.layers.{idx}"
+        block = "model.mtp_block"
+        is_fp8 = self.loader.is_static_quant
+
+        mappings: dict[str, WeightMapping] = {
+            f"{prefix}.enorm.weight": WeightMapping(
+                target_path="model.enorm.scale", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.hnorm.weight": WeightMapping(
+                target_path="model.hnorm.scale", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.final_layernorm.weight": WeightMapping(
+                target_path="model.final_layernorm.scale", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.input_layernorm.weight": WeightMapping(
+                target_path=f"{block}.input_layernorm.scale", sharding=(None,), transpose=False
+            ),
+            f"{prefix}.pre_mlp_layernorm.weight": WeightMapping(
+                target_path=f"{block}.post_attention_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.self_attn.attention_sink_bias": WeightMapping(
+                target_path=f"{block}.self_attn.attention_sink_bias",
+                sharding=("tensor",),
+                transpose=False,
+            ),
+        }
+
+        if is_fp8:
+            # FP8 separate q/k/v + BF16 o_proj + BF16 eh_proj → _kv_buffers
+            buf_idx = idx
+            mappings[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
+                target_path=f"__KV_Q_WEIGHT__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.q_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"__KV_Q_SCALE__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.k_proj.weight"] = WeightMapping(
+                target_path=f"__KV_K_WEIGHT__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.k_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"__KV_K_SCALE__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.v_proj.weight"] = WeightMapping(
+                target_path=f"__KV_V_WEIGHT__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.v_proj.weight_scale_inv"] = WeightMapping(
+                target_path=f"__KV_V_SCALE__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.self_attn.o_proj.weight"] = WeightMapping(
+                target_path=f"__KV_O_WEIGHT__{buf_idx}", sharding=(None, None), transpose=False
+            )
+            mappings[f"{prefix}.eh_proj.weight"] = WeightMapping(
+                target_path=f"__KV_EH_WEIGHT__{buf_idx}", sharding=(None, None), transpose=False
+            )
+        else:
+            # BF16 (non-quantized) path: direct mapping
+            for proj, sharding in [
+                ("q_proj", (None, "tensor")),
+                ("k_proj", (None, "tensor")),
+                ("v_proj", (None, "tensor")),
+                ("o_proj", ("tensor", None)),
+            ]:
+                mappings[f"{prefix}.self_attn.{proj}.weight"] = WeightMapping(
+                    target_path=f"{block}.self_attn.{proj}.weight",
+                    sharding=sharding,
+                    transpose=True,
+                )
+            mappings[f"{prefix}.eh_proj.weight"] = WeightMapping(
+                target_path="model.eh_proj.weight", sharding=(None, None), transpose=True
+            )
+
+        for proj, sharding in [
+            ("gate_proj", (None, "tensor")),
+            ("up_proj", (None, "tensor")),
+            ("down_proj", ("tensor", None)),
+        ]:
+            hf_key = f"{prefix}.mlp.{proj}"
+            weight_suffix = "weight_q" if is_fp8 else "weight"
+            mappings[f"{hf_key}.weight"] = WeightMapping(
+                target_path=f"{block}.mlp.{proj}.{weight_suffix}",
+                sharding=sharding,
+                transpose=True,
+            )
+            if is_fp8:
+                mappings[f"{hf_key}.weight_scale_inv"] = WeightMapping(
+                    target_path=f"{block}.mlp.{proj}.weight_scale",
+                    sharding=(None, None),
+                    transpose=False,
+                )
+
+        return mappings
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed: jax.Array, head: jax.Array) -> None:
+        self.model.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
+    def set_embed(self, embed: jax.Array) -> None:
+        self.model.embed_tokens.embedding.value = embed
+
+
+EntryClass = [MiMoV2MTPForCausalLM, MiMoV2FlashMTPForCausalLM]

@@ -436,6 +436,10 @@ class JAXModelLoader(DefaultModelLoader):
 
         checkpoint_path = self._checkpoint_path(model_config)
         checkpoint_ready = checkpoint_path and self._checkpoint_exists(checkpoint_path)
+        # Draft models (MTP) are tiny and have a different structure from the target
+        # model, so skip checkpoint caching to avoid tree-mismatch errors.
+        if getattr(model_config, "is_draft_model", False):
+            checkpoint_ready = False
 
         if (
             hasattr(model_config, "quantization_config")

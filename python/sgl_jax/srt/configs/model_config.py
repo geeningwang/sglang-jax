@@ -64,6 +64,7 @@ class ModelConfig:
         self.model_sub_dir = model_sub_dir
         self.revision = revision
         self.model_impl = model_impl
+        self.is_draft_model = is_draft_model
         self.quantization = quantization
         self.quantization_config_path = quantization_config_path
         # Create unified quantization config from path
@@ -144,6 +145,9 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoV2ForCausalLM":
             self.hf_config.architectures[0] = "MiMoV2MTPForCausalLM"
+
+        if is_draft_model and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
+            self.hf_config.architectures[0] = "MiMoV2FlashMTPForCausalLM"
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False

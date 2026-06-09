@@ -201,20 +201,23 @@ rate ~70–80%, effective per-sequence throughput increases 2–3× without chan
 the serving batch size. This is the primary lever for reducing time-to-completion
 for individual users.
 
-**Draft model candidates** (for MiMo-V2-Flash):
-- A smaller MiMo variant (if publicly available)
-- Shared-expert-only forward pass (skip the routed MoE, use only dense MLP layers)
-  — fast draft, lower acceptance rate
-- Self-speculative: early exit after N layers of the full model
+**Draft model**: Flash ships pre-trained MTP weights (`model_mtp.safetensors`, 2
+layers). These are single SWA-attention + dense-MLP blocks, same architecture as
+V2.5-Pro MTP. The EAGLE speculative-decoding framework is used.
 
-**Steps**:
-1. Decide on draft model architecture (shared-expert-only is lowest complexity).
-2. Implement `speculative_generate` wrapper: draft K tokens, batch-verify, accept/reject.
-3. Measure acceptance rate on a representative prompt distribution.
-4. Benchmark effective tok/s and TTFT vs single-model decode.
+> **Implementation (2026-06-09)**: `MiMoV2FlashMTPForCausalLM` added to
+> `mimo_v2_nextn.py`. Key differences from V2.5-Pro MTP: separate q/k/v FP8
+> weights (not fused QKV), BF16 o_proj. Draft model loads via safetensors
+> slow-path (Orbax checkpoint caching skipped for draft models).
+> See [`opt_e_speculative/results.md`](opt_e_speculative/results.md).
+
+**Remaining steps**:
+1. Create GKE benchmark YAML.
+2. Launch, measure acceptance rate + TPOT.
+3. Tune `--speculative-num-steps` and `--speculative-eagle-topk`.
 
 **Expected gain**: 2–3× per-sequence latency reduction.
-**Risk**: High (significant implementation; acceptance rate is workload-dependent).
+**Risk**: Medium — implementation done; acceptance rate is workload-dependent.
 
 ---
 
@@ -246,12 +249,12 @@ optimal for all workloads.
 | B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
 | D (sparse prefill) | Not yet investigated | 🔲 Backlog | ~30-50% TTFT |
-| **E (speculative)** | **Not yet investigated** | **⏳ Next** | **~2-3× per-seq latency** |
+| **E (speculative)** | **Implementation done — not yet benchmarked** | **⏳ Benchmark** | **~2-3× per-seq latency** |
 | F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
 
 **Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
 **Current**: 371 tok/s (no improvement yet — all analyzed opts closed with 0% or negligible gain)
-**Next**: Opt E (speculative decoding) — orthogonal to throughput, targets per-seq latency
+**Next**: Opt E benchmark — MiMoV2FlashMTPForCausalLM implemented, needs GKE job + measurement
 
 ## Tracking
 

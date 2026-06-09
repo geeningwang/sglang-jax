@@ -2474,6 +2474,14 @@ class WeightLoader:
                     buf["v_weight"] = processed_weight
                 elif "V_SCALE" in jax_path:
                     buf["v_scale"] = processed_weight
+                elif "Q_WEIGHT" in jax_path:
+                    buf["q_weight"] = processed_weight
+                elif "Q_SCALE" in jax_path:
+                    buf["q_scale"] = processed_weight
+                elif "O_WEIGHT" in jax_path:
+                    buf["o_weight"] = processed_weight
+                elif "EH_WEIGHT" in jax_path:
+                    buf["eh_weight"] = processed_weight
                 logger.info(
                     "Stored KV buffer %s for layer %d, shape=%s",
                     jax_path.split("__")[2],
