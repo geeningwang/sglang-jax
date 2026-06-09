@@ -194,7 +194,8 @@ clean refactoring (slightly shorter main-thread critical section) with no downsi
 | Optimization | Expected gain | Effort | Priority |
 |---|---|---|---|
 | Opt C-A: Move prep to background thread | **0% (measured)** | Done | ~~closed~~ |
-| Opt A2: Attention FP8 (skip BF16 dequant at load) | 4-5% | Medium | **Next** |
+| Opt A2: Attention FP8 (skip BF16 dequant at load) | **<0.3% (corrected)** | — | ~~closed~~ — not worth impl. |
+| Opt E: Speculative decoding | ~2-3× per-seq latency | High | **Next** |
 | Opt C-B: On-device EOS detection | 1-3% | Medium | Low priority (F is compute, not sync) |
 | Opt B: Larger batch (conc > 8 if KV allows) | Already tested in baseline | - | Diminishing returns |
 

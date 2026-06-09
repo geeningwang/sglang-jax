@@ -338,16 +338,18 @@ Throughput plateaus at conc=8 — decode is HBM bandwidth-bound (weight reads do
 
 | Opt | What we learned | Gain |
 |-----|----------------|------|
-| A (expert quant) | MoE expert weights already FP8 in HBM — no dequantization at load time | 0% (already done) |
+| A1 (expert quant) | MoE expert weights already FP8 in HBM — no dequantization at load time | 0% (already done) |
 | C (host sync) | Overlap design is fully pipelined; F=3.9ms is fixed TPU compute, not host bubble | 0% measured |
-| A2 (attention FP8) | Attention Q/K/V/O weights loaded as BF16 (dequantized). Keeping FP8 saves ~1.6 GB/step | **~4-5% expected — next** |
+| A2 (attention FP8) | Initial estimate of 4-5% was wrong by ~20×. Corrected: <0.3% gain. Flash uses GQA (1 global SWA KV head), TP=8 shards both dims, o_proj already FP8. Closed — not worth checkpoint rebuild. | **<0.3% — closed** |
 
-### Next step: Opt A2 — Attention FP8 at load time
+### Next step: Opt E — Speculative decoding
 
-Attention weights (48 layers × Q/K/V/O projections) are dequantized FP8→BF16 at load,
-adding ~1.6 GB/step of unnecessary weight reads per TC. Keeping them FP8 in HBM is
-~4% of total weight bandwidth. Requires verifying the flash-attention Pallas kernel
-accepts FP8 weight inputs.
+All analyzed throughput optimizations (A1, A2, B, C) are closed. The remaining lever
+for user-visible latency is speculative decoding (draft model generates K tokens per step;
+full model verifies in one pass). Potential: 2-3× per-sequence latency reduction.
+
+Candidate draft: shared-expert-only forward (skip routed MoE, use dense MLP layers) —
+low complexity, reduced acceptance rate. See `opt_e_speculative/` for investigation plan.
 
 ---
 
