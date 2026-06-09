@@ -4,19 +4,19 @@ MiMo-V2-Flash sglang-jax profiling driver.
 
 Flow:
   1. Warmup (8 requests, conc=1, input=512, output=32)
-  2. POST /start_profile  → JAX XPlane trace begins
-  3. Decode burst (64 requests at conc=8, input=512, output=256) — captures steady-state
-  4. POST /stop_profile   → trace written to --trace-dir
-  5. Print GCS path for download / Perfetto UI
+  2. Launch decode burst as background task (64 req, conc=8, output=256)
+  3. Wait 3s for requests to be in-flight, then POST /start_profile
+     (the model runner processes profile commands during active decode steps)
+  4. Wait for burst to complete, then POST /stop_profile
+  5. Print GCS trace path
 
 Usage:
   python3 scripts/profile_flash.py \
     --server http://localhost:8080 \
     --trace-dir gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-baseline/trace
 
-Trace analysis: open in TensorBoard (tensorboard --logdir=<gcs-path>) or Perfetto UI.
-Look for: host stall gaps (Opt C target), FP8 MXU op names (Opt A target),
-routing/allreduce overhead (dispatch target).
+Trace analysis: tensorboard --logdir=<gcs-path>  OR  https://ui.perfetto.dev
+Look for: host stall gaps (Opt C), FP8 MXU op names (Opt A), allreduce overhead.
 """
 
 import argparse
@@ -88,14 +88,23 @@ async def _batch(server, concurrency, input_tokens, max_tokens, n_requests):
     return wall, total_out
 
 
-async def _post(session, url, body=None, timeout=180):
-    async with session.post(
-        url,
-        json=body or {},
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as r:
-        text = await r.text()
-        return r.status, text
+async def _post_profile(server, endpoint, body=None):
+    """POST to a profile endpoint while inference is running.
+
+    Uses a fresh session with a long timeout. The /start_profile endpoint is
+    processed by the model runner during active decode steps — it will block
+    until the next step completes. Give it plenty of time.
+    """
+    url = f"{server}/{endpoint}"
+    connector = aiohttp.TCPConnector(limit=4)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.post(
+            url,
+            json=body or {},
+            timeout=aiohttp.ClientTimeout(total=600),
+        ) as r:
+            text = await r.text()
+            return r.status, text
 
 
 async def main():
@@ -111,61 +120,74 @@ async def main():
     ap.add_argument("--burst-conc", type=int, default=8)
     ap.add_argument("--host-tracer-level", type=int, default=2,
                     help="1=user events only, 2=+XLA ops, 3=+low-level TPU ops")
-    ap.add_argument("--num-profile-steps", type=int, default=None,
-                    help="Stop profile after N steps (None = manual stop_profile)")
+    ap.add_argument("--profile-start-delay", type=float, default=3.0,
+                    help="Seconds to wait after burst starts before calling /start_profile")
     args = ap.parse_args()
 
     server = args.server
 
-    async with aiohttp.ClientSession() as session:
-        # ── Phase 1: Warmup ──────────────────────────────────────────────────
-        print(f"\n{'='*70}")
-        print(f"Phase 1: Warmup  ({args.warmup_n} requests, input=512, output=32)")
-        print(f"{'='*70}")
-        wall, out_tok = await _batch(server, 1, 512, 32, args.warmup_n)
-        print(f"  Warmup done — {out_tok/wall:.1f} tok/s  (wall={wall:.1f}s)")
+    # ── Phase 1: Warmup ──────────────────────────────────────────────────────
+    print(f"\n{'='*70}")
+    print(f"Phase 1: Warmup  ({args.warmup_n} requests, conc=1, input=512, output=32)")
+    print(f"{'='*70}")
+    wall, out_tok = await _batch(server, 1, 512, 32, args.warmup_n)
+    print(f"  Warmup done — {out_tok/wall:.1f} tok/s  (wall={wall:.1f}s)")
 
-        # ── Phase 2: Start profile ───────────────────────────────────────────
+    # ── Phase 2+3: Launch burst, then start profile while in-flight ──────────
+    print(f"\n{'='*70}")
+    print(f"Phase 2: Launching decode burst in background")
+    print(f"  conc={args.burst_conc}, input=512 tok, output=256 tok, n={args.burst_n}")
+    print(f"{'='*70}")
+
+    profile_body = {
+        "output_dir": args.trace_dir,
+        "host_tracer_level": args.host_tracer_level,
+    }
+
+    async def _run_burst_then_signal():
+        wall, out_tok = await _batch(server, args.burst_conc, 512, 256, args.burst_n)
+        return wall, out_tok
+
+    async def _start_profile_delayed():
+        print(f"  Waiting {args.profile_start_delay}s for requests to be in-flight...")
+        await asyncio.sleep(args.profile_start_delay)
         print(f"\n{'='*70}")
-        print(f"Phase 2: Starting JAX profiler trace")
+        print(f"Phase 3: Starting JAX profiler trace")
         print(f"  output_dir = {args.trace_dir}")
         print(f"  host_tracer_level = {args.host_tracer_level}")
         print(f"{'='*70}")
-        profile_body = {
-            "output_dir": args.trace_dir,
-            "host_tracer_level": args.host_tracer_level,
-        }
-        if args.num_profile_steps is not None:
-            profile_body["num_steps"] = args.num_profile_steps
-
-        status, text = await _post(session, f"{server}/start_profile", profile_body)
+        status, text = await _post_profile(server, "start_profile", profile_body)
         if status not in (200, 201):
-            print(f"  ERROR starting profile: HTTP {status}  {text}")
-            sys.exit(1)
+            print(f"  ERROR starting profile: HTTP {status}  {text[:200]}")
+            return False
         print(f"  Profile started (HTTP {status}): {text[:120]}")
-        t_profile_start = time.perf_counter()
+        return True
 
-        # ── Phase 3: Decode burst (the thing we want to profile) ─────────────
-        print(f"\n{'='*70}")
-        print(f"Phase 3: Decode burst (conc={args.burst_conc}, input=512, output=256, n={args.burst_n})")
-        print(f"{'='*70}")
-        wall, out_tok = await _batch(server, args.burst_conc, 512, 256, args.burst_n)
-        tok_s = out_tok / wall
-        print(f"  Burst done — {tok_s:.1f} tok/s  (wall={wall:.1f}s, out={out_tok} tok)")
+    t_burst_start = time.perf_counter()
+    burst_task = asyncio.create_task(_run_burst_then_signal())
+    profile_ok = await _start_profile_delayed()
 
-        # ── Phase 4: Stop profile ────────────────────────────────────────────
-        elapsed = time.perf_counter() - t_profile_start
+    # Wait for burst to finish
+    wall, out_tok = await burst_task
+    tok_s = out_tok / wall
+    print(f"\n  Burst complete — {tok_s:.1f} tok/s  (wall={wall:.1f}s, out={out_tok} tok)")
+
+    # ── Phase 4: Stop profile ────────────────────────────────────────────────
+    if profile_ok:
+        elapsed = time.perf_counter() - t_burst_start
         print(f"\n{'='*70}")
-        print(f"Phase 4: Stopping profile  (elapsed={elapsed:.1f}s)")
+        print(f"Phase 4: Stopping profile  (trace elapsed={elapsed:.1f}s)")
         print(f"{'='*70}")
-        status, text = await _post(session, f"{server}/stop_profile")
+        status, text = await _post_profile(server, "stop_profile")
         if status not in (200, 201):
-            print(f"  WARNING: stop_profile returned HTTP {status}: {text}")
+            print(f"  WARNING: stop_profile returned HTTP {status}: {text[:200]}")
         else:
             print(f"  Profile stopped (HTTP {status})")
+    else:
+        print("\nSkipping stop_profile (start_profile failed)")
 
     print(f"\n{'='*70}")
-    print("Trace saved to:")
+    print("Trace output directory:")
     print(f"  {args.trace_dir}")
     print("")
     print("To analyze:")
@@ -173,10 +195,10 @@ async def main():
     print("  OR open https://ui.perfetto.dev and upload the .pb.gz file")
     print("")
     print("What to look for in the trace:")
-    print("  - Host stall gaps (CPU gaps → Opt C target: remove effects_barrier)")
-    print("  - 'custom-call: ..fp8..' op names (confirms FP8 MXU for expert matmul)")
-    print("  - 'all-reduce' / psum time (metadata allreduce overhead)")
-    print("  - MoE routing time (topk + score normalization)")
+    print("  - Host stall gaps  → Opt C: remove per-step host-device sync")
+    print("  - 'custom-call: ..fp8..'  → confirms FP8 MXU for expert matmul")
+    print("  - 'all-reduce' / psum time  → allreduce overhead")
+    print("  - MoE routing time  → topk + score normalization")
     print(f"{'='*70}")
 
 
