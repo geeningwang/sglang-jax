@@ -95,14 +95,26 @@ class ModelWorkerClient:
 
     def forward_thread_func_(self):
         while True:
-            (
-                model_worker_batch,
-                future_token_ids_ct,
-                sampling_metadata,
-                forward_metadata,
-            ) = self.input_queue.get()
+            model_worker_batch, future_token_ids_ct = self.input_queue.get()
             if not model_worker_batch:
                 break
+
+            # CPU prep moved here from main thread to shrink the per-step pipeline bubble.
+            # All three calls are read-only with respect to shared state: they read
+            # model_worker_batch fields (written by main thread before the queue.put)
+            # and model_runner / attn_backend config (immutable after init).
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                model_worker_batch,
+                0,
+                self.mesh,
+                self.worker.model_config.vocab_size,
+            )
+            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+                model_worker_batch
+            )
+            model_worker_batch.forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.worker.get_model_runner()
+            )
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
@@ -180,6 +192,8 @@ class ModelWorkerClient:
         sampling_metadata: SamplingMetadata = None,
     ) -> tuple[None, jax.Array, int]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        # This must stay on the main thread: the scheduler reads self.cur_sampling_info immediately
+        # after forward_batch_generation() returns (see event_loop_overlap in scheduler.py).
         sampling_info = model_worker_batch.sampling_info
         sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
@@ -188,35 +202,14 @@ class ModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        if sampling_metadata is None:
-            sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                model_worker_batch,
-                0,
-                self.mesh,
-                self.worker.model_config.vocab_size,
-            )
-
-        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
-        )
-
-        # Prepare LoRA batch if LoRA is enabled
+        # Prepare LoRA batch if LoRA is enabled (must run before background thread picks up)
         if self.worker.server_args.enable_lora:
             self.worker.prepare_lora_batch(model_worker_batch)
 
-        model_worker_batch.forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.worker.get_model_runner()
-        )
-
-        # Push a new batch to the queue (JAX handles synchronization automatically)
-        self.input_queue.put(
-            (
-                model_worker_batch,
-                self.future_token_ids_ct,
-                sampling_metadata,
-                forward_metadata,
-            )
-        )
+        # All remaining prep (SamplingMetadata, ForwardBatch, forward_metadata) runs in the
+        # background thread after input_queue.get(), removing it from the main-thread pipeline
+        # bubble between process_batch_result calls.
+        self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
         # Allocate output future objects
         bs = len(model_worker_batch.seq_lens)
@@ -249,4 +242,4 @@ class ModelWorkerClient:
         return self.worker.get_tokens_per_layer_info()
 
     def __delete__(self):
-        self.input_queue.put((None, None, None, None))
+        self.input_queue.put((None, None))
