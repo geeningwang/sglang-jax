@@ -1,7 +1,7 @@
 # Opt C — Per-Step Host Sync Removal: Code Analysis & Findings
 
 **Date**: 2026-06-09
-**Status**: Option A implemented; pending benchmark to measure actual gain
+**Status**: Option A implemented and benchmarked — zero measurable gain; F=3.9ms confirmed as fixed TPU compute
 
 ---
 
@@ -138,7 +138,7 @@ the scheduler's `self.cur_sampling_info` read) and LoRA prep (guards a shared wr
 
 **Risk**: Low — all three calls are read-only w.r.t. shared state
 **Expected gain**: 0.5-1ms pipeline bubble reduction = 2-5% TPOT improvement at conc=8
-**Actual gain**: TBD — needs benchmark run
+**Actual gain**: **0%** — TPOT at conc=8 unchanged at 21.6ms (see benchmark below)
 
 ### Option B: On-device EOS detection (medium effort, 3-5%)
 
@@ -156,13 +156,46 @@ Transfer token IDs only every K steps (streaming) or when a request finishes.
 
 ---
 
+## Benchmark Results — Opt C-A vs Baseline
+
+**Run**: 2026-06-09T06:56–07:08Z, `gke-tpu-b00d966f-fppd`, same config as baseline
+**GCS**: `gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-opt-c/flash_opt_c_20260609T065629Z.json`
+
+### Concurrency sweep (input=512, output=256)
+
+| conc | tok/s | TPOT (ms) | baseline TPOT | Δ |
+|------|------:|----------:|----------:|---|
+| 1 | 111.3 | 9.0 | 9.0 | 0% |
+| 2 | 181.1 | 11.0 | 10.9 | 0% |
+| 4 | 264.5 | 15.1 | 15.3 | +1% (noise) |
+| **8** | **370.1** | **21.6** | **21.6** | **0%** |
+| 16 | 374.8 | 39.0 | 39.3 | +1% (noise) |
+| 32 | 369.7 | 75.7 | 75.5 | 0% |
+
+Peak: 374.8 tok/s @ conc=16 (baseline: ~372 tok/s).
+
+### Conclusion: F=3.9ms is NOT removable host overhead
+
+The ~0.6ms of prep work moved to the background thread was already hidden by the
+overlap design. The XLA data dependency chain (`set_future_token_ids` → `resolve_future_token_ids`)
+serializes consecutive steps regardless of where the host prep runs. Moving prep off the
+main thread does not change when the TPU actually starts the next step.
+
+**F=3.9ms is fixed TPU compute**: attention, layer norms, MoE router topk, and the
+`future_token_ids_map` read/write round-trip — none of which can be pipelined away.
+
+Opt C is effectively closed. The code change (commit `10a5699`) is kept since it's a
+clean refactoring (slightly shorter main-thread critical section) with no downside.
+
+---
+
 ## Revised Priority Assessment
 
 | Optimization | Expected gain | Effort | Priority |
 |---|---|---|---|
-| Opt C-A: Move prep to background thread | 2-5% | Low | **Next** |
-| Opt A2: Attention FP8 (skip BF16 dequant at load) | 4-5% | Medium | After C-A |
-| Opt C-B: On-device EOS detection | 1-3% | Medium | After A2 |
+| Opt C-A: Move prep to background thread | **0% (measured)** | Done | ~~closed~~ |
+| Opt A2: Attention FP8 (skip BF16 dequant at load) | 4-5% | Medium | **Next** |
+| Opt C-B: On-device EOS detection | 1-3% | Medium | Low priority (F is compute, not sync) |
 | Opt B: Larger batch (conc > 8 if KV allows) | Already tested in baseline | - | Diminishing returns |
 
 ---
