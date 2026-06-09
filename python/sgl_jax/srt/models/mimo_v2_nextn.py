@@ -146,6 +146,13 @@ class MiMoV2ModelNextN(nnx.Module):
     ) -> tuple[jax.Array, list[jax.Array]]:
         embed = self.embed_tokens(forward_batch.input_ids)
         hidden_in = forward_batch.spec_info.hidden_states
+        # hidden_in may arrive as PartitionSpec(None, None) while embed is
+        # PartitionSpec('data', None); align before concat (data=1, same layout).
+        if self.mesh is not None:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+            hidden_in = jax.lax.with_sharding_constraint(
+                hidden_in, NamedSharding(self.mesh, P("data", None))
+            )
         hidden_states, _ = self.eh_proj(
             jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)
         )
