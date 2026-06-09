@@ -88,11 +88,11 @@ async def _batch(server, concurrency, input_tokens, max_tokens, n_requests):
     return wall, total_out
 
 
-async def _post(session, url, body=None):
+async def _post(session, url, body=None, timeout=180):
     async with session.post(
         url,
         json=body or {},
-        timeout=aiohttp.ClientTimeout(total=30),
+        timeout=aiohttp.ClientTimeout(total=timeout),
     ) as r:
         text = await r.text()
         return r.status, text
