@@ -100,6 +100,8 @@ spec:
           RESULT_JSON="/tmp/flash_opt_e_${TIMESTAMP}.json"
           RESULT_LOG="/tmp/flash_opt_e_${TIMESTAMP}.txt"
           ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+          # Always upload log on exit (success or failure) so errors are visible in GCS.
+          trap 'gsutil cp ${RESULT_LOG} ${RESULTS_DIR}/flash_opt_e_${TIMESTAMP}.txt 2>/dev/null || true' EXIT
 
           echo "$(ts) === Installing sglang-jax (tpu7 branch) ===" | tee -a ${RESULT_LOG}
           git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
@@ -159,8 +161,8 @@ spec:
               break
             fi
             if ! kill -0 ${SERVER_PID} 2>/dev/null; then
-              echo "$(ts) ERROR: server died" | tee -a ${RESULT_LOG}
-              tail -50 ${RESULT_LOG}
+              echo "$(ts) ERROR: server died — last 100 lines of log:" | tee -a ${RESULT_LOG}
+              tail -100 ${RESULT_LOG} | tee -a ${RESULT_LOG}
               exit 1
             fi
             [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting ($((i*5))s)" | tee -a ${RESULT_LOG}
