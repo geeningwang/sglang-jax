@@ -192,7 +192,7 @@ class MiMoV2MTPForCausalLM(nnx.Module):
         output = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
         )
-        return output, layers_kv_fused, []
+        return output, layers_kv_fused, True, []
 
     def load_weights(self, model_config: ModelConfig):
         self.loader = WeightLoader(
@@ -370,7 +370,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
         output = self.logits_processor(
             hidden_states, self.lm_head, logits_metadata, aux_hidden_states=None
         )
-        return output, layers_kv_fused, []
+        return output, layers_kv_fused, True, []
 
     def load_weights(self, model_config: ModelConfig):
         from jax.sharding import NamedSharding
