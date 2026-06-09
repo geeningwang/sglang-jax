@@ -114,6 +114,7 @@ class MiMoV2ModelNextN(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
