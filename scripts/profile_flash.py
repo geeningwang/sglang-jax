@@ -122,6 +122,10 @@ async def main():
                     help="1=user events only, 2=+XLA ops, 3=+low-level TPU ops")
     ap.add_argument("--profile-start-delay", type=float, default=3.0,
                     help="Seconds to wait after burst starts before calling /start_profile")
+    ap.add_argument("--profile-duration", type=float, default=30.0,
+                    help="Seconds to hold the profiler open (stop_profile called after this). "
+                         "Keeps trace buffer bounded: 30s / 21ms per step ≈ 1400 steps. "
+                         "Burst continues running after stop_profile.")
     args = ap.parse_args()
 
     server = args.server
@@ -144,47 +148,57 @@ async def main():
         "host_tracer_level": args.host_tracer_level,
     }
 
-    async def _run_burst_then_signal():
+    async def _run_burst():
         wall, out_tok = await _batch(server, args.burst_conc, 512, 256, args.burst_n)
         return wall, out_tok
 
-    async def _start_profile_delayed():
+    async def _profile_window():
+        """Start profile, hold for profile_duration seconds, then stop.
+
+        The profiler accumulates trace events in host RAM for all XLA ops across
+        8 TPU chips. Leaving it open for a full burst (64 req × 256 tok) OOM kills
+        the server. Bounding to profile_duration (default 30s) limits the buffer:
+          30s / 21ms per step ≈ 1,400 decode steps — ample for analysis.
+        """
         print(f"  Waiting {args.profile_start_delay}s for requests to be in-flight...")
         await asyncio.sleep(args.profile_start_delay)
+
         print(f"\n{'='*70}")
         print(f"Phase 3: Starting JAX profiler trace")
         print(f"  output_dir = {args.trace_dir}")
         print(f"  host_tracer_level = {args.host_tracer_level}")
+        print(f"  profile window = {args.profile_duration}s")
         print(f"{'='*70}")
         status, text = await _post_profile(server, "start_profile", profile_body)
         if status not in (200, 201):
             print(f"  ERROR starting profile: HTTP {status}  {text[:200]}")
             return False
         print(f"  Profile started (HTTP {status}): {text[:120]}")
-        return True
 
-    t_burst_start = time.perf_counter()
-    burst_task = asyncio.create_task(_run_burst_then_signal())
-    profile_ok = await _start_profile_delayed()
+        # Hold the profiling window, then stop — don't wait for burst to finish.
+        await asyncio.sleep(args.profile_duration)
 
-    # Wait for burst to finish
-    wall, out_tok = await burst_task
-    tok_s = out_tok / wall
-    print(f"\n  Burst complete — {tok_s:.1f} tok/s  (wall={wall:.1f}s, out={out_tok} tok)")
-
-    # ── Phase 4: Stop profile ────────────────────────────────────────────────
-    if profile_ok:
-        elapsed = time.perf_counter() - t_burst_start
         print(f"\n{'='*70}")
-        print(f"Phase 4: Stopping profile  (trace elapsed={elapsed:.1f}s)")
+        print(f"Phase 4: Stopping profile  (window={args.profile_duration}s complete)")
         print(f"{'='*70}")
         status, text = await _post_profile(server, "stop_profile")
         if status not in (200, 201):
             print(f"  WARNING: stop_profile returned HTTP {status}: {text[:200]}")
         else:
             print(f"  Profile stopped (HTTP {status})")
-    else:
-        print("\nSkipping stop_profile (start_profile failed)")
+        return True
+
+    t_burst_start = time.perf_counter()
+    burst_task = asyncio.create_task(_run_burst())
+    profile_ok = await _profile_window()
+
+    # Wait for burst to drain (requests continue after stop_profile — trace is already flushed)
+    wall, out_tok = await burst_task
+    tok_s = out_tok / wall
+    print(f"\n  Burst complete — {tok_s:.1f} tok/s  (wall={wall:.1f}s, out={out_tok} tok)")
+
+    if not profile_ok:
+        print("\nWARNING: profile start failed — trace may be missing")
 
     print(f"\n{'='*70}")
     print("Trace output directory:")

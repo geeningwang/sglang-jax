@@ -168,6 +168,7 @@ spec:
             --burst-n 64 \
             --burst-conc 8 \
             --host-tracer-level 2 \
+            --profile-duration 30 \
             2>&1 | tee -a ${LOG}
 
           echo "" | tee -a ${LOG}
