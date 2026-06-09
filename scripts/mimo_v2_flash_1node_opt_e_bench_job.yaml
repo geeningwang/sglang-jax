@@ -143,6 +143,7 @@ spec:
             --speculative-draft-model-path /mnt/gcs/mimo-v2-flash-hf-weights \
             --speculative-num-steps 4 \
             --speculative-eagle-topk 5 \
+            --disable-overlap-schedule \
             --host 0.0.0.0 \
             --port 8080 \
             --nnodes 1 \
