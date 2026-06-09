@@ -1,0 +1,191 @@
+# MiMo-V2-Flash 1-node profiling job on GKE TPU v7x
+#
+# Purpose: collect a JAX XPlane trace of steady-state decode at conc=8.
+#   The trace reveals where the 21% overhead above theoretical HBM bandwidth goes:
+#   host stall gaps, MoE routing time, allreduce overhead, or non-matmul compute.
+#   Results inform which Opt A / Opt C levers are worth implementing.
+#
+# Configuration: identical to mimo_v2_flash_1node_baseline_job.yaml
+#   tp-size=8, 1 node (jingnw-dws-tpu7-4ch, 2x2x1, cloud-platform scope)
+#   Restores from: gs://.../sglang-checkpoint/e0e89a7d/tp8_bfloat16/  (~7 min)
+#   Profile output: gs://.../perf-results/flash-1node-tp8-baseline/trace/
+#
+# Runtime: ~20-25 min total (7 min startup + warmup + profile burst + cleanup)
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-1node-profile
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "7200"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-1node-profile-template
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-1node-profile-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-1node-profile
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-1node-profile
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-1node-profile
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-1node-profile
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          TRACE_DIR="${BUCKET}/perf-results/flash-1node-tp8-baseline/trace"
+          LOG="/tmp/profile_run.txt"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "$(ts) === Installing sglang-jax ===" | tee -a ${LOG}
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          echo "$(ts) === Mounting GCS bucket via gcsfuse ===" | tee -a ${LOG}
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          mount -o remount,size=400g /dev/shm
+          mkdir -p /mnt/gcs /dev/shm/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=400000 \
+            --cache-dir=/dev/shm/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          echo "$(ts) GCS mounted" | tee -a ${LOG}
+
+          T_START=$(date +%s)
+          echo "$(ts) === Launching server (tp=8, Orbax restore) ===" | tee -a ${LOG}
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/gcs/mimo-v2-flash-hf-weights \
+            --trust-remote-code \
+            --tp-size 8 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 16 \
+            --chunked-prefill-size 2048 \
+            --max-running-requests 32 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            --nnodes 1 \
+            --node-rank 0 \
+            >> ${LOG} 2>&1 &
+          SERVER_PID=$!
+
+          echo "$(ts) Waiting for /health (PID=${SERVER_PID}) ..." | tee -a ${LOG}
+          for i in $(seq 1 1440); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              T_HEALTHY=$(date +%s)
+              echo "$(ts) Server healthy after $((T_HEALTHY - T_START))s" | tee -a ${LOG}
+              break
+            fi
+            if ! kill -0 ${SERVER_PID} 2>/dev/null; then
+              echo "$(ts) ERROR: server died" | tee -a ${LOG}
+              tail -30 ${LOG}
+              exit 1
+            fi
+            [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting ($((i*5))s)" | tee -a ${LOG}
+            sleep 5
+          done
+
+          echo "" | tee -a ${LOG}
+          echo "$(ts) === Running profiling driver ===" | tee -a ${LOG}
+          echo "  Trace dir: ${TRACE_DIR}" | tee -a ${LOG}
+          python3 /workspace/scripts/profile_flash.py \
+            --server http://localhost:8080 \
+            --trace-dir ${TRACE_DIR} \
+            --warmup-n 8 \
+            --burst-n 64 \
+            --burst-conc 8 \
+            --host-tracer-level 2 \
+            2>&1 | tee -a ${LOG}
+
+          echo "" | tee -a ${LOG}
+          echo "$(ts) === Uploading run log ===" | tee -a ${LOG}
+          gsutil cp ${LOG} ${TRACE_DIR}/profile_run.txt
+          echo "$(ts) Log uploaded: ${TRACE_DIR}/profile_run.txt" | tee -a ${LOG}
+          echo "$(ts) === Profiling job complete ===" | tee -a ${LOG}
+
+          kill ${SERVER_PID} 2>/dev/null || true
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
