@@ -490,7 +490,7 @@ class JAXModelLoader(DefaultModelLoader):
             if os.environ.get("SGLANG_HBM_ATTRIBUTE"):
                 from sgl_jax.tools.hbm.attribution import live_snapshot, print_top
                 print_top(live_snapshot(), label="after load_weights", top_n=30)
-            if checkpoint_path:
+            if checkpoint_path and not getattr(model_config, "is_draft_model", False):
                 try:
                     self._save_checkpoint(model, checkpoint_path)
                 except Exception as e:
