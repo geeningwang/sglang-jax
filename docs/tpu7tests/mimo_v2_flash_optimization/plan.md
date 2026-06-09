@@ -48,14 +48,44 @@ because they don't reduce weight reads; they only reduce intermediates.
 
 ## sglang-jax Baseline (TPU v7x)
 
-From the 1-node demo (`jingnw-dws-tpu7-4ch`, tp=8, gcsfuse, bf16):
+**Measured**: 2026-06-08, `jingnw-dws-tpu7-4ch`, tp=8, bf16, max-running-requests=32
+**Full results**: [`baseline/results.md`](baseline/results.md)
+**GCS**: `gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-baseline/flash_baseline_20260608T100546Z.json`
+
+### Concurrency sweep (input=512, output=256)
+
+| conc | tok/s | TPOT (ms) | e2e p50 | vs c=1 |
+|------|------:|----------:|--------:|-------:|
+| 1    |  111  |       9.0 |  2.35 s |  1.00× |
+| 2    |  183  |      10.9 |  2.79 s |  1.65× |
+| 4    |  262  |      15.3 |  3.90 s |  2.36× |
+| **8** | **371** | **21.6** | **5.50 s** | **3.34×** |
+| 16   |  372  |      39.3 | 11.11 s |  3.35× |
+| 32   |  370  |      75.5 | 21.96 s |  3.34× |
+
+**Plateau at conc=8** — throughput saturates at ~371 tok/s regardless of concurrency beyond 8.
+
+### Prefill / TTFT (output=1, conc=1)
+
+| input | TTFT p50 | prefill tok/s |
+|------:|---------:|--------------:|
+|   128 |   52 ms  |         2,462 |
+|   512 |   56 ms  |         9,143 |
+| 1,024 |  109 ms  |         9,395 |
+| 4,096 |  190 ms  |        21,558 |
+
+### Key summary
 
 | Metric | Value |
 |--------|-------|
-| Decode throughput | ~113–118 tok/s sustained |
-| Weight loading (gcsfuse cold) | ~9.5 min (MoE only) |
-| Checkpoint restore | ~60s |
-| Server startup (restore + compile) | ~7 min |
+| Peak decode throughput | **~372–433 tok/s** (conc=8+, short outputs) |
+| Optimal concurrency | **8** (HBM bandwidth ceiling) |
+| conc=1 decode | **111 tok/s**, TPOT=9.0 ms |
+| TTFT @ 512 tok | **56 ms** |
+| TTFT @ 4096 tok | **190 ms** |
+| Startup (Orbax restore) | ~7 min |
+
+The throughput plateau at conc=8 **confirms weight-bandwidth-bound decode**, consistent with Maxtext opt4 findings. Adding requests beyond 8 only increases latency, not throughput. This makes **Opt A (FP8 weight quantization)** the clear highest-priority next step.
 
 The sglang-jax implementation uses a different serving stack than Maxtext
 (JAX-based SGLang engine vs Maxtext's MaxEngine), so Maxtext opt numbers
