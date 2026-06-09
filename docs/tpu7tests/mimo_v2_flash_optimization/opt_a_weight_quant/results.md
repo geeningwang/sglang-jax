@@ -1,7 +1,7 @@
 # Opt A — FP8 / Int8 Weight Quantization: Analysis Results
 
 **Date**: 2026-06-09
-**Status**: A1 (expert quant) closed — already FP8. A2 (attention FP8) is next active work.
+**Status**: A1 (expert quant) closed — already FP8. A2 (attention FP8) closed — <0.3% gain, not worth implementing.
 
 ---
 
@@ -46,14 +46,35 @@ Verdict: W8A8 is low priority for decode (bandwidth-bound, not compute-bound).
 May help prefill at very long contexts (compute-bound at T=4096), but TTFT is already
 fast (190ms at 4K tokens). Deprioritized.
 
-### A2 — Attention FP8 (skip dequantization at load time)
+### A2 — Attention FP8 (skip dequantization at load time) ✅ CLOSED — <0.3% gain
 
-Attention weights (Q/K/V/O across 48 layers) are currently loaded in BF16 after
-dequantization. Keeping them in FP8 would save:
-- 48 layers × 4 proj × 4096^2 × 1B vs 2B ≈ 1.6 GB vs 3.2 GB = 1.6 GB saved per step
-- Fraction of total weight bandwidth: 1.6/38 = ~4% savings
+**Corrected analysis (2026-06-09)**:
 
-Verdict: ~4-5% throughput gain on decode. Limited upside. Deprioritized pending Opt C.
+The original estimate ("4-5% gain from 48 layers × 4 proj × 4096² savings") was wrong by ~20×.
+Three compounding errors:
+
+1. **o_proj already FP8**: Not dequantized in `load_weights()`. Only q/k/v are BF16 targets.
+2. **TP=8 sharding**: Both input (4096→512 per TC) and output heads are sharded.
+3. **GQA: 1 global SWA KV head**: Flash uses aggressive GQA — from the SWA eviction doc,
+   each device has 1 KV head (head_dim=192+128=320) at TP=16. K/V projections are tiny.
+
+**Corrected bandwidth math** (per TC per step):
+
+| Weights | Size per TC |
+|---------|-------------|
+| MoE FP8 (47 layers × 3 proj × 32 experts) | ~18.9 GB |
+| SWA attn q/k/v BF16 (39 layers) | ~43 MB |
+| Full attn q/k/v BF16 (9 layers) | ~10 MB |
+| **Attention total** | **~53 MB** |
+
+Opt A2 savings (BF16 → FP8): ~27 MB = **0.14% of MoE bandwidth**.
+
+Even doubling q_head assumptions gives <0.3%.
+
+**Verdict**: Not worth implementing. Requires full checkpoint rebuild (24-min slow-path run)
+or post-load re-quantization (loses original FP8 scales), for <0.3% TPOT improvement.
+
+**Status**: Closed. No implementation needed.
 
 ---
 
@@ -79,28 +100,16 @@ to capture a bounded trace via gRPC, bypassing the sglang-jax HTTP handler.
 
 ---
 
-## Decision: Pivot to Opt A2
+## Decision: Close Opt A2; Pivot to Opt E
 
-Opt C was fully investigated (code analysis + benchmark). Result: 0% gain —
-F=3.9ms is fixed TPU compute, not removable host overhead. See
-`../opt_c_host_sync/results.md`.
+Both A1 and A2 are closed:
+- A1: Expert weights already FP8.
+- A2: Attention FP8 gives <0.3% gain — not worth checkpoint rebuild.
 
-**Opt A2 is now the active next step.** Goal: keep attention weights in FP8 at
-load time instead of dequantizing to BF16, saving ~1.6 GB/step bandwidth.
+Opt C is also closed (0% measured gain; XLA dependency serializes steps regardless).
 
-### Opt A2 implementation plan
-
-Files to modify:
-- `python/sgl_jax/srt/model_loader/loader.py` — find and skip the BF16 dequantize
-  step for attention Q/K/V/O weights. Currently called via `dequant_fused_kv()` or
-  equivalent in the Flash model's `load_weights`.
-- `python/sgl_jax/srt/models/mimo_v2_flash.py` — verify `self_attn` forward accepts
-  FP8 weight dtype. The `q_proj / k_proj / v_proj / o_proj` matmuls may need a
-  cast before the `dot_general`, or the flash-attention kernel may already handle it.
-- `python/sgl_jax/srt/layers/attention/flashattention_backend.py` — confirm the
-  Pallas kernel input dtype requirements.
-
-Expected gain: ~4-5% TPOT reduction at conc=8 (371 → ~388-390 tok/s).
+**Next active optimization: Opt E (speculative decoding)**. Potential: ~2-3× per-sequence
+latency reduction. See `../plan.md` for full priority table.
 
 ---
 

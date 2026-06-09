@@ -101,37 +101,22 @@ Ordered by expected decode throughput gain and implementation difficulty.
 
 ### Opt A — FP8 / Int8 weight quantization
 
-**Priority: Highest** → **Revised: Opt A2 is next active work (see below)**
+**Priority: CLOSED** — both A1 and A2 investigated and closed.
 
-> **Finding (2026-06-09)**: MoE expert weights are already FP8 in HBM — the loader
-> does NOT dequantize them. The original plan assumption was wrong. See
-> [`opt_a_weight_quant/results.md`](opt_a_weight_quant/results.md) for full details.
->
-> The remaining lever is **Opt A2: keep attention weights in FP8** instead of
-> dequantizing at load time. Attention weights (Q/K/V/O across 48 layers) are
-> currently loaded as BF16 (~3.2 GB/step per TC). Keeping them FP8 saves ~1.6 GB/step
-> (~4-5% decode bandwidth reduction). This is now the highest-priority next step.
+> **Finding (2026-06-09)**: MoE expert weights are already FP8 in HBM — no action needed.
+> See [`opt_a_weight_quant/results.md`](opt_a_weight_quant/results.md).
 
-**Opt A1 (W8A8 activation quant for MoE)**: Deprioritized. MoE decode is
-bandwidth-bound, not compute-bound. Quantizing the tiny activation tensors
-(8 tokens × 4096 × 2B ≈ 3 MB) against 36 GB of weight reads is negligible.
+**Opt A1 (W8A8 activation quant for MoE)**: Closed. MoE decode is bandwidth-bound,
+not compute-bound. Activations (8 tokens × 4096 × 2B ≈ 3 MB) are negligible vs 36 GB weights.
 
-**Opt A2 (attention FP8 at load time)**: Active next step.
-- Attention weights: 48 layers × 4 proj × 4096² × 2B (BF16) = 3.2 GB/step per TC
-- With FP8: 1.6 GB/step per TC — saves 1.6 GB/step
-- Fraction of total weight bandwidth (~38 GB/step): ~4%
-- **Expected gain**: ~4-5% TPOT reduction at conc=8
+**Opt A2 (attention FP8 at load time)**: Closed after corrected analysis. Initial estimate of
+4-5% was wrong by ~20× due to three errors:
+1. Assumed 4096×4096 full-square projections — ignores TP=8 sharding (divides both dims by 8)
+2. Missed o_proj already being FP8 (not dequantized in `load_weights`)
+3. Missed Flash's aggressive GQA — 1 global SWA KV head means k_proj/v_proj are tiny
 
-**Steps for Opt A2**:
-1. In `loader.py`, identify where attention weights are dequantized from FP8 → BF16.
-   Check `dequant_fused_kv()` and any BF16 cast in `load_weights`.
-2. Modify to keep Q/K/V/O in FP8 in HBM. Ensure the attention kernel handles FP8 input.
-3. Check `flashattention_backend.py` — verify the Pallas flash-attention kernel
-   accepts FP8 weight dtype or needs a cast inserted before the matmul.
-4. Benchmark at conc=8. Quality gate: spot-check reasoning outputs.
-
-**Risk**: Medium — flash attention kernel may not accept FP8 weights directly;
-may need a per-layer cast or kernel modification.
+Corrected math: attention q/k/v BF16 ≈ 53 MB/step per TC vs 18.9 GB MoE → **0.14-0.28% gain**.
+Not worth checkpoint rebuild. See `opt_a_weight_quant/results.md` for full analysis.
 
 ---
 
@@ -256,17 +241,17 @@ optimal for all workloads.
 
 | Opt | Description | Status | Gain |
 |-----|-------------|--------|------|
-| A (expert FP8) | MoE expert weights already FP8 — no action | ✅ Closed | 0% (already done) |
-| **A2 (attention FP8)** | Keep attention weights FP8 at load time | **⏳ Next** | **~4-5% expected** |
+| A1 (expert FP8) | MoE expert weights already FP8 — no action | ✅ Closed | 0% (already done) |
+| A2 (attention FP8) | <0.3% gain after corrected math — not worth impl. | ✅ Closed | <0.3% |
 | B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
 | D (sparse prefill) | Not yet investigated | 🔲 Backlog | ~30-50% TTFT |
-| E (speculative) | Not yet investigated | 🔲 Backlog | ~2-3× per-seq latency |
+| **E (speculative)** | **Not yet investigated** | **⏳ Next** | **~2-3× per-seq latency** |
 | F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
 
 **Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
-**Current**: 371 tok/s (no improvement yet — Opt A and C closed with 0% gain)
-**Next target**: ~388-390 tok/s (+4-5%) from Opt A2
+**Current**: 371 tok/s (no improvement yet — all analyzed opts closed with 0% or negligible gain)
+**Next**: Opt E (speculative decoding) — orthogonal to throughput, targets per-seq latency
 
 ## Tracking
 
