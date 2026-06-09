@@ -135,7 +135,7 @@ spec:
             --tp-size 8 \
             --device tpu \
             --dtype bfloat16 \
-            --mem-fraction-static 0.75 \
+            --mem-fraction-static 0.65 \
             --page-size 16 \
             --chunked-prefill-size 2048 \
             --max-running-requests 32 \
