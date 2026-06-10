@@ -398,6 +398,11 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info.topk_index,
             model_worker_batch.spec_info.hidden_states,
         )
+        # Normalize to (None, None) sharding so hidden_in matches embed_tokens output inside
+        # MiMoV2ModelNextN. During precompile spec_info.hidden_states is jnp.ones on a single
+        # device; during serving it comes from capture_for_decode which already calls
+        # replicate_to_mesh. Both paths must produce (None, None) before entering the model.
+        hidden_states = replicate_to_mesh(self.mesh, hidden_states)
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
