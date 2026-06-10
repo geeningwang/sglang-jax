@@ -561,7 +561,7 @@ def topk_probs_from_logits(
     return _topk_probs_from_logits_jit(logits, topk, axis)
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk", "axis"])
 def _topk_probs_from_logits_jit(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:
