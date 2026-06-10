@@ -1502,7 +1502,15 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
-                bq_sz = min(MAX_BQ_SZ, max_q // 2)
+                # For small max_num_tokens (e.g. EAGLE draft multi-step with topk
+                # tokens per sequence), set bq_sz = max_num_tokens so all tokens
+                # fit in one BQ block (num_bq=1). This avoids double-buffering
+                # edge cases in the BQ loop when BKV iterations per BQ are few
+                # (e.g. with sliding_window).
+                if 0 < max_num_tokens <= MAX_BQ_SZ:
+                    bq_sz = max_num_tokens
+                else:
+                    bq_sz = min(MAX_BQ_SZ, max_q // 2)
                 bkv_sz = min(1024, max_kv)
                 bq_csz = min(MAX_BQ_SZ, min(512 // num_q_heads_per_kv_head, max_q))
                 bkv_csz = min(512, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
@@ -1515,7 +1523,15 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
-                bq_sz = min(MAX_BQ_SZ, max_q // 2)
+                # For small max_num_tokens (e.g. EAGLE draft multi-step with topk
+                # tokens per sequence), set bq_sz = max_num_tokens so all tokens
+                # fit in one BQ block (num_bq=1). This avoids double-buffering
+                # edge cases in the BQ loop when BKV iterations per BQ are few
+                # (e.g. with sliding_window).
+                if 0 < max_num_tokens <= MAX_BQ_SZ:
+                    bq_sz = max_num_tokens
+                else:
+                    bq_sz = min(MAX_BQ_SZ, max_q // 2)
                 bkv_sz = min(2048, max_kv // 2)
                 bq_csz = min(MAX_BQ_SZ, min(1024 // num_q_heads_per_kv_head, max_q))
                 bkv_csz = min(1024, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
@@ -1560,12 +1576,14 @@ def get_default_block_sizes(
     bkv_csz = min(bkv_csz, bkv_sz)
     bq_csz = min(bq_csz, bq_sz)
 
-    # Ensure bq_sz divides max_num_tokens to prevent OOB DMA in the last block.
-    # The kernel issues DMA for full bq_sz-token blocks; if max_num_tokens is not
-    # a multiple of bq_sz, the last block's DMA reads past the end of q_hbm_ref,
-    # leaving a semaphore nonzero on kernel exit (Mosaic FAILED_PRECONDITION).
-    # E.g. topk=5 → 5 tokens, bq_sz=4 → DMA tries q[4:8] from a 5-element array.
-    if bq_sz > 1 and max_num_tokens % bq_sz != 0:
+    # Ensure bq_sz divides max_num_tokens so all BQ blocks are full-sized.
+    # A non-divisible bq_sz can leave the kernel with a partial last BQ block,
+    # which interacts badly with the BQ double-buffering in the kernel loop
+    # and can leave a semaphore nonzero on exit (Mosaic FAILED_PRECONDITION).
+    # Note: for max_num_tokens <= MAX_BQ_SZ the bq_sz=max_num_tokens assignment
+    # above already guarantees divisibility; this guard is a safety net for the
+    # large-token case where the heuristic formula may not divide evenly.
+    if bq_sz > 1 and max_num_tokens > 0 and max_num_tokens % bq_sz != 0:
         while bq_sz > 1 and max_num_tokens % bq_sz != 0:
             bq_sz //= 2
         bq_csz = min(bq_csz, bq_sz)
