@@ -556,10 +556,7 @@ def _ragged_paged_attention_kernel_loop(
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
         kv_len = kv_lens_ref[seq_idx]
-        mask_len = kv_len
         mask_start = bkvmask_idx * bkv_sz
-        mask_left = mask_len - mask_start
-        load_kvmask_sz = jnp.minimum(bkv_sz, mask_left)
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
@@ -570,25 +567,18 @@ def _ragged_paged_attention_kernel_loop(
 
         def loop_body(i, _):
             start = cur_bq_mask_start + i * kv_len + mask_start
+            # bkv_sz is a Python int (compile-time constant), so Mosaic can
+            # prove divisibility by 8. The custom_mask HBM array is padded with
+            # 2048 zero rows, so reading a full bkv_sz block is always in-bounds.
+            # Rows beyond kv_len correspond to zero KV entries and don't affect
+            # the attention output regardless of their mask value.
             _async_copy(
-                custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(0, load_kvmask_sz)],
-                sem,
-                wait,
-            )
-            _async_copy(
-                zero_mask_ref.at[pl.ds(0, bkv_sz - load_kvmask_sz)],
-                kvmask_vmem_ref.at[i, pl.ds(load_kvmask_sz, bkv_sz - load_kvmask_sz)],
+                custom_mask_ref.at[pl.ds(start, bkv_sz)],
+                kvmask_vmem_ref.at[i],
                 sem,
                 wait,
             )
 
-        # Use unroll=False so XLA emits a while_loop. When load_q_sz evaluates
-        # to 0 at compile time (e.g. TARGET_VERIFY MIXED which has 0 sequences),
-        # XLA eliminates the loop body entirely — no DMA is emitted and Mosaic
-        # cannot see the dynamic load_kvmask_sz slice. For EAGLE draft decode the
-        # MIXED kernel is compiled with custom_mask=None so _fetch_mask returns
-        # early; the fori_loop is never reached.
         lax.fori_loop(0, load_q_sz, loop_body, None, unroll=False)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
@@ -1795,6 +1785,11 @@ def ragged_paged_attention(
         if custom_mask.dtype == jnp.bool_:
             custom_mask = custom_mask.astype(jnp.int32)
         custom_mask = jnp.repeat(jnp.expand_dims(custom_mask, axis=1), repeats=head_dim, axis=1)
+        # Pad with 2048 zero rows so _fetch_mask can always DMA a full bkv_sz
+        # block (≤ 2048 for all supported configs) without going out of bounds.
+        # Rows beyond kv_len correspond to zero KV entries, so any mask value
+        # loaded for those rows does not affect the attention output.
+        custom_mask = jnp.pad(custom_mask, ((0, 2048), (0, 0)))
 
         # Prepare cu_seq_mask_lens for custom mask.
         q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
