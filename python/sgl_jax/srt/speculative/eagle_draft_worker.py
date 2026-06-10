@@ -191,12 +191,12 @@ class EagleDraftWorker(BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> None:
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
-        # Reshard hidden_states to ('data', None) to match the sharding produced by
-        # the draft model's embed_tokens lookup. With data=1 this is a no-op physically
-        # (same layout), but JAX 0.9 requires matching logical specs for jnp.concatenate.
-        # Must happen outside JIT — jax.sharding.reshard inside JIT causes XLA crashes.
+        # Annotate hidden_states with ('data', None) sharding to match embed_tokens output
+        # inside the draft model. With data=1 this is physically a no-op (same layout as
+        # fully-replicated), but JAX 0.9 requires matching logical specs for jnp.concatenate.
+        # Use device_put (not reshard — reshard needs jax.set_mesh context in eager mode).
         if self.mesh is not None:
-            hidden_states = jax.sharding.reshard(
+            hidden_states = jax.device_put(
                 hidden_states, NamedSharding(self.mesh, P("data", None))
             )
         model_worker_batch.spec_info = EagleDraftInput(
@@ -245,7 +245,7 @@ class EagleDraftWorker(BaseDraftWorker):
             return
         hs = batch_output.logits_output.hidden_states
         if self.mesh is not None:
-            hs = jax.sharding.reshard(hs, NamedSharding(self.mesh, P("data", None)))
+            hs = jax.device_put(hs, NamedSharding(self.mesh, P("data", None)))
         draft_input = EagleDraftInput(
             hidden_states=hs,
             allocate_lens=batch_output.allocate_lens,
@@ -296,10 +296,9 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        hs = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-        # Reshard to ('data', None) so all decode steps match embed_tokens output sharding.
-        if self.mesh is not None:
-            hs = jax.sharding.reshard(hs, NamedSharding(self.mesh, P("data", None)))
+        hs = jax.device_put(
+            logits_output.hidden_states, NamedSharding(self.mesh, P("data", None))
+        ) if self.mesh is not None else logits_output.hidden_states
         draft_input.hidden_states = hs
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
@@ -445,7 +444,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 break
 
             if self.mesh is not None:
-                hidden_states = jax.sharding.reshard(
+                hidden_states = jax.device_put(
                     hidden_states, NamedSharding(self.mesh, P("data", None))
                 )
             forward_batch = update_forward_batch_info(
@@ -463,11 +462,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-            if self.mesh is not None:
-                hidden_states = jax.sharding.reshard(
-                    hidden_states, NamedSharding(self.mesh, P("data", None))
-                )
+            hidden_states = jax.device_put(
+                logits_output.hidden_states, NamedSharding(self.mesh, P("data", None))
+            ) if self.mesh is not None else logits_output.hidden_states
 
         return score_list, token_list, parents_list
 
