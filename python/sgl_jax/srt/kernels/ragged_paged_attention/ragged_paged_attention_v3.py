@@ -1560,6 +1560,16 @@ def get_default_block_sizes(
     bkv_csz = min(bkv_csz, bkv_sz)
     bq_csz = min(bq_csz, bq_sz)
 
+    # Ensure bq_sz divides max_num_tokens to prevent OOB DMA in the last block.
+    # The kernel issues DMA for full bq_sz-token blocks; if max_num_tokens is not
+    # a multiple of bq_sz, the last block's DMA reads past the end of q_hbm_ref,
+    # leaving a semaphore nonzero on kernel exit (Mosaic FAILED_PRECONDITION).
+    # E.g. topk=5 → 5 tokens, bq_sz=4 → DMA tries q[4:8] from a 5-element array.
+    if bq_sz > 1 and max_num_tokens % bq_sz != 0:
+        while bq_sz > 1 and max_num_tokens % bq_sz != 0:
+            bq_sz //= 2
+        bq_csz = min(bq_csz, bq_sz)
+
     # Ensure bkv_sz is evenly divisible by bkv_csz. If not, fall back to
     # bkv_csz = bkv_sz (disabling the nested attention loop for this config).
     if bkv_csz > 0 and bkv_sz % bkv_csz != 0:
