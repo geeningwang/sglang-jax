@@ -568,19 +568,7 @@ def _ragged_paged_attention_kernel_loop(
         cur_seq_mask_start = cu_seq_mask_lens[seq_idx]
         cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
 
-        # Use a plain Python for-loop (not lax.fori_loop) so that each
-        # iteration is traced independently at Python level with no loop
-        # primitive in the XLA output.  lax.fori_loop — even with unroll=True —
-        # generates a loop annotation that causes Mosaic to apply strict
-        # tile-divisibility checks on the DMA slice size (load_kvmask_sz),
-        # which can be dynamic (e.g. last BKV block).  With a flat sequence of
-        # independent DMA ops (as produced here), Mosaic applies the same
-        # looser check it uses for a single-iteration DMA, matching the bq_sz=1
-        # behavior that previously compiled without error.
-        # bq_sz is a Python int here (static), so range(bq_sz) is valid.
-        # For EAGLE multi-step decode bq_sz = max_num_tokens = topk, and every
-        # sequence has exactly topk tokens, so load_q_sz == bq_sz always.
-        for i in range(bq_sz):
+        def loop_body(i, _):
             start = cur_bq_mask_start + i * kv_len + mask_start
             _async_copy(
                 custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
@@ -594,6 +582,14 @@ def _ragged_paged_attention_kernel_loop(
                 sem,
                 wait,
             )
+
+        # Use unroll=False so XLA emits a while_loop. When load_q_sz evaluates
+        # to 0 at compile time (e.g. TARGET_VERIFY MIXED which has 0 sequences),
+        # XLA eliminates the loop body entirely — no DMA is emitted and Mosaic
+        # cannot see the dynamic load_kvmask_sz slice. For EAGLE draft decode the
+        # MIXED kernel is compiled with custom_mask=None so _fetch_mask returns
+        # early; the fori_loop is never reached.
+        lax.fori_loop(0, load_q_sz, loop_body, None, unroll=False)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
@@ -1517,7 +1513,13 @@ def get_default_block_sizes(
                 # fit in one BQ block (num_bq=1). This avoids double-buffering
                 # edge cases in the BQ loop when BKV iterations per BQ are few
                 # (e.g. with sliding_window).
-                if 0 < max_num_tokens <= MAX_BQ_SZ:
+                # Limit to page_size: the custom-mask VMEM buffer scales as
+                # 2 * bq_sz * bkv_sz * head_dim * 4 bytes; large bq_sz (e.g. from
+                # TARGET_VERIFY with speculative_num_draft_tokens = K*topk >> topk)
+                # can exceed VMEM, causing Mosaic compile failures.
+                # page_size is always a safe upper bound since topk ≤ page_size
+                # for typical speculative decoding configurations.
+                if 0 < max_num_tokens <= page_size:
                     bq_sz = max_num_tokens
                 else:
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
@@ -1538,7 +1540,11 @@ def get_default_block_sizes(
                 # fit in one BQ block (num_bq=1). This avoids double-buffering
                 # edge cases in the BQ loop when BKV iterations per BQ are few
                 # (e.g. with sliding_window).
-                if 0 < max_num_tokens <= MAX_BQ_SZ:
+                # Limit to page_size: the custom-mask VMEM buffer scales as
+                # 2 * bq_sz * bkv_sz * head_dim * 4 bytes; large bq_sz (e.g. from
+                # TARGET_VERIFY with speculative_num_draft_tokens = K*topk >> topk)
+                # can exceed VMEM, causing Mosaic compile failures.
+                if 0 < max_num_tokens <= page_size:
                     bq_sz = max_num_tokens
                 else:
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
@@ -1590,7 +1596,7 @@ def get_default_block_sizes(
     # A non-divisible bq_sz can leave the kernel with a partial last BQ block,
     # which interacts badly with the BQ double-buffering in the kernel loop
     # and can leave a semaphore nonzero on exit (Mosaic FAILED_PRECONDITION).
-    # Note: for max_num_tokens <= MAX_BQ_SZ the bq_sz=max_num_tokens assignment
+    # Note: for max_num_tokens <= page_size the bq_sz=max_num_tokens assignment
     # above already guarantees divisibility; this guard is a safety net for the
     # large-token case where the heuristic formula may not divide evenly.
     if bq_sz > 1 and max_num_tokens > 0 and max_num_tokens % bq_sz != 0:
