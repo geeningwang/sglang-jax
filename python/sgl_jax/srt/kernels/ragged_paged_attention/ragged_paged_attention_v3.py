@@ -568,7 +568,19 @@ def _ragged_paged_attention_kernel_loop(
         cur_seq_mask_start = cu_seq_mask_lens[seq_idx]
         cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
 
-        def loop_body(i, _):
+        # Use a plain Python for-loop (not lax.fori_loop) so that each
+        # iteration is traced independently at Python level with no loop
+        # primitive in the XLA output.  lax.fori_loop — even with unroll=True —
+        # generates a loop annotation that causes Mosaic to apply strict
+        # tile-divisibility checks on the DMA slice size (load_kvmask_sz),
+        # which can be dynamic (e.g. last BKV block).  With a flat sequence of
+        # independent DMA ops (as produced here), Mosaic applies the same
+        # looser check it uses for a single-iteration DMA, matching the bq_sz=1
+        # behavior that previously compiled without error.
+        # bq_sz is a Python int here (static), so range(bq_sz) is valid.
+        # For EAGLE multi-step decode bq_sz = max_num_tokens = topk, and every
+        # sequence has exactly topk tokens, so load_q_sz == bq_sz always.
+        for i in range(bq_sz):
             start = cur_bq_mask_start + i * kv_len + mask_start
             _async_copy(
                 custom_mask_ref.at[pl.ds(start, load_kvmask_sz)],
@@ -582,16 +594,6 @@ def _ragged_paged_attention_kernel_loop(
                 sem,
                 wait,
             )
-
-        # Use bq_sz (Python int, static) as the loop bound instead of the
-        # dynamic load_q_sz.  A dynamic upper bound creates a Mosaic while-loop
-        # whose body requires all DMA slice sizes to be statically tile-divisible
-        # (tile 8 along dim-0).  With a static bound + unroll=True, the loop is
-        # fully unrolled at trace time — no while-loop — so Mosaic applies the
-        # same (looser) divisibility check it uses for single-iteration DMAs.
-        # For EAGLE multi-step decode: bq_sz = max_num_tokens = topk, and every
-        # sequence has exactly topk query tokens, so load_q_sz == bq_sz always.
-        lax.fori_loop(0, bq_sz, loop_body, None, unroll=True)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
