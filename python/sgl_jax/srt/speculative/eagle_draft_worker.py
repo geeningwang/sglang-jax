@@ -608,8 +608,11 @@ def select_top_k_tokens(
     if i == 0:
         return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
     else:
+        # Capture sharding before JIT — not available on traced arrays inside JIT.
+        hs_sharding = getattr(hidden_states, "sharding", None)
         return select_top_k_tokens_step_greater_0(
-            jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
+            jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk,
+            hs_out_sharding=hs_sharding,
         )
 
 
@@ -635,7 +638,7 @@ def select_top_k_tokens_step_0(
     return input_ids, hidden_states, scores, tree_info
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk", "hs_out_sharding"])
 def select_top_k_tokens_step_greater_0(
     i: jax.Array,
     topk_p: jax.Array,
@@ -643,6 +646,7 @@ def select_top_k_tokens_step_greater_0(
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
+    hs_out_sharding=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
     topk_cs_p, topk_cs_index = fast_topk(
@@ -655,11 +659,10 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        # In JAX 0.9 Explicit mesh mode, gather output sharding is ambiguous when
-        # index and table have mismatched specs. Providing out_sharding explicitly
-        # avoids silent XLA crashes (FAILED_PRECONDITION).
+        # In JAX 0.9 Explicit mesh, gather output sharding is ambiguous — provide
+        # it explicitly. hs_out_sharding is captured before JIT (concrete array).
         hidden_states = hidden_states.at[selected_input_index, :].get(
-            out_sharding=hidden_states.sharding
+            out_sharding=hs_out_sharding
         )
     tree_info = (
         expand_scores,
