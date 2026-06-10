@@ -655,7 +655,12 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = hidden_states[selected_input_index, :]
+        # In JAX 0.9 Explicit mesh mode, gather output sharding is ambiguous when
+        # index and table have mismatched specs. Providing out_sharding explicitly
+        # avoids silent XLA crashes (FAILED_PRECONDITION).
+        hidden_states = hidden_states.at[selected_input_index, :].get(
+            out_sharding=hidden_states.sharding
+        )
     tree_info = (
         expand_scores,
         topk_index,
