@@ -16,6 +16,9 @@ from flax import nnx
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
+
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -145,7 +148,13 @@ class MiMoV2ModelNextN(nnx.Module):
     def __call__(
         self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache
     ) -> tuple[jax.Array, list[jax.Array]]:
-        embed = self.embed_tokens(forward_batch.input_ids)
+        # Use (None, None) output sharding so embed matches hidden_in's (None, None)
+        # sharding from the target model's TP allreduce. JAX 0.9 Explicit mesh requires
+        # matching shardings for jnp.concatenate; Embed defaults to ('data', None).
+        embed_out_sharding = (
+            NamedSharding(self.mesh, P(None, None)) if self.mesh is not None else None
+        )
+        embed = self.embed_tokens(forward_batch.input_ids, out_sharding=embed_out_sharding)
         hidden_in = forward_batch.spec_info.hidden_states
         hidden_states, _ = self.eh_proj(
             jnp.concatenate((self.enorm(embed), self.hnorm(hidden_in)), axis=-1)

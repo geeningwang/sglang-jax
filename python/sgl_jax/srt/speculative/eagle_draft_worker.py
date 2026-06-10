@@ -191,14 +191,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> None:
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
-        # Annotate hidden_states with ('data', None) sharding to match embed_tokens output
-        # inside the draft model. With data=1 this is physically a no-op (same layout as
-        # fully-replicated), but JAX 0.9 requires matching logical specs for jnp.concatenate.
-        # Use device_put (not reshard — reshard needs jax.set_mesh context in eager mode).
-        if self.mesh is not None:
-            hidden_states = jax.device_put(
-                hidden_states, NamedSharding(self.mesh, P("data", None))
-            )
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -243,11 +235,8 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
-        hs = batch_output.logits_output.hidden_states
-        if self.mesh is not None:
-            hs = jax.device_put(hs, NamedSharding(self.mesh, P("data", None)))
         draft_input = EagleDraftInput(
-            hidden_states=hs,
+            hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.allocate_lens,
         )
         model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
@@ -296,10 +285,7 @@ class EagleDraftWorker(BaseDraftWorker):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        hs = jax.device_put(
-            logits_output.hidden_states, NamedSharding(self.mesh, P("data", None))
-        ) if self.mesh is not None else logits_output.hidden_states
-        draft_input.hidden_states = hs
+        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
         _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
@@ -443,10 +429,6 @@ class EagleDraftWorker(BaseDraftWorker):
             if i == self.speculative_num_steps - 1:
                 break
 
-            if self.mesh is not None:
-                hidden_states = jax.device_put(
-                    hidden_states, NamedSharding(self.mesh, P("data", None))
-                )
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
@@ -462,9 +444,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = jax.device_put(
-                logits_output.hidden_states, NamedSharding(self.mesh, P("data", None))
-            ) if self.mesh is not None else logits_output.hidden_states
+            hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
         return score_list, token_list, parents_list
 

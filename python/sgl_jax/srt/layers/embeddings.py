@@ -84,11 +84,17 @@ class Embed(nnx.Module):
         self.mesh = mesh
 
     @named_scope
-    def __call__(self, inputs: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        inputs: jax.Array,
+        out_sharding: NamedSharding | None = None,
+    ) -> jax.Array:
         """Embeds the inputs along the last dimension.
 
         Args:
           inputs: input data, all dimensions are considered batch dimensions.
+          out_sharding: optional sharding override for the gather output.
+            When None (default), uses P("data", ..., kernel_axes[-1]).
 
         Returns:
           Output which is embedded input data.  The output shape follows the input,
@@ -102,9 +108,10 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
 
-        output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
-        output_sharding = NamedSharding(self.mesh, output_pspec)
-        output = embedding.at[inputs].get(out_sharding=output_sharding)
+        if out_sharding is None:
+            output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
+            out_sharding = NamedSharding(self.mesh, output_pspec)
+        output = embedding.at[inputs].get(out_sharding=out_sharding)
         return output
 
     def attend(self, query: jax.Array) -> jax.Array:
