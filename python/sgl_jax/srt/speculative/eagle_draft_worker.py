@@ -398,18 +398,31 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info.topk_index,
             model_worker_batch.spec_info.hidden_states,
         )
-        # Normalize to (None, None) sharding so hidden_in matches embed_tokens output inside
-        # MiMoV2ModelNextN. During precompile spec_info.hidden_states is jnp.ones on a single
-        # device; during serving it comes from capture_for_decode which already calls
-        # replicate_to_mesh. Both paths must produce (None, None) before entering the model.
-        hidden_states = replicate_to_mesh(self.mesh, hidden_states)
+        # Normalize ALL loop-level arrays to (None, None) mesh sharding before the JIT'd
+        # helpers (select_top_k_tokens, update_eagle_lists). In JAX 0.9 explicit mesh,
+        # mixing numpy/single-device inputs with mesh-replicated inputs inside a JIT
+        # produces invalid XLA programs that crash silently (deferred FAILED_PRECONDITION).
+        # Sources of single-device arrays:
+        #   hidden_states — jnp.ones during precompile or from capture_for_decode (already
+        #                   replicated after serving, but idempotent to call again)
+        #   topk_p/topk_index — numpy after padding_for_decode np.pad calls
+        #   score_list/token_list/parents_list — jnp.empty lands on default device (dev 0)
+        hidden_states, topk_p, topk_index = replicate_to_mesh(
+            self.mesh, hidden_states, topk_p, topk_index
+        )
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
-        score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list: jax.Array = jnp.empty(
-            (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
+        _replicated = NamedSharding(self.mesh, P())
+        score_list: jax.Array = jax.device_put(
+            jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk)), _replicated
         )
-        parents_list: jax.Array = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        token_list: jax.Array = jax.device_put(
+            jnp.empty((bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32),
+            _replicated,
+        )
+        parents_list: jax.Array = jax.device_put(
+            jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk)), _replicated
+        )
         scores = None
         positions_base = device_array(
             np.repeat(model_worker_batch.seq_lens, self.topk),
