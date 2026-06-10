@@ -583,7 +583,15 @@ def _ragged_paged_attention_kernel_loop(
                 wait,
             )
 
-        lax.fori_loop(0, load_q_sz, loop_body, None, unroll=False)
+        # Use bq_sz (Python int, static) as the loop bound instead of the
+        # dynamic load_q_sz.  A dynamic upper bound creates a Mosaic while-loop
+        # whose body requires all DMA slice sizes to be statically tile-divisible
+        # (tile 8 along dim-0).  With a static bound + unroll=True, the loop is
+        # fully unrolled at trace time — no while-loop — so Mosaic applies the
+        # same (looser) divisibility check it uses for single-iteration DMAs.
+        # For EAGLE multi-step decode: bq_sz = max_num_tokens = topk, and every
+        # sequence has exactly topk query tokens, so load_q_sz == bq_sz always.
+        lax.fori_loop(0, bq_sz, loop_body, None, unroll=True)
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
