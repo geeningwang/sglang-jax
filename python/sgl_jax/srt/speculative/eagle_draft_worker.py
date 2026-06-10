@@ -191,6 +191,11 @@ class EagleDraftWorker(BaseDraftWorker):
         next_token_ids: jax.Array,
     ) -> None:
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
+        # Normalize to (None, None) sharding (fully replicated) so hidden_in matches
+        # embed_tokens output sharding inside the draft model. The target model outputs
+        # ('data', None) hidden states; draft_forward decode steps use replicate_to_mesh
+        # which already produces (None, None). Align prefill path to the same convention.
+        hidden_states = replicate_to_mesh(self.mesh, hidden_states)
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
@@ -236,7 +241,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
         draft_input = EagleDraftInput(
-            hidden_states=batch_output.logits_output.hidden_states,
+            hidden_states=replicate_to_mesh(self.mesh, batch_output.logits_output.hidden_states),
             allocate_lens=batch_output.allocate_lens,
         )
         model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
