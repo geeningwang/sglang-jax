@@ -1,7 +1,7 @@
 # Opt E — Speculative Decoding (Flash MTP): Implementation & Results
 
-**Date**: 2026-06-09
-**Status**: Implementation complete — not yet benchmarked
+**Date**: 2026-06-09 – 2026-06-10
+**Status**: Benchmark job submitted (commit `cd041a6`) — awaiting TPU provisioning
 
 ---
 
@@ -49,7 +49,7 @@ o_proj and eh_proj are BF16 (no scale_inv).
 
 ---
 
-## Implementation
+## Implementation (2026-06-09)
 
 Four files modified:
 
@@ -79,31 +79,93 @@ Added `MiMoV2FlashMTPForCausalLM` class. Key points:
 
 ---
 
-## Launch Command
+## Bugs Fixed During Integration (2026-06-09 – 2026-06-10)
 
-```bash
-python3 -m sgl_jax.launch_server \
-  --model-path /mnt/gcs/mimo-v2-flash-hf-weights \
-  --trust-remote-code \
-  --tp-size 8 \
-  --device tpu \
-  --dtype bfloat16 \
-  --mem-fraction-static 0.75 \
-  --page-size 16 \
-  --chunked-prefill-size 2048 \
-  --max-running-requests 32 \
-  --speculative-algorithm EAGLE \
-  --speculative-draft-model-path /mnt/gcs/mimo-v2-flash-hf-weights \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 4 \
-  --host 0.0.0.0 --port 8080 --nnodes 1 --node-rank 0
+Getting SPEC_EXTEND and SPEC_DECODE precompile to pass required fixing several
+bugs across the paged attention kernel and EAGLE worker:
+
+| Bug | Symptom | Fix | Commit |
+|-----|---------|-----|--------|
+| Vocab-logits all-gather inside JIT | `FAILED_PRECONDITION` on second precompile call | Moved all-gather outside JIT | — |
+| TracerBoolConversionError | Crash on `if forward_mode.is_decode()` inside traced code | Added axis to `static_argnames` | — |
+| OOB DMA in last BQ block | `Semaphore has nonzero value` at runtime | bq_sz divisibility loop in `get_default_block_sizes` | `893368d` |
+| BQ double-buffering semaphore crash (bq_sz=1, EAGLE DECODE MIXED) | `Semaphore has nonzero value` at runtime for draft decode | `bq_sz = max_num_tokens` for small token counts; limited to `page_size` threshold | `8c24cc4`, `bcbed33` |
+| `hidden_states` sharding mismatch in nextn | XLA INVALID_ARGUMENT on reshard | Reshard outside JIT with `jax.sharding.reshard` | `2ac21f0`, `6749b06` |
+
+### Root-cause fix: Mosaic dynamic DMA size (2026-06-10)
+
+**Error**:
+```
+MosaicError: INTERNAL: Mosaic failed to compile TPU kernel:
+Failed to prove that a dynamic slice size along dimension 0 is divisible by the tiling (8).
+MLIR: memref<272x256xi32, #tpu.tiled<(8,128),[2,1]>, #tpu.memory_space<hbm>> → memref<?x256xi32>
 ```
 
-**Note**: `--speculative-draft-model-path` uses the same directory as the main
-model (since `model_mtp.safetensors` is there). The Orbax checkpoint hash
-collision is avoided by the `is_draft_model` flag in the loader, which forces
-draft models to always use the safetensors slow-path (no Orbax). The MTP model
-is tiny (~1.7 GB weights), so slow-path loading adds only ~10-20 s.
+**Root cause**: SPEC_DECODE precompile compiles a `TARGET_VERIFY` kernel with
+`custom_mask = tree_mask` (non-None). Inside `_fetch_mask`, the DMA source size
+was:
+```python
+load_kvmask_sz = jnp.minimum(bkv_sz, mask_left)   # dynamic JAX value
+```
+Even though this equals `bkv_sz` or a multiple of 8 at runtime (kv_len is always
+aligned to page_size=16), Mosaic cannot prove it statically for a tiled HBM memref
+and rejects the compilation.
+
+**Why it appeared after `8c24cc4`**: That commit set `bq_sz = max_num_tokens` for
+`TARGET_VERIFY`, giving it a non-trivial `bq_sz`. Mosaic then compiled the DMA into
+a loop body and applied stricter static-divisibility checks.
+
+**Failed approaches** (each required ~20 min to iterate: commit → push → delete job
+→ resubmit → wait for provisioning + Orbax restore + precompile):
+
+| Attempt | Change | Why it failed |
+|---------|--------|---------------|
+| `bcbed33` | `lax.fori_loop(unroll=True)`, static bound | Mosaic still checks each unrolled copy |
+| `f86a2eb` | Python `for i in range(bq_sz)` | Generates unconditional DMA calls; same check |
+| `85a5135` | `lax.fori_loop(0, load_q_sz, unroll=False)` | `load_q_sz` dynamic bound doesn't help; DMA size still dynamic |
+| `bcbed33` | Add `page_size` threshold for `bq_sz` selection | Reduced bq_sz correctly but DMA size remained dynamic |
+
+**Correct fix** (commit `cd041a6`):
+
+Use `bkv_sz` (a Python int captured in the kernel closure) as the DMA size:
+```python
+# _fetch_mask loop_body — bkv_sz is a Python int, statically divisible by 8
+_async_copy(
+    custom_mask_ref.at[pl.ds(start, bkv_sz)],   # static size
+    kvmask_vmem_ref.at[i],
+    sem, wait,
+)
+```
+
+Pad `custom_mask` with 2048 zero rows before the kernel call so reading a full
+`bkv_sz` block never goes out of bounds:
+```python
+custom_mask = jnp.pad(custom_mask, ((0, 2048), (0, 0)))
+```
+
+**Correctness**: rows beyond `kv_len` correspond to zero KV cache entries. The
+attention output for those positions is zero regardless of the mask value
+(V=0 → contribution=0). Result is numerically identical to the original code.
+
+**File**: [ragged_paged_attention_v3.py](python/sgl_jax/srt/kernels/ragged_paged_attention/ragged_paged_attention_v3.py)
+
+---
+
+## Launch Configuration
+
+**Benchmark job**: `scripts/mimo_v2_flash_1node_opt_e_bench_job.yaml`
+
+```
+--speculative-algorithm EAGLE
+--speculative-num-steps 4
+--speculative-eagle-topk 5
+--page-size 16
+--max-running-requests 32
+```
+
+Draft model path points to the same directory as the main model
+(`/mnt/gcs/mimo-v2-flash-hf-weights`); the loader's `is_draft_model` flag
+forces the slow-path safetensors loader, avoiding Orbax hash collisions.
 
 ---
 
@@ -114,27 +176,18 @@ Sweep (input=512, output=256):
 | Setting | conc | Expected |
 |---------|------|---------|
 | Baseline (no spec) | 8 | 21.6 ms TPOT |
-| Spec EAGLE (K=3, topk=4) | 8 | ~10-12 ms if acceptance ~70% |
-| Spec EAGLE (K=5, topk=4) | 8 | ~8-10 ms if acceptance ~70% |
+| Spec EAGLE K=4, topk=5 | 8 | ~8-12 ms if acceptance ~60-70% |
 
 Target: 2-3× per-sequence latency reduction.
 
 ---
 
-## Results (TBD)
+## Results (pending)
 
 | Setting | TPOT (ms) | Acceptance rate | tok/s |
 |---------|----------:|----------------:|------:|
 | Baseline | 21.6 | — | 371 |
-| Spec K=3 | TBD | TBD | TBD |
-| Spec K=5 | TBD | TBD | TBD |
+| Spec K=4, topk=5 | TBD | TBD | TBD |
 
----
-
-## TODO
-
-- [ ] Create GKE benchmark YAML for Opt E
-- [ ] Resolve `speculative-draft-model-path` same-path issue (test if Orbax skip works)
-- [ ] Run benchmark, record TPOT and acceptance rate
-- [ ] Tune K (num_steps) and topk for best throughput
-- [ ] Update this doc with measured results
+Job `mimo-v2-flash-1node-opt-e` submitted 2026-06-10, commit `cd041a6`.
+Awaiting TPU node provisioning → Orbax restore (~7 min) → precompile → results.

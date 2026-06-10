@@ -3,7 +3,7 @@
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
 **Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-09
+**Last updated**: 2026-06-10
 
 ---
 
@@ -249,12 +249,12 @@ optimal for all workloads.
 | B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
 | D (sparse prefill) | Not yet investigated | 🔲 Backlog | ~30-50% TTFT |
-| **E (speculative)** | **Implementation done — not yet benchmarked** | **⏳ Benchmark** | **~2-3× per-seq latency** |
+| **E (speculative)** | **Benchmark job submitted (cd041a6) — awaiting results** | **⏳ Running** | **~2-3× per-seq latency** |
 | F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
 
 **Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
 **Current**: 371 tok/s (no improvement yet — all analyzed opts closed with 0% or negligible gain)
-**Next**: Opt E benchmark — MiMoV2FlashMTPForCausalLM implemented, needs GKE job + measurement
+**Next**: Opt E results — job `mimo-v2-flash-1node-opt-e` running (commit `cd041a6`, 2026-06-10)
 
 ## Tracking
 
