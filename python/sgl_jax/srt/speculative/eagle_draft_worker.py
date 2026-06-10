@@ -270,7 +270,7 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.next_token_logits = rep_logits[select_index]
         draft_logits_output.hidden_states = rep_hidden[select_index]
         topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
+            draft_logits_output.next_token_logits, self.topk, mesh=self.mesh
         )
 
         batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
@@ -287,7 +287,9 @@ class EagleDraftWorker(BaseDraftWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        topk_p, topk_index = topk_probs_from_logits(
+            logits_output.next_token_logits, self.topk, mesh=self.mesh
+        )
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
         draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
@@ -463,7 +465,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 logits_metadata=logits_metadata,
             )
 
-            topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+            topk_p, topk_index = topk_probs_from_logits(
+                logits_output.next_token_logits, self.topk, mesh=self.mesh
+            )
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
@@ -536,17 +540,32 @@ class EagleDraftWorker(BaseDraftWorker):
 # ---------------------------------------------------------------------------
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(
+    logits: jax.Array, topk: int, axis: int = -1, mesh=None
+) -> tuple[jax.Array, jax.Array]:
+    """Return top-k probabilities without materializing the full softmax tensor.
+
+    Callers must pass replicated (P()) logits.  If the logits are
+    vocab-sharded (P('data','tensor') from the lm_head), pass mesh= so this
+    function can all-gather them OUTSIDE JIT.  Doing the reshard inside JIT
+    causes silent XLA crashes on TPU v7 (deferred FAILED_PRECONDITION).
+    """
+    # All-gather vocab-sharded logits to P() EAGERLY (outside JIT) so that:
+    # 1. jax.sharding.reshard inside JIT is avoided (causes FAILED_PRECONDITION on TPU v7)
+    # 2. top_k sees fully-replicated input → output (bs, topk) is not forced to be
+    #    divisible by tensor=8, which would break topk=5.
+    if mesh is not None:
+        sh = getattr(logits, "sharding", None)
+        if isinstance(sh, NamedSharding):
+            logits = jax.device_put(logits, NamedSharding(sh.mesh, P()))
+    return _topk_probs_from_logits_jit(logits, topk, axis)
+
+
+@functools.partial(jax.jit, static_argnames=["topk"])
+def _topk_probs_from_logits_jit(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:
-    """Return top-k probabilities without materializing the full softmax tensor."""
     working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
-    # TODO(#1053 Phase 2): replace this all-gather with a sharded top-k +
-    # logsumexp over the vocab axis for DP/TP scalability.
-    sh = jax.typeof(working_logits).sharding
-    if isinstance(sh, NamedSharding):
-        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
