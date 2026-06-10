@@ -205,27 +205,26 @@ def build_tree_kernel_efficient_preprocess(
     # Concatenate token lists: b, (self.topk + (num_steps-1) * self.topk)
     ss_token_list = tokens
 
-    # Get top scores and indices
+    # Get top scores and indices.
+    # jax.lax.top_k on P() inputs returns P() output — no WSC needed.
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
-    # top_k is a gather-like op; in JAX 0.9 explicit mesh the output sharding is
-    # ambiguous even with P() inputs. Annotate as P() so subsequent take_along_axis
-    # and concatenate produce valid-sharding outputs (preventing deferred FAILED_PRECONDITION).
-    if rep_sharding is not None:
-        top_scores_index = jax.lax.with_sharding_constraint(top_scores_index, rep_sharding)
+    # jnp.sort on P() input returns P() output — no WSC needed.
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
-    if rep_sharding is not None:
-        top_scores_index = jax.lax.with_sharding_constraint(top_scores_index, rep_sharding)
 
-    # Gather draft tokens using the top indices
-    draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
+    # Replace jnp.take_along_axis (gather → potentially ambiguous output sharding in
+    # JAX 0.9 explicit mesh) with .at[rows, cols].get(out_sharding=...) which carries
+    # an explicit output sharding spec and avoids deferred FAILED_PRECONDITION.
     if rep_sharding is not None:
-        draft_tokens = jax.lax.with_sharding_constraint(draft_tokens, rep_sharding)
-    # assert draft_tokens.shape == (batch_size, verified_id.shape[0])
+        rows = jnp.broadcast_to(
+            jnp.arange(ss_token_list.shape[0])[:, None], top_scores_index.shape
+        )
+        draft_tokens = ss_token_list.at[rows, top_scores_index].get(out_sharding=rep_sharding)
+    else:
+        draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
+    # jnp.concatenate + flatten on P() inputs → P() output — no WSC needed.
     draft_tokens = jnp.concatenate(
         [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
     ).flatten()
-    if rep_sharding is not None:
-        draft_tokens = jax.lax.with_sharding_constraint(draft_tokens, rep_sharding)
 
     # Build parent list
     if speculative_num_steps > 1:

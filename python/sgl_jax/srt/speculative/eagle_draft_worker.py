@@ -625,10 +625,10 @@ def select_top_k_tokens(
     mesh=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if i == 0:
-        rep_sharding = NamedSharding(mesh, P()) if mesh is not None else None
-        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk, rep_sharding=rep_sharding)
+        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
     else:
         # Capture sharding before JIT — not available on traced arrays inside JIT.
+        # After step_0's broadcast+reshape fix, hidden_states.sharding = P() (mesh-replicated).
         hs_sharding = getattr(hidden_states, "sharding", None)
         return select_top_k_tokens_step_greater_0(
             jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk,
@@ -636,22 +636,24 @@ def select_top_k_tokens(
         )
 
 
-@functools.partial(jax.jit, static_argnames=["topk", "rep_sharding"])
+@functools.partial(jax.jit, static_argnames=["topk"])
 def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
-    rep_sharding=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     input_ids = topk_index.flatten()
-    hidden_states = jnp.repeat(hidden_states, topk, axis=0)
-    # jnp.repeat is a gather-like op; JAX 0.9 explicit mesh doesn't infer P()
-    # output from P() inputs. Annotate explicitly to prevent ambiguous sharding
-    # from propagating into the draft model JIT and causing deferred FAILED_PRECONDITION.
-    if rep_sharding is not None:
-        hidden_states = jax.lax.with_sharding_constraint(hidden_states, rep_sharding)
+    # Replace jnp.repeat (gather-like op — JAX 0.9 explicit mesh cannot infer P()
+    # output sharding from P() inputs, marking output as ambiguous and causing
+    # deferred FAILED_PRECONDITION via invalid jax.sharding.reshard downstream)
+    # with broadcast_to + reshape: pure shape ops that preserve P() sharding.
+    bs = hidden_states.shape[0]
+    hd = hidden_states.shape[-1]
+    hidden_states = jnp.broadcast_to(
+        jnp.expand_dims(hidden_states, axis=1), (bs, topk, hd)
+    ).reshape(bs * topk, hd)
     scores = topk_p
     tree_info = (
         jnp.expand_dims(topk_p, axis=1),
@@ -678,28 +680,28 @@ def select_top_k_tokens_step_greater_0(
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
     )
-    # fast_topk uses jax.lax.top_k (gather-like); take_along_axis below is also a
-    # gather. In JAX 0.9 explicit mesh, gather outputs from P() inputs get ambiguous
-    # sharding annotations. Annotate as P() so downstream draft model JIT and
-    # update_eagle_lists don't inherit the ambiguity (which would cause deferred
-    # FAILED_PRECONDITION via jax.sharding.reshard on ambiguous logits in topk_probs_from_logits).
-    if hs_out_sharding is not None:
-        _rep = NamedSharding(hs_out_sharding.mesh, P())
-        topk_cs_p = jax.lax.with_sharding_constraint(topk_cs_p, _rep)
-        topk_cs_index = jax.lax.with_sharding_constraint(topk_cs_index, _rep)
+    # fast_topk = jax.lax.top_k; on P() inputs, output is P() — no WSC needed.
+    # (WSC on ambiguous→P() is invalid in JAX 0.9 explicit mesh; WSC on P()→P() is a no-op.)
     scores = topk_cs_p
     topk_index = topk_index.reshape(-1, topk**2)
-    input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1)
+    # Replace jnp.take_along_axis (gather → potentially ambiguous output sharding)
+    # with .at[rows, cols].get(out_sharding=...) which carries explicit output sharding.
     if hs_out_sharding is not None:
-        _rep = NamedSharding(hs_out_sharding.mesh, P())
-        input_ids = jax.lax.with_sharding_constraint(input_ids, _rep)
+        rows = jnp.broadcast_to(
+            jnp.arange(topk_index.shape[0])[:, None], topk_cs_index.shape
+        )
+        input_ids = topk_index.at[rows, topk_cs_index].get(out_sharding=hs_out_sharding)
+    else:
+        input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1)
     input_ids = input_ids.flatten()
     if hidden_states.shape[0] > 0:
-        selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
-            jnp.arange(0, hidden_states.shape[0], topk), topk
-        )
-        # In JAX 0.9 Explicit mesh, gather output sharding is ambiguous — provide
-        # it explicitly. hs_out_sharding is captured before JIT (concrete array).
+        # Replace jnp.repeat(arange, topk) (gather-like → ambiguous sharding) with
+        # broadcast_to + reshape (shape ops that preserve P() sharding).
+        arange_base = jnp.arange(0, hidden_states.shape[0], topk)
+        repeated_base = jnp.broadcast_to(
+            arange_base[:, None], (arange_base.shape[0], topk)
+        ).reshape(-1)
+        selected_input_index = topk_cs_index.flatten() // topk + repeated_base
         hidden_states = hidden_states.at[selected_input_index, :].get(
             out_sharding=hs_out_sharding
         )
