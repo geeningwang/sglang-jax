@@ -444,6 +444,10 @@ class EagleDraftWorker(BaseDraftWorker):
             if i == self.speculative_num_steps - 1:
                 break
 
+            if self.mesh is not None:
+                hidden_states = jax.sharding.reshard(
+                    hidden_states, NamedSharding(self.mesh, P("data", None))
+                )
             forward_batch = update_forward_batch_info(
                 forward_batch, i, input_ids, hidden_states, positions_base
             )
@@ -460,6 +464,10 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+            if self.mesh is not None:
+                hidden_states = jax.sharding.reshard(
+                    hidden_states, NamedSharding(self.mesh, P("data", None))
+                )
 
         return score_list, token_list, parents_list
 
