@@ -444,7 +444,7 @@ class EagleDraftWorker(BaseDraftWorker):
         for i in range(self.speculative_num_steps):
 
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                i, topk_p, topk_index, hidden_states, scores, self.topk, mesh=self.mesh
             )
             score_list, token_list, parents_list = update_eagle_lists(
                 i, score_list, token_list, parents_list, tree_info, self.topk
@@ -622,9 +622,11 @@ def select_top_k_tokens(
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
+    mesh=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if i == 0:
-        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
+        rep_sharding = NamedSharding(mesh, P()) if mesh is not None else None
+        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk, rep_sharding=rep_sharding)
     else:
         # Capture sharding before JIT — not available on traced arrays inside JIT.
         hs_sharding = getattr(hidden_states, "sharding", None)
@@ -634,16 +636,22 @@ def select_top_k_tokens(
         )
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk", "rep_sharding"])
 def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
     scores: jax.Array,
     topk: int,
+    rep_sharding=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     input_ids = topk_index.flatten()
     hidden_states = jnp.repeat(hidden_states, topk, axis=0)
+    # jnp.repeat is a gather-like op; JAX 0.9 explicit mesh doesn't infer P()
+    # output from P() inputs. Annotate explicitly to prevent ambiguous sharding
+    # from propagating into the draft model JIT and causing deferred FAILED_PRECONDITION.
+    if rep_sharding is not None:
+        hidden_states = jax.lax.with_sharding_constraint(hidden_states, rep_sharding)
     scores = topk_p
     tree_info = (
         jnp.expand_dims(topk_p, axis=1),
@@ -670,9 +678,22 @@ def select_top_k_tokens_step_greater_0(
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
     )
+    # fast_topk uses jax.lax.top_k (gather-like); take_along_axis below is also a
+    # gather. In JAX 0.9 explicit mesh, gather outputs from P() inputs get ambiguous
+    # sharding annotations. Annotate as P() so downstream draft model JIT and
+    # update_eagle_lists don't inherit the ambiguity (which would cause deferred
+    # FAILED_PRECONDITION via jax.sharding.reshard on ambiguous logits in topk_probs_from_logits).
+    if hs_out_sharding is not None:
+        _rep = NamedSharding(hs_out_sharding.mesh, P())
+        topk_cs_p = jax.lax.with_sharding_constraint(topk_cs_p, _rep)
+        topk_cs_index = jax.lax.with_sharding_constraint(topk_cs_index, _rep)
     scores = topk_cs_p
     topk_index = topk_index.reshape(-1, topk**2)
-    input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1).flatten()
+    input_ids = jnp.take_along_axis(topk_index, topk_cs_index, axis=1)
+    if hs_out_sharding is not None:
+        _rep = NamedSharding(hs_out_sharding.mesh, P())
+        input_ids = jax.lax.with_sharding_constraint(input_ids, _rep)
+    input_ids = input_ids.flatten()
     if hidden_states.shape[0] > 0:
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk

@@ -182,7 +182,7 @@ def get_last_loc_large_page_size_large_top_k(
 
 
 @functools.partial(
-    jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
+    jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps", "rep_sharding"]
 )
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
@@ -192,6 +192,7 @@ def build_tree_kernel_efficient_preprocess(
     num_verify_tokens: int,
     batch_size: int,
     speculative_num_steps: int,
+    rep_sharding=None,
 ):
     # score_list   (bs, 1 + (step - 1) * topk  , eagle_topk)
     # token_list   (bs, topk + (step - 1) * topk * topk)
@@ -206,14 +207,25 @@ def build_tree_kernel_efficient_preprocess(
 
     # Get top scores and indices
     _, top_scores_index = jax.lax.top_k(score_tensor, num_verify_tokens - 1)
+    # top_k is a gather-like op; in JAX 0.9 explicit mesh the output sharding is
+    # ambiguous even with P() inputs. Annotate as P() so subsequent take_along_axis
+    # and concatenate produce valid-sharding outputs (preventing deferred FAILED_PRECONDITION).
+    if rep_sharding is not None:
+        top_scores_index = jax.lax.with_sharding_constraint(top_scores_index, rep_sharding)
     top_scores_index = jnp.sort(top_scores_index, axis=-1)
+    if rep_sharding is not None:
+        top_scores_index = jax.lax.with_sharding_constraint(top_scores_index, rep_sharding)
 
     # Gather draft tokens using the top indices
     draft_tokens = jnp.take_along_axis(ss_token_list, top_scores_index, axis=1)
+    if rep_sharding is not None:
+        draft_tokens = jax.lax.with_sharding_constraint(draft_tokens, rep_sharding)
     # assert draft_tokens.shape == (batch_size, verified_id.shape[0])
     draft_tokens = jnp.concatenate(
         [jnp.expand_dims(verified_id, axis=1), draft_tokens], axis=1
     ).flatten()
+    if rep_sharding is not None:
+        draft_tokens = jax.lax.with_sharding_constraint(draft_tokens, rep_sharding)
 
     # Build parent list
     if speculative_num_steps > 1:
@@ -339,6 +351,7 @@ def build_tree_kernel_efficient(
         num_verify_tokens,
         batch_size,
         speculative_num_steps,
+        rep_sharding=rep,
     )
     # build_tree_kernel_efficient_preprocess uses jax.lax.top_k / jnp.take_along_axis
     # (gather-like ops) on mesh-replicated arrays. In JAX 0.9 explicit mesh, these
