@@ -546,9 +546,7 @@ def topk_probs_from_logits(
     # logsumexp over the vocab axis for DP/TP scalability.
     sh = jax.typeof(working_logits).sharding
     if isinstance(sh, NamedSharding):
-        # jax.sharding.reshard inside or outside JIT causes deferred FAILED_PRECONDITION
-        # in JAX 0.9 explicit mesh. Use device_put (replicate_to_mesh equivalent) instead.
-        working_logits = jax.device_put(working_logits, NamedSharding(sh.mesh, P()))
+        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
