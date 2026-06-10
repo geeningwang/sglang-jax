@@ -340,6 +340,13 @@ def build_tree_kernel_efficient(
         batch_size,
         speculative_num_steps,
     )
+    # build_tree_kernel_efficient_preprocess uses jax.lax.top_k / jnp.take_along_axis
+    # (gather-like ops) on mesh-replicated arrays. In JAX 0.9 explicit mesh, these
+    # produce ambiguous output sharding. Normalize all three outputs to P() before
+    # passing to jax.shard_map in build_eagle_tree_structure (which expects in_specs=P()).
+    parent_list, top_scores_index, draft_tokens = jax.device_put(
+        (parent_list, top_scores_index, draft_tokens), rep
+    )
 
     # Get batch size
     # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
