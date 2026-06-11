@@ -1514,9 +1514,15 @@ def get_default_block_sizes(
                 # 2 * bq_sz * bkv_sz * head_dim * 4 bytes; large bq_sz (e.g. from
                 # TARGET_VERIFY with speculative_num_draft_tokens = K*topk >> topk)
                 # can exceed VMEM, causing Mosaic compile failures.
-                # page_size is always a safe upper bound since topk ≤ page_size
-                # for typical speculative decoding configurations.
-                if 0 < max_num_tokens <= page_size:
+                # Sliding-window MIXED (EAGLE DRAFT DECODE MIXED): bkv_sz >
+                # sliding_window guarantees only one BKV iteration per BQ
+                # block. With num_bq > 1, BQ double-buffering stalls waiting
+                # for a second BKV signal that never arrives → semaphore crash.
+                # Fix: bq_sz = max_num_tokens → num_bq = 1 always.
+                # Safe: these kernels use causal=True (no custom-mask VMEM).
+                if sliding_window is not None and max_num_tokens > 0:
+                    bq_sz = max_num_tokens
+                elif 0 < max_num_tokens <= page_size:
                     bq_sz = max_num_tokens
                 else:
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
@@ -1541,7 +1547,16 @@ def get_default_block_sizes(
                 # 2 * bq_sz * bkv_sz * head_dim * 4 bytes; large bq_sz (e.g. from
                 # TARGET_VERIFY with speculative_num_draft_tokens = K*topk >> topk)
                 # can exceed VMEM, causing Mosaic compile failures.
-                if 0 < max_num_tokens <= page_size:
+                #
+                # Sliding-window MIXED (EAGLE DRAFT DECODE MIXED): bkv_sz >
+                # sliding_window guarantees only one BKV iteration per BQ
+                # block. With num_bq > 1, BQ double-buffering stalls waiting
+                # for a second BKV signal that never arrives → semaphore crash.
+                # Fix: bq_sz = max_num_tokens → num_bq = 1 always.
+                # Safe: these kernels use causal=True (no custom-mask VMEM).
+                if sliding_window is not None and max_num_tokens > 0:
+                    bq_sz = max_num_tokens
+                elif 0 < max_num_tokens <= page_size:
                     bq_sz = max_num_tokens
                 else:
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
