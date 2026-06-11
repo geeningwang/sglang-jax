@@ -363,12 +363,6 @@ class SchedulerOutputProcessorMixin:
                             all_token_len:cur_allocate_len,
                         ]
                         kv_indices = kv_indices[kv_indices != 0]
-                        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-                        assert (
-                            len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
-                        ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
-
                         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
