@@ -1518,8 +1518,12 @@ def get_default_block_sizes(
                 # sliding_window guarantees only one BKV iteration per BQ
                 # block. With num_bq > 1, BQ double-buffering stalls waiting
                 # for a second BKV signal that never arrives → semaphore crash.
-                # Fix: bq_sz = max_num_tokens → num_bq = 1 always.
-                # Safe: these kernels use causal=True (no custom-mask VMEM).
+                # Fix: bq_sz = bq_csz = max_num_tokens → num_bq = 1 always.
+                # bq_csz must equal bq_sz: load_bq accesses the bq_sz-sized
+                # VMEM buffer in bq_csz-sized blocks; if bq_csz < bq_sz the
+                # last block goes OOB (start + bq_csz > bq_sz after folds).
+                # Safe: causal=True → no custom-mask VMEM; KV≤sw → no
+                # flash-accumulation precision concern for large bq_sz.
                 if sliding_window is not None and max_num_tokens > 0:
                     bq_sz = max_num_tokens
                 elif 0 < max_num_tokens <= page_size:
@@ -1528,6 +1532,8 @@ def get_default_block_sizes(
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
                 bkv_sz = min(1024, max_kv)
                 bq_csz = min(MAX_BQ_SZ, min(512 // num_q_heads_per_kv_head, max_q))
+                if sliding_window is not None and max_num_tokens > 0:
+                    bq_csz = bq_sz
                 bkv_csz = min(512, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
         case 7:
             if case == RpaCase.DECODE:
@@ -1552,8 +1558,12 @@ def get_default_block_sizes(
                 # sliding_window guarantees only one BKV iteration per BQ
                 # block. With num_bq > 1, BQ double-buffering stalls waiting
                 # for a second BKV signal that never arrives → semaphore crash.
-                # Fix: bq_sz = max_num_tokens → num_bq = 1 always.
-                # Safe: these kernels use causal=True (no custom-mask VMEM).
+                # Fix: bq_sz = bq_csz = max_num_tokens → num_bq = 1 always.
+                # bq_csz must equal bq_sz: load_bq accesses the bq_sz-sized
+                # VMEM buffer in bq_csz-sized blocks; if bq_csz < bq_sz the
+                # last block goes OOB (start + bq_csz > bq_sz after folds).
+                # Safe: causal=True → no custom-mask VMEM; KV≤sw → no
+                # flash-accumulation precision concern for large bq_sz.
                 if sliding_window is not None and max_num_tokens > 0:
                     bq_sz = max_num_tokens
                 elif 0 < max_num_tokens <= page_size:
@@ -1562,6 +1572,8 @@ def get_default_block_sizes(
                     bq_sz = min(MAX_BQ_SZ, max_q // 2)
                 bkv_sz = min(2048, max_kv // 2)
                 bq_csz = min(MAX_BQ_SZ, min(1024 // num_q_heads_per_kv_head, max_q))
+                if sliding_window is not None and max_num_tokens > 0:
+                    bq_csz = bq_sz
                 bkv_csz = min(1024, align_to(max_kv // 2, page_size)) if max_kv > 1 else page_size
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
