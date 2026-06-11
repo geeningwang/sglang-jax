@@ -1,7 +1,7 @@
 # Opt E — Speculative Decoding (Flash MTP): Implementation & Results
 
-**Date**: 2026-06-09 – 2026-06-10
-**Status**: Benchmark job submitted (commit `cd041a6`) — awaiting TPU provisioning
+**Date**: 2026-06-09 – 2026-06-11
+**Status**: Benchmark job resubmitted (commit `9c41046`) — awaiting TPU provisioning
 
 ---
 
@@ -89,7 +89,8 @@ bugs across the paged attention kernel and EAGLE worker:
 | Vocab-logits all-gather inside JIT | `FAILED_PRECONDITION` on second precompile call | Moved all-gather outside JIT | — |
 | TracerBoolConversionError | Crash on `if forward_mode.is_decode()` inside traced code | Added axis to `static_argnames` | — |
 | OOB DMA in last BQ block | `Semaphore has nonzero value` at runtime | bq_sz divisibility loop in `get_default_block_sizes` | `893368d` |
-| BQ double-buffering semaphore crash (bq_sz=1, EAGLE DECODE MIXED) | `Semaphore has nonzero value` at runtime for draft decode | `bq_sz = max_num_tokens` for small token counts; limited to `page_size` threshold | `8c24cc4`, `bcbed33` |
+| BQ double-buffering semaphore crash (bq_sz=1, EAGLE DECODE MIXED, bs=1) | `Semaphore has nonzero value` at runtime for draft decode | `bq_sz = max_num_tokens` for small token counts; limited to `page_size` threshold | `8c24cc4`, `bcbed33` |
+| BQ double-buffering semaphore crash (sliding-window MIXED, bs≥4) | `Semaphore has nonzero value` at runtime for bs=4 precompile (`RPAm-p_16-bq_4_4-bkv_2048_1024-sw_128.1`) | `bq_sz = max_num_tokens` for any `sliding_window is not None`, uncapped; forces num_bq=1 | `9c41046` |
 | `hidden_states` sharding mismatch in nextn | XLA INVALID_ARGUMENT on reshard | Reshard outside JIT with `jax.sharding.reshard` | `2ac21f0`, `6749b06` |
 
 ### Root-cause fix: Mosaic dynamic DMA size (2026-06-10)
@@ -189,5 +190,5 @@ Target: 2-3× per-sequence latency reduction.
 | Baseline | 21.6 | — | 371 |
 | Spec K=4, topk=5 | TBD | TBD | TBD |
 
-Job `mimo-v2-flash-1node-opt-e` submitted 2026-06-10, commit `cd041a6`.
+Job `mimo-v2-flash-1node-opt-e` resubmitted 2026-06-11, commit `9c41046`.
 Awaiting TPU node provisioning → Orbax restore (~7 min) → precompile → results.
