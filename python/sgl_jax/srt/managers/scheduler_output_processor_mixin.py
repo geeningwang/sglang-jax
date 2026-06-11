@@ -351,9 +351,13 @@ class SchedulerOutputProcessorMixin:
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
                         cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-                        if self.page_size > 1:
-                            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+                        # kv_committed_len stays at input_len for EAGLE spec decode (it is
+                        # not incremented per accepted round — the prepare_for_decode early-exit
+                        # skips the kv_committed_len += 1 update). cache_finished_req inserts
+                        # complete pages [0:page_floor(kv_committed_len)] into the tree and frees
+                        # the partial page [page_floor:kv_committed_len]. We must free everything
+                        # from page_floor(kv_committed_len) onward up to cur_allocate_len.
+                        all_token_len = (req.kv_committed_len // self.page_size) * self.page_size
                         kv_indices = self.req_to_token_pool.req_to_token[
                             req.req_pool_idx,
                             all_token_len:cur_allocate_len,
