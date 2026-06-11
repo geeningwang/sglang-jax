@@ -556,22 +556,29 @@ def _ragged_paged_attention_kernel_loop(
         kvmask_vmem_ref = bkvmask_ref.at[bkvmask_sem_idx]
 
         kv_len = kv_lens_ref[seq_idx]
-        mask_start = bkvmask_idx * bkv_sz
 
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         load_q_sz = jnp.minimum(bq_sz, q_end - q_len_start)
 
         cur_seq_mask_start = cu_seq_mask_lens[seq_idx]
-        cur_bq_mask_start = cur_seq_mask_start + bq_idx * bq_sz * kv_len
+
+        # kv_len is always a multiple of page_size (≥ 16), hence divisible by 8.
+        # All start-offset terms are therefore divisible by 8 at runtime:
+        #   cur_seq_mask_start — sum of (kv_len[j] * q_len[j]) each div by 8
+        #   bq_idx * bq_sz * kv_len — kv_len div by 8
+        #   i * kv_len — kv_len div by 8
+        #   bkvmask_idx * bkv_sz — bkv_sz = 2048, div by 8
+        # Express start as 8 * (start // 8) so Mosaic sees mul(8, x) and can
+        # prove tile-index divisibility without symbolic kv_len analysis.
+        kv_len_div8 = kv_len >> jnp.int32(3)
+        cur_bq_div8 = (
+            cur_seq_mask_start >> jnp.int32(3)
+        ) + bq_idx * jnp.int32(bq_sz) * kv_len_div8
+        mask_start_div8 = bkvmask_idx * jnp.int32(bkv_sz // 8)
 
         def loop_body(i, _):
-            start = cur_bq_mask_start + i * kv_len + mask_start
-            # bkv_sz is a Python int (compile-time constant), so Mosaic can
-            # prove divisibility by 8. The custom_mask HBM array is padded with
-            # 2048 zero rows, so reading a full bkv_sz block is always in-bounds.
-            # Rows beyond kv_len correspond to zero KV entries and don't affect
-            # the attention output regardless of their mask value.
+            start = (cur_bq_div8 + i * kv_len_div8 + mask_start_div8) * jnp.int32(8)
             _async_copy(
                 custom_mask_ref.at[pl.ds(start, bkv_sz)],
                 kvmask_vmem_ref.at[i],
