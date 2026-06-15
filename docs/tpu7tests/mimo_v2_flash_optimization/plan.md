@@ -3,7 +3,7 @@
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
 **Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-11
+**Last updated**: 2026-06-15
 
 ---
 
@@ -243,13 +243,13 @@ optimal for all workloads.
 | A2 (attention FP8) | <0.3% gain after corrected math — not worth impl. | ✅ Closed | <0.3% |
 | B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
-| **D (sparse prefill)** | **Not yet investigated** | **🔲 Next** | **~30-50% TTFT** |
+| D (sparse prefill) | ep_size=1 (no EP); benefit requires cross-device a2a which is absent | ⏸ Deferred | Not applicable @ ep=1 |
 | E (speculative) | Benchmarked: 36× slower at conc=8 (accept-ratio=0.27, full tp=8 draft overhead) | ✅ Closed | **Negative** |
-| F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
+| **F (page tuning)** | **Sweeping page-size=8 and page-size=32 vs baseline 16** | **🔄 Running** | **5-15% HBM efficiency** |
 
 **Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
 **Current**: 371 tok/s — no decode throughput improvement yet; all decode-side opts exhausted
-**Next**: Opt D — sparse MoE dispatch for prefill (TTFT reduction)
+**Next**: Opt F results — page-size sweep running (job: `mimo-v2-flash-1node-opt-f`)
 
 ## Tracking
 

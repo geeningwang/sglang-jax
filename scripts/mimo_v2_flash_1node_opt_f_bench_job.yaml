@@ -1,0 +1,223 @@
+# MiMo-V2-Flash 1-node Opt F benchmark job — paged attention tuning
+#
+# Purpose: sweep --page-size to find the optimal KV cache page granularity.
+#   Tests page-size=8 and page-size=32 against baseline page-size=16.
+#   Smaller pages → less KV waste for short sequences.
+#   Larger pages → less page-table metadata overhead.
+#
+# Two configs run sequentially in one provisioning slot:
+#   Config A: page-size=8  (3% max waste @ output=256)
+#   Config B: page-size=32 (12% max waste @ output=256)
+#   Baseline: page-size=16 (6% max waste) — already measured 2026-06-08
+#
+# Results saved to:
+#   gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-opt-f/
+#     flash_opt_f_pagesz8_{timestamp}.json  / .txt
+#     flash_opt_f_pagesz32_{timestamp}.json / .txt
+#
+# Runtime: ~100 min total (5 min setup + 45 min × 2 configs)
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-1node-opt-f
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "10800"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-1node-opt-f-template
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-1node-opt-f-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-1node-opt-f
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-1node-opt-f
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-1node-opt-f
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-1node-opt-f
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          RESULTS_DIR="${BUCKET}/perf-results/flash-1node-tp8-opt-f"
+          TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "$(ts) === Installing sglang-jax (tpu7 branch) ==="
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          echo "$(ts) === Mounting GCS bucket via gcsfuse ==="
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          mount -o remount,size=400g /dev/shm
+          mkdir -p /mnt/gcs /dev/shm/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=400000 \
+            --cache-dir=/dev/shm/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          echo "$(ts) GCS mounted. Flash weights: $(ls /mnt/gcs/mimo-v2-flash-hf-weights/*.safetensors 2>/dev/null | wc -l) safetensors"
+
+          # ── Helper: launch server, run full sweep, kill server ────────────────
+          bench_config() {
+            local PAGE_SIZE=$1
+            local SUFFIX="pagesz${PAGE_SIZE}"
+            local RESULT_JSON="/tmp/flash_opt_f_${SUFFIX}_${TIMESTAMP}.json"
+            local RESULT_LOG="/tmp/flash_opt_f_${SUFFIX}_${TIMESTAMP}.txt"
+            # Upload log on exit (success or failure)
+            trap "gsutil cp ${RESULT_LOG} ${RESULTS_DIR}/flash_opt_f_${SUFFIX}_${TIMESTAMP}.txt 2>/dev/null || true" RETURN
+
+            echo "" | tee -a ${RESULT_LOG}
+            echo "$(ts) ════════════════════════════════════════════════" | tee -a ${RESULT_LOG}
+            echo "$(ts) === Config: page-size=${PAGE_SIZE} ===" | tee -a ${RESULT_LOG}
+            echo "$(ts)   Baseline: page-size=16 (TPOT=21.6ms, 371 tok/s @ conc=8)" | tee -a ${RESULT_LOG}
+            echo "$(ts) ════════════════════════════════════════════════" | tee -a ${RESULT_LOG}
+
+            T_START=$(date +%s)
+            JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+            SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
+            python3 -m sgl_jax.launch_server \
+              --model-path /mnt/gcs/mimo-v2-flash-hf-weights \
+              --trust-remote-code \
+              --tp-size 8 \
+              --device tpu \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.75 \
+              --page-size ${PAGE_SIZE} \
+              --chunked-prefill-size 2048 \
+              --max-running-requests 32 \
+              --host 0.0.0.0 \
+              --port 8080 \
+              --nnodes 1 \
+              --node-rank 0 \
+              >> ${RESULT_LOG} 2>&1 &
+            local SERVER_PID=$!
+
+            echo "$(ts) Waiting for /health (PID=${SERVER_PID}) ..." | tee -a ${RESULT_LOG}
+            for i in $(seq 1 1440); do
+              if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+                T_HEALTHY=$(date +%s)
+                echo "$(ts) Server healthy after $((T_HEALTHY - T_START))s" | tee -a ${RESULT_LOG}
+                break
+              fi
+              if ! kill -0 ${SERVER_PID} 2>/dev/null; then
+                echo "$(ts) ERROR: server died — last 50 lines:" | tee -a ${RESULT_LOG}
+                tail -50 ${RESULT_LOG} | tee -a ${RESULT_LOG}
+                return 1
+              fi
+              [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting ($((i*5))s)" | tee -a ${RESULT_LOG}
+              sleep 5
+            done
+
+            echo "" | tee -a ${RESULT_LOG}
+            echo "$(ts) === Running full sweep (page-size=${PAGE_SIZE}) ===" | tee -a ${RESULT_LOG}
+            python3 /workspace/scripts/perf_sweep_flash.py \
+              --server http://localhost:8080 \
+              --model "MiMo-V2-Flash" \
+              --n-requests 20 \
+              --phase 0 \
+              --result-path ${RESULT_JSON} \
+              2>&1 | tee -a ${RESULT_LOG}
+
+            echo "" | tee -a ${RESULT_LOG}
+            echo "$(ts) === Uploading results (page-size=${PAGE_SIZE}) ===" | tee -a ${RESULT_LOG}
+            gsutil cp ${RESULT_JSON} ${RESULTS_DIR}/flash_opt_f_${SUFFIX}_${TIMESTAMP}.json
+            gsutil cp ${RESULT_LOG}  ${RESULTS_DIR}/flash_opt_f_${SUFFIX}_${TIMESTAMP}.txt
+            echo "$(ts) Results: ${RESULTS_DIR}/flash_opt_f_${SUFFIX}_${TIMESTAMP}.json" | tee -a ${RESULT_LOG}
+
+            kill ${SERVER_PID} 2>/dev/null || true
+            # Give the server process time to release TPU device before next config
+            sleep 30
+          }
+
+          # ── Config A: page-size=8 ─────────────────────────────────────────────
+          bench_config 8
+
+          # ── Config B: page-size=32 ───────────────────────────────────────────
+          bench_config 32
+
+          echo ""
+          echo "$(ts) === Opt F benchmark complete ==="
+          echo "$(ts)   Results: ${RESULTS_DIR}/"
+          echo "$(ts)   Compare against baseline (page-size=16) measured 2026-06-08."
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
