@@ -249,7 +249,7 @@ optimal for all workloads.
 
 **Old baseline**: 371 tok/s, TPOT=21.6ms @ conc=8, page-size=16 (2026-06-08)
 **New baseline**: **534 tok/s @ conc=16, page-size=32** (+44% over old baseline) — confirmed 2026-06-15
-**Next**: Opt G — chunked-prefill-size tuning for long-prompt workloads (TTFT at 2K-4K tokens)
+**Next**: Opt G results — chunked-prefill-size sweep running (job: `mimo-v2-flash-1node-opt-g`)
 
 ## Tracking
 

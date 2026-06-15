@@ -10,10 +10,15 @@ Phases:
   2  Concurrency sweep   — vary concurrent requests (input=512, output=256)
   3  Prefill sweep       — vary input length, output=1 (TTFT / prefill tok/s)
   4  Output length sweep — vary max_tokens at optimal concurrency from Phase 2
+  5  Long-input conc sweep — vary concurrent requests (input=2048, output=64)
+                             Isolates chunked-prefill interleaving benefit: with
+                             long prompts, smaller --chunked-prefill-size lets
+                             decode steps run between prefill chunks, improving
+                             TPOT for concurrent requests.
 
 Usage:
   python3 scripts/perf_sweep_flash.py [--server http://localhost:8080] \\
-      [--phase 0|1|2|3|4] [--n-requests 20] [--model MiMo-V2-Flash] \\
+      [--phase 0|1|2|3|4|5] [--n-requests 20] [--model MiMo-V2-Flash] \\
       [--result-path /tmp/flash_baseline.json]
 """
 
@@ -154,7 +159,7 @@ async def main():
     ap.add_argument("--n-requests", type=int, default=20,
                     help="Requests per sweep step (min=concurrency×3 for concurrent phases)")
     ap.add_argument("--phase", type=int, default=0,
-                    help="0=all phases, 1=warmup only, 2=concurrency, 3=prefill, 4=output-len")
+                    help="0=all phases, 1=warmup only, 2=concurrency, 3=prefill, 4=output-len, 5=long-input-conc")
     ap.add_argument("--result-path", default="/tmp/flash_baseline.json",
                     help="Write JSON results to this path")
     args = ap.parse_args()
@@ -256,6 +261,34 @@ async def main():
             )
         all_results["phase4_output_len"] = phase4_rows
 
+    # ── Phase 5: Long-input concurrency sweep ───────────────────────────────
+    if args.phase in (0, 5):
+        print("\n" + "=" * 70)
+        print("Phase 5: Long-input concurrency sweep  (input=2048 tok, output=64 tok)")
+        print("  Measures chunked-prefill interleaving benefit at high concurrency.")
+        print("=" * 70)
+        print(f"  {'conc':>5}  {'tok/s':>8}  {'TPOT_ms':>8}  "
+              f"{'e2e_p50':>8}  {'e2e_p90':>8}  {'vs_c1':>7}  {'efficiency':>10}")
+        print("  " + "-" * 66)
+
+        phase5_rows = []
+        baseline_tps5 = None
+        for conc in CONCURRENCY_LEVELS:
+            n = max(N, conc * 3)
+            r = await _run_batch(server, model, conc, 2048, 64, n)
+            phase5_rows.append(r)
+            if baseline_tps5 is None:
+                baseline_tps5 = r["decode_tok_per_s"] or 1.0
+            vs = r["decode_tok_per_s"] / baseline_tps5
+            eff = vs / conc * 100
+            print(
+                f"  {conc:>5}  {r['decode_tok_per_s']:>8.1f}  "
+                f"{r['tpot_ms']:>8.1f}  "
+                f"{r['e2e_latency_p50_s']:>8.3f}s  {r['e2e_latency_p90_s']:>8.3f}s  "
+                f"{vs:>6.2f}x  {eff:>9.0f}%"
+            )
+        all_results["phase5_long_input_conc"] = phase5_rows
+
     # ── Summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 70)
     print("Summary")
@@ -285,6 +318,11 @@ async def main():
         for r in rows:
             print(f"    output={r['max_tokens']:>5} tok  →  {r['decode_tok_per_s']:>7.1f} tok/s"
                   f"  TPOT={r['tpot_ms']:.1f} ms")
+    if "phase5_long_input_conc" in all_results:
+        rows = all_results["phase5_long_input_conc"]
+        best5 = max(rows, key=lambda r: r["decode_tok_per_s"])
+        print(f"  Long-input peak (in=2048,out=64): {best5['decode_tok_per_s']:.1f} tok/s"
+              f"  @ conc={best5['concurrency']}  TPOT={best5['tpot_ms']:.1f} ms")
 
     # ── Save results ─────────────────────────────────────────────────────────
     with open(args.result_path, "w") as f:
