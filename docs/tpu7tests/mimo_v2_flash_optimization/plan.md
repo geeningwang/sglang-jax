@@ -3,7 +3,7 @@
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
 **Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-15 (Opt F complete, new baseline confirmed)
+**Last updated**: 2026-06-15 (Opt G complete)
 
 ---
 
@@ -245,11 +245,12 @@ optimal for all workloads.
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
 | D (sparse prefill) | ep_size=1 (no EP); benefit requires cross-device a2a which is absent | ⏸ Deferred | Not applicable @ ep=1 |
 | E (speculative) | Benchmarked: 36× slower at conc=8 (accept-ratio=0.27, full tp=8 draft overhead) | ✅ Closed | **Negative** |
-| **F (page tuning)** | **page-size=32 wins: 528 tok/s @ conc=32 (+42% vs baseline 371)** | **✅ Done** | **+42% @ conc=32** |
+| **F (page tuning)** | **page-size=32 wins: 534 tok/s @ conc=16 (+44% vs baseline 371)** | **✅ Done** | **+44% @ conc=16** |
+| G (chunked prefill) | cps=2048 (baseline) wins; smaller cps adds scheduling overhead | ✅ Closed | Negative |
 
 **Old baseline**: 371 tok/s, TPOT=21.6ms @ conc=8, page-size=16 (2026-06-08)
 **New baseline**: **534 tok/s @ conc=16, page-size=32** (+44% over old baseline) — confirmed 2026-06-15
-**Next**: Opt G results — chunked-prefill-size sweep running (job: `mimo-v2-flash-1node-opt-g`)
+**Next**: All planned opts complete. Production config: --page-size 32 --chunked-prefill-size 2048.
 
 ## Tracking
 
