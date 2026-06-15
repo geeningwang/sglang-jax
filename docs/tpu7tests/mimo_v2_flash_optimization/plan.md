@@ -1,9 +1,9 @@
 # MiMo-V2-Flash TPU v7x Inference — Optimization Plan
 
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
-**Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
+**Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, moe_inter=2048, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-15 (Opt G complete)
+**Last updated**: 2026-06-15 (Opt H in progress — H-1 complete)
 
 ---
 
@@ -235,7 +235,7 @@ optimal for all workloads.
 
 ---
 
-## Status Summary (2026-06-11)
+## Status Summary (2026-06-15)
 
 | Opt | Description | Status | Gain |
 |-----|-------------|--------|------|
@@ -247,10 +247,12 @@ optimal for all workloads.
 | E (speculative) | Benchmarked: 36× slower at conc=8 (accept-ratio=0.27, full tp=8 draft overhead) | ✅ Closed | **Negative** |
 | **F (page tuning)** | **page-size=32 wins: 534 tok/s @ conc=16 (+44% vs baseline 371)** | **✅ Done** | **+44% @ conc=16** |
 | G (chunked prefill) | cps=2048 (baseline) wins; smaller cps adds scheduling overhead | ✅ Closed | Negative |
+| **H (EP scaling)** | **H-1 complete: backend=EPMoE ep=1 (TP-style); H-2a (FusedEPMoE 1-node) next** | **🔄 In progress** | TBD |
 
 **Old baseline**: 371 tok/s, TPOT=21.6ms @ conc=8, page-size=16 (2026-06-08)
-**New baseline**: **534 tok/s @ conc=16, page-size=32** (+44% over old baseline) — confirmed 2026-06-15
-**Next**: All planned opts complete. Production config: --page-size 32 --chunked-prefill-size 2048.
+**Current baseline**: **534 tok/s @ conc=16, page-size=32** (+44% over old baseline) — confirmed 2026-06-15
+**Current production config**: `--page-size 32 --chunked-prefill-size 2048 --max-running-requests 32`
+**Next**: H-2a — benchmark FusedEPMoE backend on 1 node (`--json-model-override-args '{"moe_backend": "fused"}'`)
 
 ## Tracking
 
@@ -263,9 +265,13 @@ docs/tpu7tests/mimo_v2_flash_optimization/
   opt_a_weight_quant/        ← FP8/int8 weight quantization ✅ closed (0%)
   opt_b_batch_scaling/       ← batch size sweep (plateau at conc=8) ✅
   opt_c_host_sync/           ← host sync removal ✅ closed (0% measured)
-  opt_d_sparse_prefill/      ← sparse MoE prefill 🔲 backlog
-  opt_e_speculative/         ← speculative decoding 🔲 backlog
-  opt_f_paged_attention/     ← paged attention tuning 🔲 backlog
+  opt_d_sparse_prefill/      ← sparse MoE prefill ⏸ deferred
+  opt_e_speculative/         ← speculative decoding ✅ closed (negative)
+  opt_f_paged_attention/     ← page-size=32 ✅ done (+44%)
+  opt_g_chunked_prefill/     ← cps=2048 ✅ closed (negative)
+  opt_h_ep_scaling/          ← EP scaling 🔄 in progress
+    plan.md                  ← detailed plan + sub-problem decomposition
+    h1_model_dims.md         ← H-1 complete: EPMoE ep=1, moe_inter=2048 ✅
 ```
 
 Each subdirectory should contain at minimum:

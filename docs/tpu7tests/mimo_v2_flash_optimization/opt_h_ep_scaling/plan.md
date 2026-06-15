@@ -1,384 +1,355 @@
 # Opt H — Expert Parallelism (EP) Scaling
 
 **Date**: 2026-06-15
-**Status**: PLAN — Approved, implementation not yet started
+**Status**: H-1 complete; H-2 pending
 **Baseline**: 534 tok/s @ conc=16 (page-size=32, cps=2048, 1-node tp=8)
 
 ---
 
 ## Decomposition Overview
 
-The EP scaling problem is split into four independent sub-problems, each with its own
-exit criterion. Later sub-problems only run if earlier ones pass.
+| Sub-problem | Goal | Risk | Dependency | Status |
+|-------------|------|------|------------|--------|
+| **H-1** | Identify model dims + actual MoE backend | None | None | ✅ Complete |
+| **H-2a** | Benchmark FusedEPMoE backend on 1 node | Low | H-1 | Pending |
+| **H-2b** | Add tuned block configs for FusedEPMoE | Low | H-2a positive | Pending |
+| **H-3** | Profile TPOT: weight bandwidth fraction + a2a cost | Low | H-2a | Pending |
+| **H-4** | 2-node EP experiment (ep_size=16) | High | H-3 passes gate | Pending |
 
-| Sub-problem | Goal | Risk | Dependency |
-|-------------|------|------|------------|
-| **H-1** | Find exact model dims + understand current block config | None | None |
-| **H-2** | Add tuned block configs for 1-node (ep_size=8) | Low | H-1 |
-| **H-3** | Profile TPOT: measure how weight-bandwidth-bound decode is | Low | H-2 (or parallel) |
-| **H-4** | 2-node EP experiment (ep_size=16) | High | H-3 passes gate |
-
-Each sub-problem has:
-- A **single deliverable** (one job, one file, one measurement)
-- A **pass/fail exit criterion** defined up front
-- A **stop condition** that ends the chain if it fails
+Each sub-problem has a single deliverable, an explicit exit criterion, and a stop
+condition that ends the chain if it fails.
 
 ---
 
-## 1. Current EP Architecture (What We Have Today)
+## 1. Current EP Architecture (Confirmed by H-1)
 
-### How ep_size actually works in the FusedEPMoE kernel
+> Full details: [`h1_model_dims.md`](h1_model_dims.md)
 
-There are two "ep_size" concepts that are easy to confuse:
-
-| Concept | Value | Source |
-|---------|-------|--------|
-| `model_config.ep_size` | **1** | Hardcoded in `python/sgl_jax/srt/configs/model_config.py:74` |
-| `hf_config.ep_size` | **1** | From the MiMo-V2-Flash `config.json` |
-| Kernel `ep_size` | **8** | Derived at runtime: `get_ep_size(mesh) = dp_size × tp_size = 1 × 8` |
-
-The `fused_ep_moe()` kernel ignores `ep_size` from hf_config entirely. It computes its own ep_size from the JAX mesh (`python/sgl_jax/srt/kernels/fused_moe/v1/kernel.py:480-484`):
-```python
-def get_ep_size(mesh, dp_axis_name, tp_axis_name):
-    dp_size = mesh.shape[dp_axis_name]   # = 1 (1 node)
-    tp_size = mesh.shape[tp_axis_name]   # = 8 (tp=8)
-    return dp_size * tp_size              # = 8 (current)
-```
-
-### Current production state (1-node, tp=8)
-
-```
-Mesh:                  (data=1, tensor=8)
-Kernel ep_size:        8
-Local experts/device:  256 / 8 = 32
-Expert sharding:       P(("data", "tensor"), None, None)
-All-to-all (a2a):      ENABLED — intra-node ICI (fast)
-                       disable_a2a=False; MiMo-V2-Flash does NOT disable it
-Tuned block configs:   NONE for MiMo-V2-Flash shape → DEFAULT_FUSED_MOE_BLOCK_CONFIG
-```
-
-The kernel routes tokens between the 8 devices via ICI all-to-all today. ICI is intra-chip-interconnect, very fast compared to DCN (between-node).
-
-### MiMo-V2-Flash model dimensions
+### MiMo-V2-Flash model dimensions (confirmed from config.json)
 
 | Parameter | Value |
 |-----------|-------|
 | hidden_size | 4096 |
-| moe_intermediate_size | ~768 (check config.json for exact value) |
-| num_experts | 256 |
+| moe_intermediate_size | **2048** |
+| num_experts (n_routed_experts) | 256 |
 | num_experts_per_tok (top-k) | 8 |
-| num_layers | 48 (47 MoE + 1 dense layer-0) |
+| num_hidden_layers | 48 |
+| MoE layers | 47 (layers 1–47; layer 0 is dense) |
 | weight dtype | float8_e4m3fn (FP8) |
-| activation dtype | bfloat16 |
+| quant_block_size | [128, 128] |
 
----
+### Actual backend: EPMoE with ep_size=1 (TP-style)
 
-## 2. What "Increasing EP" Means
+The production server runs **EPMoE** with **ep_size=1**, NOT FusedEPMoE as originally assumed.
 
-"Increasing EP" means **adding more nodes** to increase the total device count:
-
-| Config | Nodes | Total devices | Kernel ep_size | Local experts/device |
-|--------|-------|--------------|----------------|---------------------|
-| **Current** | 1 | 8 | 8 | 32 |
-| 2-node | 2 | 16 | 16 | 16 |
-| 4-node | 4 | 32 | 32 | 8 |
-
-For 2-node EP (nnodes=2, tp=8 per node):
+How this is determined (code path):
 ```
-Mesh: (data=2, tensor=8)
-Kernel ep_size: 16
-Local experts per device: 16
-ICI a2a: within each node (fast, already working)
-DCN a2a: between nodes (NEW — the critical unknown)
+server_args.moe_backend = "epmoe"          # default: server_args.py:138
+ModelConfig.moe_backend = MoEBackend.EPMOE # model_config.py:77
+model_runner.py:336 → hf_config.moe_backend = "epmoe"
+model_runner.py:332 → hf_config.ep_size    = server_args.ep_size = 1
+
+mimo_v2_flash.py:100  getattr(config, "moe_backend", "epmoe") → "epmoe"
+mimo_v2_flash.py:101  use_fused = ("epmoe" == "fused") → False
+mimo_v2_flash.py:125  EPMoE(ep_size=1) instantiated
 ```
 
----
+### What ep_size=1 means in EPMoE (layers/moe.py)
 
-## 3. Code Architecture Analysis
-
-### What needs to change for 2-node EP
-
-**Item 1: Mesh — likely works already**
-
-`python/sgl_jax/srt/managers/scheduler.py:272-276` creates the mesh with:
 ```python
-ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
-dcn_parallelism=[1, 1],
+world_size = 1 × 8 = 8          # dp=1, tp=8
+tp_size    = 8 // 1 = 8         # all devices are tensor-parallel
+experts_per_device = 256 // 1 = 256   # all 256 experts on EVERY device
+
+# Mesh reshaped to (expert=1, tensor=8)
+# Expert weights: P("expert", None, "tensor")
+#   "expert" axis size=1  → NOT sharded across EP groups
+#   "tensor" axis size=8  → intermediate dim split 8-way
 ```
 
-With `--nnodes 2 --tp-size 16`, multi-node mesh construction should be handled automatically. Whether `dcn_parallelism` needs explicit adjustment is an open question.
+**Every device holds all 256 experts, with intermediate dim = 2048/8 = 256 per device.**
 
-**Item 2: Tuned block configs — MISSING (required)**
+### Communication pattern with ep_size=1
 
-`python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_configs.py` has NO entries for MiMo-V2-Flash. The existing entries are for:
-- 128-expert models (hidden=2048, inter=768, ep_size=8)
-- 256-expert models (hidden=8192, inter=2048, ep_size=32)
+- **No expert routing all-to-all** (`if self.ep_size > 1:` at moe.py:563 is skipped)
+- **psum allreduce after each MoE layer** (`if self.tp_size > 1:` at moe.py:557)
+- Allreduce volume per layer: `num_tokens × 4096 × BF16` (e.g., 16 tokens → 131 KB)
 
-MiMo-V2-Flash (256 experts, hidden=4096, inter=~768) falls through to `DEFAULT_FUSED_MOE_BLOCK_CONFIG` for all token counts and ep sizes. This is suboptimal even on 1-node today.
+### Per-device expert weight bandwidth (current vs EP-scaled)
 
-**Item 3: `--ep-size` flag — not blocking**
+For decode at conc=16 (16 tokens × top-k=8 = 128 expert activations):
 
-`model_config.ep_size` is hardcoded to 1 (`python/sgl_jax/srt/configs/model_config.py:74`). For FusedEPMoE, the kernel derives ep_size from the mesh, so `--ep-size` being unwired does NOT block 2-node testing.
+| Config | Experts/device | Weight cols/expert | Weight bytes/activation | Communication |
+|--------|---------------|---------------------|-------------------------|---------------|
+| EPMoE, ep=1 **(current)** | 256 | inter/8 = 256 | 4096×256 FP8 | psum allreduce |
+| EPMoE, ep=8 (1-node) | 32 | inter = 2048 | 4096×2048 FP8 | ICI a2a (ragged) |
+| FusedEPMoE (1-node) | 32 | inter = 2048 | 4096×2048 FP8 | ICI a2a (Pallas) |
+| EPMoE, ep=16 (2-node) | 16 | inter = 2048 | 4096×2048 FP8 | DCN a2a |
 
-**Item 4: Orbax checkpoint resharding — needs verification**
-
-Expert weights use `P(("data", "tensor"), None, None)` sharding. With 16 devices instead of 8, Orbax will reshard from (data=1, tensor=8) to (data=2, tensor=8) at load time. This should work in principle but has not been tested for this shape change.
-
-**Item 5: 2-node YAML — most complex change**
-
-Multi-node server launch requires:
-- DWS ProvisioningRequest for 2× 2x2x1 TPU nodes
-- Head/worker pod coordination across nodes
-- `--nnodes 2 --node-rank {0,1}` flags
-- Distributed init (TCP rendezvous or MXLA)
-
-This is significantly more complex than the existing 1-node YAML pattern.
+**Key insight (from H-1)**: On a single 8-device node, EPMoE(ep=1) and EPMoE(ep=8)
+have the **same total per-device expert weight bandwidth** (256 × 256 cols = 32 × 2048 cols).
+Changing ep_size on the same node does NOT reduce weight reads — it only trades
+psum allreduce for a2a. The weight bandwidth benefit only materialises with 2-node EP
+(ep=16 → 16 experts × 2048 cols, genuinely half the current per-device weight reads).
 
 ---
 
-## 4. Benefit/Cost Analysis
+## 2. Two Paths to "Increasing EP"
 
-### Weight bandwidth reduction (upside)
+### Path A — Switch to FusedEPMoE backend (1-node, low risk)
 
-Decode is weight-bandwidth-bound. With ep_size=16 (2-node):
-- Local experts: 32 → 16 per device
-- Weight bytes per decode step: ~halved
-- Theoretical peak speedup: up to **2×**
+```bash
+--json-model-override-args '{"moe_backend": "fused"}'
+```
 
-At current TPOT=30ms with 534 tok/s, assuming weight reads are 80% of TPOT:
-- Weight-bound: 24ms → 12ms (halved)
-- Fixed (attention, routing, etc.): 6ms
-- Optimistic new TPOT: ~18ms → ~888 tok/s (+66%)
+- FusedEPMoE's Pallas kernel derives ep_size from the JAX mesh: `dp × tp = 1 × 8 = 8`
+- Result: 32 local experts per device, ICI a2a INSIDE the Pallas kernel
+- Expert weight per device: same as current (see table above)
+- Communication: ICI a2a (within-node, fast) instead of psum allreduce
+- Requires tuned block configs for MiMo-V2-Flash shape (hidden=4096, inter=2048, ep=8)
+  — currently falls back to `DEFAULT_FUSED_MOE_BLOCK_CONFIG`
 
-### DCN all-to-all overhead (downside)
+Path A does not need any code changes — only a launch flag. This is the first test.
 
-Each decode step requires DCN a2a to route tokens between nodes.
+### Path B — Keep EPMoE, increase --ep-size (same node or multi-node)
 
-| Parameter | Value |
-|-----------|-------|
-| A2a calls per step | 47 layers × 2 (scatter + gather) = 94 |
-| Token payload | conc=16 × hidden=4096 × 2B ≈ 131 KB |
-| Raw DCN transfer at 50 GB/s | ~2.6 µs per call |
-| **Actual DCN latency (incl. SW overhead)** | **0.05–1 ms per call** |
+```bash
+--ep-size 8    # same 1-node: trades psum for a2a, same weight bandwidth
+--ep-size 16   # 2-node: halves local expert count + adds DCN a2a
+```
 
-Sensitivity to DCN overhead:
+- `server_args.ep_size` is wired to `hf_config.ep_size` at `model_runner.py:332`
+- EPMoE already has ep_size > 1 code path using `jax.lax.ragged_all_to_all`
+- For 1-node (ep=8): same weight bandwidth, different communication → uncertain benefit
+- For 2-node (ep=16): fewer local experts, genuinely less weight bandwidth, but DCN overhead
 
-| DCN latency per call | Added TPOT | New TPOT | New tok/s | vs. baseline |
-|---------------------|-----------|---------|---------|-------------|
-| 0.05 ms | 4.7 ms | 22.7 ms | ~704 | **+32%** |
-| 0.10 ms | 9.4 ms | 27.4 ms | ~583 | **+9%** |
-| 0.20 ms | 18.8 ms | 36.8 ms | ~433 | -19% |
-| 0.50 ms | 47.0 ms | 65.0 ms | ~246 | -54% |
+Path B for 2-node is the high-risk, high-reward option — tested only if Path A (H-2a)
+and profiling (H-3) show the approach is viable.
 
-Breakeven point: ~0.12 ms per DCN a2a call.
+---
 
-**The DCN latency is the critical unknown for this cluster configuration.**
+## 3. Benefit/Cost Analysis (updated for correct architecture)
+
+### 1-node EP (Path A or Path B ep=8): communication pattern change only
+
+Estimated impact on TPOT=30ms (current):
+- Weight bandwidth per device: unchanged
+- psum allreduce → ICI a2a: latency difference unknown; ICI a2a is generally
+  slightly more expensive than psum for small tensors (harder to fuse, more routing)
+- Potential gain: if ICI a2a is cheaper or the Pallas kernel fuses better → marginal gain
+- Potential regression: if a2a overhead > allreduce overhead → negative
+
+**Verdict**: uncertain; measure via H-2a benchmark.
+
+### 2-node EP (Path B ep=16): genuine weight bandwidth reduction
+
+With ep=16 (2-node, 16 devices), local experts drop from 32 → 16 per device.
+
+Weight bandwidth per device: halved. If weight reads are X% of TPOT:
+- X=80%: TPOT = 0.2 × 30 + 0.5 × 0.8 × 30 = 6 + 12 = 18ms → ~888 tok/s (+66%)
+- X=60%: TPOT = 0.4 × 30 + 0.5 × 0.6 × 30 = 12 + 9 = 21ms → ~762 tok/s (+43%)
+- X=40%: TPOT = 0.6 × 30 + 0.5 × 0.4 × 30 = 18 + 6 = 24ms → ~667 tok/s (+25%)
+
+DCN a2a overhead (94 calls per step = 47 layers × 2):
+
+| DCN latency/call | Added TPOT | Breakeven X% | Net tok/s (X=80%) |
+|-----------------|-----------|-------------|------------------|
+| 0.05 ms | +4.7 ms | 13% | ~700 (+31%) |
+| 0.10 ms | +9.4 ms | 25% | ~547 (+2%) |
+| 0.15 ms | +14.1 ms | 36% | ~461 (-14%) |
+| 0.20 ms | +18.8 ms | 47% | ~396 (-26%) |
+
+Breakeven DCN latency (for X=80%): ~0.12 ms/call.
+Breakeven DCN latency (for X=60%): ~0.09 ms/call.
+
+**The weight bandwidth fraction (X) and DCN latency are both unknown — measured by H-3.**
 
 ### Historical evidence
 
-From Maxtext experiments (ref: `plan.md`):
-- **Opt 9 (ragged a2a, 1-node)**: 316 tok/s vs 576 tok/s = -45% regression
-  - Root cause: a2a overhead added WITHOUT reducing expert weight reads (sparse routing)
-  - Different from 2-node EP which DOES reduce expert weights per device
-
-Maxtext did not test true multi-node EP. No direct evidence either way.
-
-### Verdict
-
-**High uncertainty.** Breakeven at ~0.12ms/call DCN latency is tight. Risk of regression is high without first profiling to measure:
-1. What fraction of TPOT is currently weight bandwidth (vs. a2a, attention, other)
-2. Whether the existing ICI a2a already has measurable overhead
+From Maxtext (different hardware, different backend):
+- **Opt 9 (ragged a2a, 1-node)**: 316 vs 576 tok/s → -45%
+  - Added a2a WITHOUT reducing expert weights — analogous to Path B ep=8 (1-node)
+  - Confirms 1-node EP is likely neutral or negative on MoE with small batch
 
 ---
 
-## Sub-problem H-1: Identify Model Dimensions
+## Sub-problem H-1: Identify Model Dimensions ✅ COMPLETE
 
-**Goal**: Determine the exact `moe_intermediate_size` and confirm the kernel block config
-lookup key for MiMo-V2-Flash, so subsequent sub-problems use the correct parameters.
+**Result**: See [`h1_model_dims.md`](h1_model_dims.md).
 
-**What to do**:
-1. Add a one-time log statement at server startup to print the full HF config (or read
-   the `config.json` directly from the GCS weights path)
-2. Record: `moe_intermediate_size`, `n_routed_experts`, `num_experts_per_tok`,
-   `hidden_size`, `moe_backend`, `ep_size` (from hf_config)
-3. Verify the tuned block config lookup key that the kernel will use:
-   `('bfloat16', 'float8_e4m3fn', num_tokens, 256, 8, hidden_size, moe_inter, 8, False, False)`
-4. Confirm the DEFAULT block config is indeed being used (no matching entry in table)
-
-**Deliverable**: A single file `docs/tpu7tests/mimo_v2_flash_optimization/opt_h_ep_scaling/h1_model_dims.md`
-recording the confirmed model dimensions and block config lookup key.
-
-**Exit criteria**:
-- ✅ PASS: Dimensions confirmed; key identified; no tuned config exists → proceed to H-2
-- ❌ STOP: Tuned config already exists (somehow missed) → re-check current performance first
-
-**Effort**: 1 hour (read config.json, write findings).
+Key findings:
+- moe_intermediate_size = **2048** (was estimated as ~768 — wrong)
+- Backend is **EPMoE** with **ep_size=1** (was assumed FusedEPMoE with ep=8 — wrong)
+- No expert routing a2a exists today; experts are TP-sharded
+- Original H-2 (tuned block configs) was predicated on FusedEPMoE — needs revision
+- Two EP paths identified: Path A (switch to FusedEPMoE) and Path B (--ep-size flag)
 
 ---
 
-## Sub-problem H-2: Tuned Block Configs for 1-node (ep_size=8)
+## Sub-problem H-2a: Benchmark FusedEPMoE on 1-Node
 
-**Goal**: Replace the DEFAULT block config with a tuned config for MiMo-V2-Flash at ep_size=8.
-This is a standalone improvement independent of multi-node EP.
+**Goal**: Determine whether switching to FusedEPMoE backend improves throughput on the
+existing 1-node tp=8 setup, compared to the current EPMoE(ep=1) baseline.
 
 **What to do**:
-1. Write a block config sweep script (`scripts/block_config_sweep_flash.py`) that:
-   - Launches the existing 1-node server
-   - Runs Phase 2 sweep with different `block_config` overrides (bt, bf, bd1, bd2 variants)
-   - Records throughput per config
-2. Find the best config for each `num_tokens` value in the concurrency sweep
-3. Add the winning entries to `tuned_block_configs.py` under `"TPU v7"`
-4. Re-run the standard Phase 2 sweep to confirm improvement
 
-**Deliverable**: A commit adding tuned config entries to `tuned_block_configs.py` + a
-benchmark result showing the improvement (or confirming DEFAULT is already near-optimal).
+1. Run the standard Phase 2 sweep with:
+   ```
+   --json-model-override-args '{"moe_backend": "fused"}'
+   ```
+   All other flags unchanged (tp=8, page-size=32, cps=2048, max-running-requests=32).
+
+2. Create a new bench job YAML `scripts/mimo_v2_flash_1node_opt_h2a_bench_job.yaml`
+   copying the Opt G YAML structure, adding the override arg.
+
+3. Run Phase 2 (conc sweep, input=512, output=256) and record tok/s vs. 534 tok/s baseline.
+
+**Deliverable**: `h2a_results.md` with tok/s at each concurrency vs. EPMoE(ep=1) baseline.
 
 **Exit criteria**:
-- ✅ PASS (improvement): New configs yield ≥3% gain → commit, record in
-  `h2_block_configs/results.md`, continue to H-3
-- ✅ PASS (flat): New configs show <3% gain → DEFAULT is near-optimal; commit anyway
-  (good to have explicit configs), continue to H-3
-- ❌ STOP: Sweep crashes / configs are invalid → debug before continuing
+- ✅ PASS (FusedEPMoE ≥ EPMoE): proceed to H-2b (add tuned block configs to further improve)
+- ✅ PASS-flat (within ±3%): tuned block configs (H-2b) may still help; proceed
+- ❌ STOP (FusedEPMoE clearly worse, >5% regression): document a2a overhead; Path A is negative.
+  Evaluate whether to proceed to H-4 (2-node EPMoE) or close Opt H.
 
-**Effort**: 1 benchmark job slot (~2 hours runtime, mainly waiting for DWS).
+**Effort**: 1 DWS slot (~45 min).
 
 ---
 
-## Sub-problem H-3: Profile TPOT Breakdown (1-node)
+## Sub-problem H-2b: Add Tuned Block Configs for FusedEPMoE
 
-**Goal**: Measure what fraction of the 30ms TPOT is spent on:
-- Expert weight HBM reads (w1/w2/w3 for 47 layers)
-- ICI a2a (scatter + gather within the node)
-- Attention computation
-- Other (routing, layernorm, etc.)
+**Only run if H-2a shows FusedEPMoE is viable (PASS or PASS-flat).**
 
-This is the go/no-go gate for 2-node EP. If weight bandwidth is not dominant, EP scaling
-cannot overcome DCN overhead.
+**Goal**: Replace the DEFAULT block config with tuned configs for the MiMo-V2-Flash shape
+at ep_size=8 in `python/sgl_jax/srt/kernels/fused_moe/v1/tuned_block_configs.py`.
+
+The current lookup key for MiMo-V2-Flash at ep=8 is:
+```python
+('bfloat16', 'float8_e4m3fn', num_tokens, 256, 8, 4096, 2048, 8, False, False)
+```
+This key has NO match in the table → falls back to `DEFAULT_FUSED_MOE_BLOCK_CONFIG`.
 
 **What to do**:
-1. Use the existing `/start_profile` HTTP endpoint on the production 1-node server
-2. Capture a ~50-step decode trace at conc=16 (the optimal concurrency)
-3. Download from GCS and open in Perfetto
-4. Annotate the trace to estimate per-layer time budgets
+1. Run a block config micro-sweep: vary `(bt, bf, bd1, bd2)` at the relevant token counts
+   (typically 8, 16, 32 for decode-batch sizes)
+2. Add the best entries to `tuned_block_configs.py` under `"TPU v7"`
+3. Re-run Phase 2 sweep with tuned configs enabled to measure gain over H-2a
 
-**Deliverable**: A file `h3_profile/results.md` with:
-- Time breakdown pie: weight reads / a2a / attention / other (% of TPOT)
-- Current ICI a2a overhead estimate (µs per call)
-- Estimated breakeven DCN latency for 2-node EP to be profitable
+**Deliverable**: A commit to `tuned_block_configs.py` + `h2b_results.md` with before/after.
 
 **Exit criteria**:
-- ✅ PASS: Weight bandwidth ≥ 50% of TPOT AND estimated breakeven DCN latency > 0.1ms
-  → proceed to H-4
-- ❌ STOP (weight not dominant): Weight bandwidth < 40% of TPOT → 2-node EP cannot
-  halve enough of the step to overcome DCN; **close Opt H as negative**
-- ❌ STOP (a2a already hurts): Current ICI a2a > 5ms/step → the kernel is already
-  a2a-bottlenecked; adding DCN a2a will certainly make it worse; **close Opt H as negative**
+- ✅ PASS (≥3% gain over H-2a): commit configs, record gain, continue to H-3
+- ✅ PASS-flat (<3%): DEFAULT was already near-optimal; commit anyway (documents intent)
+- ❌ STOP: Sweep crashes or all configs regress → debug before continuing
 
-**Effort**: 1 benchmark slot for profiling + 2-4 hours trace analysis.
+**Effort**: 1 DWS slot for sweep + 2-4h to analyze and add entries.
+
+---
+
+## Sub-problem H-3: Profile TPOT Breakdown
+
+**Goal**: Measure what fraction of TPOT is spent on expert weight reads vs. a2a vs.
+attention. This is the go/no-go gate for 2-node EP.
+
+**What to do**:
+1. Use the `/start_profile` endpoint on the best 1-node server (EPMoE or FusedEPMoE,
+   whichever is faster from H-2a)
+2. Capture ~50-step decode trace at conc=16 (optimal concurrency)
+3. Download from GCS, analyze in Perfetto:
+   - Expert weight HBM read time per layer
+   - a2a scatter + gather time per layer
+   - Attention compute time
+   - Other overhead (layernorm, routing topk, KV, etc.)
+
+**Deliverable**: `h3_profile/results.md` with:
+- TPOT breakdown: weight / a2a / attention / other (ms and %)
+- Current a2a latency per call (µs)
+- Estimated breakeven DCN latency for 2-node EP to be profitable (from benefit/cost table)
+
+**Exit criteria**:
+- ✅ PASS: Weight bandwidth ≥ 50% of TPOT AND estimated breakeven DCN > 0.1ms
+  → weight-bandwidth-bound enough that 2-node EP could help; proceed to H-4
+- ❌ STOP (weight not dominant, <40%): 2-node EP cannot halve enough of TPOT; **close Opt H**
+- ❌ STOP (a2a already costly, >5ms/step): adding DCN a2a will worsen it; **close Opt H**
+
+**Effort**: 1 slot for trace capture + 2-4h analysis.
 
 ---
 
 ## Sub-problem H-4: 2-node EP Experiment (ep_size=16)
 
-**Only run this if H-3 passes both gates above.**
+**Only run if H-3 passes both gates above.**
 
-This sub-problem is itself divided into three steps to fail fast on infrastructure
-issues before spending a full benchmark slot.
+### H-4a: Weight loading validation
 
-### H-4a: Weight loading validation (fast fail)
-
-**Goal**: Verify Orbax can reshard expert weights from 8 → 16 devices without crashing.
+**Goal**: Verify that EPMoE with ep_size=16 loads correctly on 2 nodes (Orbax resharding
+from 8 → 16 devices, expert mesh changes from (1,8) to (16,1)).
 
 **What to do**:
-1. Create a minimal job YAML (`scripts/mimo_v2_flash_2node_validate_job.yaml`) that:
-   - Provisions 2 TPU nodes
-   - Launches the server with `--nnodes 2 --tp-size 16`
-   - Waits for weight loading to complete and prints the expert weight shapes per device
-   - Does NOT run any inference — exits immediately after load
-2. Confirm: `w1.shape = (16, hidden, moe_inter)` on each of the 16 devices
+- Create `scripts/mimo_v2_flash_2node_validate_job.yaml`: 2 TPU nodes, server with
+  `--nnodes 2 --tp-size 16 --ep-size 16`, load weights, print expert weight shapes, exit.
+- Confirm: each device holds 16 experts with full inter=2048.
 
 **Exit criteria**:
-- ✅ PASS: Server loads weights, shapes correct → proceed to H-4b
-- ❌ STOP: Orbax resharding fails / shape mismatch / crash → root-cause before proceeding
-
-**Effort**: 1 small job slot (~30 min).
+- ✅ PASS: Weights load, shapes correct → proceed to H-4b
+- ❌ STOP: Crash or shape mismatch → root-cause before proceeding
 
 ### H-4b: Add tuned block configs for ep_size=16
 
-**Goal**: Add tuned block config entries for the MiMo-V2-Flash shape at ep_size=16
-(from H-1 dimensions). Without these, the 2-node kernel falls back to DEFAULT config
-which may be significantly suboptimal at ep_size=16.
+**Goal**: Add tuned block configs for EPMoE ep=16 shape (or FusedEPMoE ep=16 if using
+that backend for 2-node).
 
-**What to do**:
-1. Run a block config sweep at ep_size=16 (2-node job, sweep a small grid of bt values)
-2. Add the best entries to `tuned_block_configs.py`
-
-Key lookup key:
+Config lookup key for ep=16:
 ```python
-('bfloat16', 'float8_e4m3fn', num_tokens, 256, 8, hidden_size, moe_inter, 16, False, False)
+('bfloat16', 'float8_e4m3fn', num_tokens, 256, 8, 4096, 2048, 16, False, False)
 ```
-
-**Exit criteria**:
-- ✅ PASS: Configs found and added → proceed to H-4c
-- ❌ STOP: Kernel validation errors for all configs → investigate block constraint violations
-
-**Effort**: 1 benchmark slot.
 
 ### H-4c: 2-node performance benchmark
 
-**Goal**: Measure 2-node throughput and compare to 1-node baseline.
+**Goal**: Measure 2-node throughput vs. 1-node baseline.
 
-**What to do**:
-1. Run standard benchmark job (`scripts/mimo_v2_flash_2node_opt_h_bench_job.yaml`)
-   - Phase 2: concurrency sweep (input=512, output=256)
-   - Phase 5: long-input sweep (input=2048, output=64)
-2. Record results in `h4_2node/results.md`
-3. Compare: 2-node peak tok/s vs. 1-node 534 tok/s
+- Run Phase 2 + Phase 5 sweeps (same as Opt G YAML pattern but 2-node)
+- Record peak tok/s
 
 **Exit criteria**:
-- ✅ SUCCESS: 2-node peak > 534 tok/s → adopt 2-node config, update production config,
-  update plan.md status to ✅
-- ❌ CLOSE NEGATIVE: 2-node peak ≤ 534 tok/s → record DCN overhead findings, close
-  Opt H as negative (DCN a2a cost exceeds weight bandwidth savings)
-
-**Effort**: 1 benchmark slot (~90 min runtime).
+- ✅ SUCCESS (>534 tok/s): adopt 2-node, update production config
+- ❌ CLOSE NEGATIVE (≤534 tok/s): record DCN overhead, close Opt H as negative
 
 ---
 
-## 5. Stopping Rules (Summary)
-
-Stop the chain immediately and record findings if:
+## 4. Stopping Rules (Summary)
 
 | Condition | Stop at | Action |
 |-----------|---------|--------|
-| Tuned config already exists (H-1) | H-1 | Re-benchmark current state |
+| FusedEPMoE clearly worse than EPMoE (H-2a) | H-2a | Document; evaluate H-4 direct |
 | Weight bandwidth < 40% of TPOT (H-3) | H-3 | Close Opt H negative |
 | ICI a2a already > 5ms/step (H-3) | H-3 | Close Opt H negative |
-| Orbax resharding crashes (H-4a) | H-4a | Debug or close |
-| Block config validation errors (H-4b) | H-4b | Debug or close |
+| Orbax resharding fails (H-4a) | H-4a | Debug or close |
 | 2-node peak ≤ 534 tok/s (H-4c) | H-4c | Close Opt H negative |
 
 ---
 
-## 6. Risk Matrix
+## 5. Risk Matrix
 
 | Risk | Severity | Likelihood | Mitigated by |
 |------|----------|------------|-------------|
-| DCN latency > breakeven (~0.12ms/call) | High | High | H-3 gate (profile first) |
-| No tuned configs for ep_size=16 | Medium | Certain | H-4b (sweep before benchmark) |
-| Orbax reshape fails on 16 devices | High (crash) | Medium | H-4a (validation-only job) |
-| 2-node YAML pod coordination bugs | Operational | Medium | H-4a catches this early |
-| DEFAULT config suboptimal today | Medium | High | H-2 addresses independently |
+| ICI a2a > psum allreduce for small tensors | Medium | Medium | H-2a measurement |
+| No tuned configs for ep_size=8 (FusedEPMoE) | Medium | Certain | H-2b adds them |
+| DCN latency > breakeven (~0.12ms/call) | High | High | H-3 gate before H-4 |
+| Orbax reshape fails on 16-device mesh | High (crash) | Medium | H-4a validation job |
+| 2-node YAML pod coordination bugs | Operational | Medium | H-4a catches early |
+| Weight bandwidth fraction < 50% | High | Unknown | H-3 measures this |
 
 ---
 
-## 7. Files per Sub-problem
+## 6. Files per Sub-problem
 
 | Sub-problem | Files |
 |-------------|-------|
-| H-1 | `opt_h_ep_scaling/h1_model_dims.md` |
-| H-2 | `scripts/block_config_sweep_flash.py`, `tuned_block_configs.py` (edit), `h2_block_configs/results.md` |
-| H-3 | `scripts/profile_flash.py` (reuse if exists), `h3_profile/results.md` |
+| H-1 ✅ | `opt_h_ep_scaling/h1_model_dims.md` |
+| H-2a | `scripts/mimo_v2_flash_1node_opt_h2a_bench_job.yaml`, `h2a_results.md` |
+| H-2b | `tuned_block_configs.py` (edit), sweep script, `h2b_results.md` |
+| H-3 | `scripts/profile_flash.py` (reuse), `h3_profile/results.md` |
 | H-4a | `scripts/mimo_v2_flash_2node_validate_job.yaml` |
-| H-4b | `tuned_block_configs.py` (edit), sweep job YAML |
+| H-4b | `tuned_block_configs.py` (edit for ep=16) |
 | H-4c | `scripts/mimo_v2_flash_2node_opt_h_bench_job.yaml`, `h4_2node/results.md` |
