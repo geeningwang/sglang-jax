@@ -53,26 +53,47 @@ page boundary.
 
 Prefill TTFT is essentially unchanged (within 2ms at all lengths).
 
-### Phase 4: Output length sweep (input=512, conc=32)
+### Phase 4: Output length sweep (input=512, conc=16)
 
-| out_tok | p16 tok/s (est) | p32 tok/s | TPOT (ms) |
-|--------:|----------------:|----------:|----------:|
-| 64      | —               | 648.2     | 45.4      |
-| 128     | —               | 590.8     | 49.6      |
-| 256     | 370             | **533.3** | 55.0      |
-| 512     | —               | 504.9     | 58.0      |
-| 1024    | —               | 485.1     | 60.5      |
+*(conc=16 selected as opt_conc from Phase 2 peak in the official baseline run)*
+
+| out_tok | p32 tok/s | TPOT (ms) |
+|--------:|----------:|----------:|
+| 64      | 640.3     | 25.0      |
+| 128     | 587.5     | 27.2      |
+| 256     | **538.8** | 29.7      |
+| 512     | 504.8     | 31.7      |
+| 1024    | 487.3     | 32.8      |
+
+---
+
+## Official baseline (page-size=32) — confirmed 2026-06-15
+
+Full sweep: `flash_baseline_pagesz32_20260615T030728Z.json`
+
+### Concurrency sweep (input=512, output=256)
+
+| conc | tok/s | TPOT (ms) | e2e_p50 | vs_c1 |
+|-----:|------:|----------:|--------:|------:|
+| 1    | 87.5  | 11.4      | 2.942s  | 1.00× |
+| 2    | 177.4 | 11.3      | 2.862s  | 2.03× |
+| 4    | 265.1 | 15.1      | 3.831s  | 3.03× |
+| 8    | 371.8 | 21.5      | 5.522s  | 4.25× |
+| **16** | **534.0** | **30.0** | **7.718s** | **6.10×** |
+| 32   | 527.6 | 55.6      | 15.560s | 6.03× |
+
+Peak at conc=16 (534 tok/s). Conc=32 marginally lower (527.6) due to TPOT pressure.
 
 ---
 
 ## Summary table
 
-| Metric | page-size=8 | page-size=16 (baseline) | **page-size=32** | p32 vs p16 |
-|--------|------------:|------------------------:|-----------------:|-----------:|
-| Peak tok/s | 255.9 @ c=4 | 371 @ c=8 | **528 @ c=32** | **+42%** |
-| TPOT @ conc=8 | 28.7ms | 21.6ms | **21.9ms** | ~flat |
-| TTFT @ 512 tok | 44ms | 56ms | 58ms | +2ms |
-| Peak prefill | ~21,900 tok/s | 21,558 tok/s | 21,333 tok/s | ~flat |
+| Metric | page-size=8 | page-size=16 (old baseline) | **page-size=32 (new baseline)** | p32 vs p16 |
+|--------|------------:|----------------------------:|--------------------------------:|-----------:|
+| Peak tok/s | 255.9 @ c=4 | 371 @ c=8 | **534 @ c=16** | **+44%** |
+| TPOT @ conc=8 | 28.7ms | 21.6ms | **21.5ms** | ~flat |
+| TTFT @ 512 tok | 44ms | 56ms | 57ms | +1ms |
+| Peak prefill | ~21,900 tok/s | 21,558 tok/s | 21,672 tok/s | ~flat |
 
 ---
 
@@ -103,10 +124,8 @@ up to 1024.
 
 Switch the production config from `--page-size 16` to `--page-size 32`.
 
-**New peak**: 528 tok/s @ conc=32 with page-size=32 (+42% vs 371 baseline).
-
-The recommendation is to re-run the baseline sweep with `--page-size 32
---max-running-requests 32` to establish the new official baseline with this config.
+**New peak**: **534 tok/s @ conc=16** with page-size=32 (+44% vs 371 tok/s old baseline).
+Confirmed by full official baseline sweep on 2026-06-15.
 
 ---
 
@@ -114,6 +133,9 @@ The recommendation is to re-run the baseline sweep with `--page-size 32
 
 ```
 gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-opt-f/
-  flash_opt_f_pagesz8_20260615T020714Z.json   — Config A (page-size=8)
-  flash_opt_f_pagesz32_20260615T020714Z.json  — Config B (page-size=32) ← winner
+  flash_opt_f_pagesz8_20260615T020714Z.json    — Config A (page-size=8)
+  flash_opt_f_pagesz32_20260615T020714Z.json   — Config B (page-size=32) ← winner
+
+gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-baseline-pagesz32/
+  flash_baseline_pagesz32_20260615T030728Z.json  — Official new baseline (confirmed)
 ```
