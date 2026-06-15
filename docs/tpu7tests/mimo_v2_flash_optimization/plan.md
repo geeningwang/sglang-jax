@@ -3,7 +3,7 @@
 **Cluster**: `jingnw-tpu7-cluster`, zone `us-central1-c`, GKE TPU v7x
 **Model**: `XiaomiMiMo/MiMo-V2-Flash` (48 layers, 256 experts, hidden=4096, FP8 e4m3fn weights)
 **Framework**: sglang-jax (`tpu7` branch)
-**Last updated**: 2026-06-10
+**Last updated**: 2026-06-11
 
 ---
 
@@ -193,31 +193,26 @@ before removing).
 
 ### Opt E — Speculative decoding
 
-**Priority: Medium-High for per-sequence latency**
+**Priority: CLOSED** — benchmarked 2026-06-11, negative result.
 
-**Rationale**: Orthogonal to batch throughput scaling. A draft model produces K
-candidate tokens per step; the full model verifies them in one pass. With acceptance
-rate ~70–80%, effective per-sequence throughput increases 2–3× without changing
-the serving batch size. This is the primary lever for reducing time-to-completion
-for individual users.
-
-**Draft model**: Flash ships pre-trained MTP weights (`model_mtp.safetensors`, 2
-layers). These are single SWA-attention + dense-MLP blocks, same architecture as
-V2.5-Pro MTP. The EAGLE speculative-decoding framework is used.
-
-> **Implementation (2026-06-09)**: `MiMoV2FlashMTPForCausalLM` added to
-> `mimo_v2_nextn.py`. Key differences from V2.5-Pro MTP: separate q/k/v FP8
-> weights (not fused QKV), BF16 o_proj. Draft model loads via safetensors
-> slow-path (Orbax checkpoint caching skipped for draft models).
+> **Finding**: EAGLE K=4, topk=5 is 36× worse than baseline at conc=8 (763ms TPOT vs
+> 21.6ms, 10 tok/s vs 371). Best case at conc=32: 42.9 tok/s (still 8.6× worse).
 > See [`opt_e_speculative/results.md`](opt_e_speculative/results.md).
 
-**Remaining steps**:
-1. Create GKE benchmark YAML.
-2. Launch, measure acceptance rate + TPOT.
-3. Tune `--speculative-num-steps` and `--speculative-eagle-topk`.
+**Two compounding failure modes**:
 
-**Expected gain**: 2–3× per-sequence latency reduction.
-**Risk**: Medium — implementation done; acceptance rate is workload-dependent.
+1. **Poor acceptance rate**: `accept-ratio=0.27`, accept-len=1.07 tokens/round (max 5).
+   The MTP draft model is a poor predictor of the target distribution on this workload.
+   5 forward passes yield only ~1 extra accepted token over autoregressive.
+
+2. **Draft model carries full tp=8 communication overhead**: The single-layer MTP draft
+   model on tp=8 incurs the same all-reduce latency as the target model (~21ms/step).
+   Draft steps are not cheaper than target steps. Net TPOT = 5 × step_time / 1.07 ≈ 4.7×
+   baseline per token.
+
+**Verdict**: Spec decode on tp=8 only helps when the draft model is substantially cheaper
+than the target (e.g., tp=1 draft). Not feasible on this 1-node tp=8 setup without major
+architectural changes.
 
 ---
 
@@ -240,7 +235,7 @@ optimal for all workloads.
 
 ---
 
-## Status Summary (2026-06-09)
+## Status Summary (2026-06-11)
 
 | Opt | Description | Status | Gain |
 |-----|-------------|--------|------|
@@ -248,13 +243,13 @@ optimal for all workloads.
 | A2 (attention FP8) | <0.3% gain after corrected math — not worth impl. | ✅ Closed | <0.3% |
 | B (batch scaling) | Sweep already done: plateau at conc=8 | ✅ Closed | Diminishing returns |
 | C (host sync) | Overlap design already optimal; 0% measured | ✅ Closed | 0% measured |
-| D (sparse prefill) | Not yet investigated | 🔲 Backlog | ~30-50% TTFT |
-| **E (speculative)** | **Benchmark job submitted (cd041a6) — awaiting results** | **⏳ Running** | **~2-3× per-seq latency** |
+| **D (sparse prefill)** | **Not yet investigated** | **🔲 Next** | **~30-50% TTFT** |
+| E (speculative) | Benchmarked: 36× slower at conc=8 (accept-ratio=0.27, full tp=8 draft overhead) | ✅ Closed | **Negative** |
 | F (page tuning) | Not yet investigated | 🔲 Backlog | 5-15% HBM efficiency |
 
 **Baseline**: 371 tok/s, TPOT=21.6ms @ conc=8 (2026-06-08)
-**Current**: 371 tok/s (no improvement yet — all analyzed opts closed with 0% or negligible gain)
-**Next**: Opt E results — job `mimo-v2-flash-1node-opt-e` running (commit `cd041a6`, 2026-06-10)
+**Current**: 371 tok/s — no decode throughput improvement yet; all decode-side opts exhausted
+**Next**: Opt D — sparse MoE dispatch for prefill (TTFT reduction)
 
 ## Tracking
 
