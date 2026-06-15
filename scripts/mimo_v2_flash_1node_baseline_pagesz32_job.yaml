@@ -1,0 +1,202 @@
+# MiMo-V2-Flash 1-node baseline benchmark — page-size=32 (new production config)
+#
+# Purpose: establish the new official baseline after Opt F showed page-size=32
+#   achieves 528 tok/s @ conc=32 (+42% vs page-size=16 baseline of 371 tok/s).
+#
+# Configuration:
+#   tp-size=8, 1 node (jingnw-dws-tpu7-4ch, 2x2x1)
+#   page-size=32, chunked-prefill-size=2048, max-running-requests=32
+#
+# Results saved to:
+#   gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/flash-1node-tp8-baseline-pagesz32/
+#     flash_baseline_pagesz32_{timestamp}.json
+#     flash_baseline_pagesz32_{timestamp}.txt
+#
+# Runtime: ~40-60 min total (7 min startup + ~35 min sweep)
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-1node-baseline-pagesz32
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "10800"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-1node-baseline-pagesz32-template
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-1node-baseline-pagesz32-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-1node-baseline-pagesz32
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        limits:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+        requests:
+          cpu: "220"
+          memory: 900Gi
+          google.com/tpu: "4"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-1node-baseline-pagesz32
+  namespace: default
+spec:
+  completions: 1
+  parallelism: 1
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-1node-baseline-pagesz32
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-1node-baseline-pagesz32
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          RESULTS_DIR="${BUCKET}/perf-results/flash-1node-tp8-baseline-pagesz32"
+          TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+          RESULT_JSON="/tmp/flash_baseline_pagesz32_${TIMESTAMP}.json"
+          RESULT_LOG="/tmp/flash_baseline_pagesz32_${TIMESTAMP}.txt"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+          trap 'gsutil cp ${RESULT_LOG} ${RESULTS_DIR}/flash_baseline_pagesz32_${TIMESTAMP}.txt 2>/dev/null || true' EXIT
+
+          echo "$(ts) === Installing sglang-jax (tpu7 branch) ===" | tee -a ${RESULT_LOG}
+          git clone -b tpu7 https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)" | tee -a ${RESULT_LOG}
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          echo "$(ts) === Mounting GCS bucket via gcsfuse ===" | tee -a ${RESULT_LOG}
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          mount -o remount,size=400g /dev/shm
+          mkdir -p /mnt/gcs /dev/shm/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=400000 \
+            --cache-dir=/dev/shm/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          echo "$(ts) GCS mounted. Flash weights: $(ls /mnt/gcs/mimo-v2-flash-hf-weights/*.safetensors 2>/dev/null | wc -l) safetensors" | tee -a ${RESULT_LOG}
+
+          T_START=$(date +%s)
+          echo "$(ts) === Launching server (tp=8, page-size=32, Orbax restore) ===" | tee -a ${RESULT_LOG}
+          JAX_COMPILATION_CACHE_DIR=${BUCKET}/jax-compilation-cache \
+          SGLANG_CHECKPOINT_DIR=${BUCKET}/sglang-checkpoint \
+          python3 -m sgl_jax.launch_server \
+            --model-path /mnt/gcs/mimo-v2-flash-hf-weights \
+            --trust-remote-code \
+            --tp-size 8 \
+            --device tpu \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.75 \
+            --page-size 32 \
+            --chunked-prefill-size 2048 \
+            --max-running-requests 32 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            --nnodes 1 \
+            --node-rank 0 \
+            >> ${RESULT_LOG} 2>&1 &
+          SERVER_PID=$!
+
+          echo "$(ts) Waiting for /health (PID=${SERVER_PID}) ..." | tee -a ${RESULT_LOG}
+          for i in $(seq 1 1440); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              T_HEALTHY=$(date +%s)
+              STARTUP_S=$((T_HEALTHY - T_START))
+              echo "$(ts) Server healthy after ${STARTUP_S}s" | tee -a ${RESULT_LOG}
+              break
+            fi
+            if ! kill -0 ${SERVER_PID} 2>/dev/null; then
+              echo "$(ts) ERROR: server died. Last logs:" | tee -a ${RESULT_LOG}
+              tail -50 ${RESULT_LOG}
+              exit 1
+            fi
+            [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting ($((i * 5))s)" | tee -a ${RESULT_LOG}
+            sleep 5
+          done
+
+          echo "" | tee -a ${RESULT_LOG}
+          echo "$(ts) === Running performance sweep (page-size=32 new baseline) ===" | tee -a ${RESULT_LOG}
+          echo "  Config: tp=8, page-size=32, max-running-requests=32" | tee -a ${RESULT_LOG}
+          echo "  Prior baseline (page-size=16): 371 tok/s @ conc=8, TPOT=21.6ms" | tee -a ${RESULT_LOG}
+          echo "  Opt F result:                  528 tok/s @ conc=32 (+42%)" | tee -a ${RESULT_LOG}
+          echo "" | tee -a ${RESULT_LOG}
+
+          python3 /workspace/scripts/perf_sweep_flash.py \
+            --server http://localhost:8080 \
+            --model "MiMo-V2-Flash" \
+            --n-requests 20 \
+            --phase 0 \
+            --result-path ${RESULT_JSON} \
+            2>&1 | tee -a ${RESULT_LOG}
+
+          echo "" | tee -a ${RESULT_LOG}
+          echo "$(ts) === Uploading results to GCS ===" | tee -a ${RESULT_LOG}
+          gsutil cp ${RESULT_JSON} ${RESULTS_DIR}/flash_baseline_pagesz32_${TIMESTAMP}.json
+          gsutil cp ${RESULT_LOG}  ${RESULTS_DIR}/flash_baseline_pagesz32_${TIMESTAMP}.txt
+          echo "$(ts) Results: ${RESULTS_DIR}/flash_baseline_pagesz32_${TIMESTAMP}.json" | tee -a ${RESULT_LOG}
+          echo "$(ts) === Baseline (page-size=32) benchmark complete ===" | tee -a ${RESULT_LOG}
+
+          kill ${SERVER_PID} 2>/dev/null || true
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          limits:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
+          requests:
+            cpu: "220"
+            memory: 900Gi
+            google.com/tpu: "4"
