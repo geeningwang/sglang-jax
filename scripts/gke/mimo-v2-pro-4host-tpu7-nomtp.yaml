@@ -1,0 +1,281 @@
+# §3.2 MiMo-V2.5-Pro TPU No-MTP bench_serving — No-MTP only rerun
+# Previous job (mimo-v2-pro-4host-tpu7) completed MTP phase but No-MTP failed:
+# ranks 1-3 did not rejoin JAX distributed init after MTP server was killed.
+# Fix: GCS barrier — all ranks write a ready flag and wait for all 4 before
+# starting the server, guaranteeing simultaneous distributed init.
+#
+# Repo:   https://github.com/primatrix/sglang-jax.git
+# Commit: 1bc2227 (fix(mimo): handle missing token valid mask)
+# HW:     v7x 16-chip (jingnw-dws-tpu7-16ch, topology 2x2x4), tp=32 dp=4 ep=32
+# Model:  gs://jingnw-mimo-v2-5-pro-us-central1/hf-weights
+# Out:    gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/pro-4host-mtp-tpu7/nomtp/
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-v2-pro-4host-tpu7-nomtp-svc
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-v2-pro-4host-tpu7-nomtp
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-pro-4host-tpu7-nomtp-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x4
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-pro-4host-tpu7-nomtp
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-pro-4host-tpu7-nomtp
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "14400"   # 4 h: clone+install+server+4×bench
+  podSets:
+  - count: 4
+    podTemplateRef:
+      name: mimo-v2-pro-4host-tpu7-nomtp-template
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-pro-4host-tpu7-nomtp
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-pro-4host-tpu7-nomtp
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      subdomain: mimo-v2-pro-4host-tpu7-nomtp-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-16ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x4
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-pro-4host-tpu7-nomtp
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          NODE_RANK=${JOB_COMPLETION_INDEX}
+          RANK0_ADDR="mimo-v2-pro-4host-tpu7-nomtp-0.mimo-v2-pro-4host-tpu7-nomtp-svc"
+          RESULTS_BUCKET="gs://jingnw-mimo-v2-5-pro-us-central1"
+          TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+          RESULTS_DIR="${RESULTS_BUCKET}/perf-results/pro-4host-mtp-tpu7"
+          # All ranks must use the same SYNC_PREFIX for the barrier to work.
+          # Use JOB_COMPLETION_INDEX to strip the rank suffix from HOSTNAME.
+          SYNC_PREFIX="${RESULTS_DIR}/sync/${HOSTNAME%-${NODE_RANK}}"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [rank${NODE_RANK}]"; }
+
+          # ── 1. Clone + install ────────────────────────────────────────────────
+          echo "$(ts) === Clone primatrix/sglang-jax @ 1bc2227 ==="
+          git clone https://github.com/primatrix/sglang-jax.git /workspace
+          cd /workspace
+          git checkout 1bc2227
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          # ── 2. Mount GCS bucket ───────────────────────────────────────────────
+          echo "$(ts) === Mounting GCS bucket via gcsfuse ==="
+          if ! command -v gcsfuse &>/dev/null; then
+            export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] \
+          https://packages.cloud.google.com/apt $GCSFUSE_REPO main" \
+              | tee /etc/apt/sources.list.d/gcsfuse.list
+            apt-get update -qq && apt-get install -y -qq gcsfuse
+          fi
+          mount -o remount,size=400g /dev/shm
+          mkdir -p /mnt/gcs /dev/shm/gcsfuse-cache
+          gcsfuse \
+            --implicit-dirs \
+            --file-cache-max-size-mb=400000 \
+            --cache-dir=/dev/shm/gcsfuse-cache \
+            jingnw-mimo-v2-5-pro-us-central1 /mnt/gcs
+          MODEL_PATH=/mnt/gcs/hf-weights
+          echo "$(ts) Pro weights: $(ls ${MODEL_PATH}/*.safetensors 2>/dev/null | wc -l) safetensors files"
+
+          # ── 3. GCS barrier — ensure all 4 ranks are ready before starting ─────
+          # Each rank signals readiness; all wait until 4 flags appear.
+          # Uses a run-specific SYNC_PREFIX to avoid stale flags from prior runs.
+          gcs_barrier() {
+            local LABEL=$1
+            local PREFIX="${SYNC_PREFIX}/${LABEL}"
+            echo "$(ts) Barrier [${LABEL}]: writing ready flag for rank ${NODE_RANK}"
+            echo "ready" | gsutil cp - "${PREFIX}/rank${NODE_RANK}" 2>/dev/null
+            echo "$(ts) Barrier [${LABEL}]: waiting for all 4 ranks..."
+            for i in $(seq 1 720); do   # up to 1 h
+              COUNT=$(gsutil ls "${PREFIX}/rank*" 2>/dev/null | wc -l || echo 0)
+              if [ "${COUNT}" -ge 4 ]; then
+                echo "$(ts) Barrier [${LABEL}]: all 4 ranks ready (${i}×5s)"
+                return 0
+              fi
+              [ $((i % 24)) -eq 0 ] && echo "$(ts) Barrier [${LABEL}]: ${COUNT}/4 ready (${i}×5s)"
+              sleep 5
+            done
+            echo "$(ts) ERROR: barrier [${LABEL}] timed out"
+            return 1
+          }
+
+          # ── 4. Server launch helper ───────────────────────────────────────────
+          launch_server() {
+            local SLOG=$1
+            JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+            python3 -m sgl_jax.launch_server \
+              --model-path "${MODEL_PATH}" \
+              --trust-remote-code \
+              --enable-sequence-parallel \
+              --tp-size 32 \
+              --dp-size 4 \
+              --ep-size 32 \
+              --moe-backend fused_v2 \
+              --nnodes 4 \
+              --node-rank "${NODE_RANK}" \
+              --dist-init-addr "${RANK0_ADDR}:5000" \
+              --host 0.0.0.0 \
+              --port 30271 \
+              --page-size 256 \
+              --context-length 262144 \
+              --disable-radix-cache \
+              --chunked-prefill-size 4096 \
+              --max-prefill-tokens 16384 \
+              --dtype bfloat16 \
+              --mem-fraction-static 0.84 \
+              --swa-full-tokens-ratio 0.2 \
+              --skip-server-warmup \
+              --log-level info \
+              --decode-log-interval 1 \
+              --max-running-requests 256 \
+              --dp-schedule-policy round_robin \
+              --precompile-bs-paddings 1 4 8 16 32 64 128 192 256 \
+              --precompile-token-paddings 4096 \
+              >> "${SLOG}" 2>&1 &
+          }
+
+          # ── 5. No-MTP run ─────────────────────────────────────────────────────
+          OUT="${RESULTS_DIR}/nomtp"
+          SLOG="/tmp/server_nomtp_rank${NODE_RANK}_${TIMESTAMP}.log"
+          T0=$(date +%s)
+
+          # Synchronize all ranks before starting server
+          gcs_barrier "pre-server"
+
+          echo ""
+          echo "$(ts) ════════ Launching No-MTP server (rank ${NODE_RANK}) ════════"
+          launch_server "${SLOG}"
+          SRV=$!
+
+          if [ "${NODE_RANK}" = "0" ]; then
+            # Rank 0: wait for health, run bench, upload, kill server
+            echo "$(ts) Waiting for /health (PID=${SRV}) ..."
+            for i in $(seq 1 1440); do
+              if curl -sf http://localhost:30271/health >/dev/null 2>&1; then
+                echo "$(ts) Server ready in $(($(date +%s) - T0))s"
+                break
+              fi
+              if ! kill -0 "${SRV}" 2>/dev/null; then
+                echo "$(ts) ERROR: server exited. Last 80 lines:"
+                tail -80 "${SLOG}"
+                gsutil cp "${SLOG}" "${OUT}/server_rank0.log" 2>/dev/null || true
+                exit 1
+              fi
+              [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting … $((i*5))s"
+              sleep 5
+            done
+
+            echo ""
+            echo "$(ts) === bench_serving nomtp: bsz 32 64 128 192 ==="
+            for bs in 32 64 128 192; do
+              np=$((bs * 3))
+              RF="/tmp/bench_nomtp_bs${bs}_${TIMESTAMP}.jsonl"
+              BL="/tmp/bench_nomtp_bs${bs}_${TIMESTAMP}.log"
+              echo "$(ts) bsz=${bs} num_prompts=${np}"
+              python3 -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url http://127.0.0.1:30271 \
+                --model "${MODEL_PATH}" \
+                --dataset-name random \
+                --random-input-len 16384 \
+                --random-output-len 4096 \
+                --random-range-ratio 1 \
+                --max-concurrency "${bs}" \
+                --num-prompts "${np}" \
+                --warmup-requests 0 \
+                --output-file "${RF}" \
+                2>&1 | tee "${BL}" || true
+              gsutil cp "${RF}" "${OUT}/bs${bs}/result.jsonl" || true
+              gsutil cp "${BL}" "${OUT}/bs${bs}/bench.log"   || true
+            done
+
+            echo "$(ts) Uploading server log ..."
+            gsutil cp "${SLOG}" "${OUT}/server_rank0.log" || true
+            kill "${SRV}" 2>/dev/null || true
+
+          else
+            # Ranks 1-3: wait for server to die when rank 0 kills it
+            echo "$(ts) Rank ${NODE_RANK}: server running (PID=${SRV}), waiting for rank 0 to finish..."
+            wait "${SRV}" || true
+            echo "$(ts) Rank ${NODE_RANK}: server exited"
+          fi
+
+          echo ""
+          echo "$(ts) === Pro §3.2 No-MTP benchmark complete ==="
+          echo "$(ts)   Results: ${OUT}/"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
+          limits:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"

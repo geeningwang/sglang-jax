@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .claude/
 test.md
+test_summary.md
 .Python
 .python-version
 build/

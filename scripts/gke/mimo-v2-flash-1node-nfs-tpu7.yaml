@@ -1,0 +1,280 @@
+# §3.1 MiMo-V2-Flash TPU MTP + No-MTP bench_serving — NFS model weights
+# Derived from mimo-v2-flash-1node-tpu7.yaml: gcsfuse replaced with NFS mount.
+# NFS server: nfs-flash.us-central1-c.c.tpu-launchpad-playground.internal
+#             (n2-highmem-48, 384 GB RAM, weights in tmpfs — see run-flash-nfs-bench.sh)
+#
+# Repo:   https://github.com/primatrix/sglang-jax.git
+# Commit: 1bc2227 (fix(mimo): handle missing token valid mask)
+# HW:     v7x 4-chip (jingnw-dws-tpu7-4ch, topology 2x2x1), tp=8 dp=2 ep=8
+# Model:  /models/MiMo-V2-Flash  (NFS-served from tmpfs)
+# Out:    gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-1node-nfs-tpu7/
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-1node-nfs-tpu7-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-1node-nfs-tpu7
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-1node-nfs-tpu7
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "14400"   # 4 h: clone+install+NFS mount+2×(server+3×bench)
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-1node-nfs-tpu7-template
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-1node-nfs-tpu7
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-1node-nfs-tpu7
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-1node-nfs-tpu7
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          RESULTS_BUCKET="gs://jingnw-mimo-v2-flash-us-central1"
+          TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+          RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-1node-nfs-tpu7"
+          NFS_IP_FLAG="${RESULTS_BUCKET}/nfs-flash-ip"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          # ── 1. Clone + install ────────────────────────────────────────────────
+          echo "$(ts) === Clone primatrix/sglang-jax @ 1bc2227 ==="
+          git clone https://github.com/primatrix/sglang-jax.git /workspace
+          cd /workspace
+          git checkout 1bc2227
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          # ── 2. Mount NFS model weights ────────────────────────────────────────
+          # The NFS VM is created in parallel with DWS provisioning. Its startup
+          # script writes the VM's internal IP to GCS (zone-agnostic discovery).
+          # We poll for that flag, then mount NFS using the IP directly.
+          echo "$(ts) === Installing nfs-common ==="
+          apt-get update -qq
+          apt-get install -y -qq nfs-common
+
+          echo "$(ts) === Polling GCS for NFS server IP (up to 30 min) ==="
+          NFS_SERVER=""
+          for i in $(seq 1 360); do  # up to 30 min
+            if NFS_SERVER=$(gsutil cat "${NFS_IP_FLAG}" 2>/dev/null) && [ -n "${NFS_SERVER}" ]; then
+              echo "$(ts) NFS server IP: ${NFS_SERVER}"
+              break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) Waiting for NFS server IP... (${i}×5s elapsed)"
+            sleep 5
+          done
+          if [ -z "${NFS_SERVER}" ]; then
+            echo "$(ts) ERROR: NFS server IP never appeared after 30 min"
+            exit 1
+          fi
+
+          # Mount the NFS export directly as MODEL_PATH.
+          # The NFS VM exports /export/flash (a tmpfs) — NFS clients see all files
+          # in that tmpfs without any cross-submount issue.
+          echo "$(ts) === Mounting NFS from ${NFS_SERVER}:/export/flash ==="
+          MODEL_PATH=/tmp/flash-model
+          mkdir -p "${MODEL_PATH}"
+          for i in $(seq 1 120); do  # retry up to 10 min after IP is known
+            if mount -t nfs \
+              -o nfsvers=3,nolock,rsize=1048576,wsize=1048576,hard,intr,timeo=600 \
+              "${NFS_SERVER}:/export/flash" "${MODEL_PATH}" 2>/dev/null; then
+              echo "$(ts) NFS mounted after ${i}×5s"
+              break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) NFS not ready yet, retrying (${i}×5s)..."
+            sleep 5
+          done
+          echo "$(ts) Flash weights: $(ls ${MODEL_PATH}/*.safetensors 2>/dev/null | wc -l) safetensors files"
+          echo "$(ts) Config files: $(ls ${MODEL_PATH}/*.json ${MODEL_PATH}/*.py 2>/dev/null | wc -l) files"
+
+          # ── 3. Server launch helper ───────────────────────────────────────────
+          launch_server() {
+            local MODE=$1
+            local SLOG=$2
+            local BASE_ARGS=(
+              --model-path "${MODEL_PATH}"
+              --trust-remote-code
+              --enable-sequence-parallel
+              --tp-size 8
+              --dp-size 2
+              --ep-size 8
+              --moe-backend fused_v2
+              --nnodes 1
+              --node-rank 0
+              --host 0.0.0.0
+              --port 30271
+              --page-size 256
+              --context-length 262144
+              --disable-radix-cache
+              --chunked-prefill-size 2048
+              --max-prefill-tokens 16384
+              --dtype bfloat16
+              --mem-fraction-static 0.84
+              --swa-full-tokens-ratio 0.2
+              --skip-server-warmup
+              --log-level info
+              --decode-log-interval 1
+              --max-running-requests 256
+              --dp-schedule-policy round_robin
+              --precompile-bs-paddings 1 4 8 16 32 64 128 256
+              --precompile-token-paddings 4096
+            )
+            local MTP_ARGS=()
+            if [ "$MODE" = "mtp" ]; then
+              MTP_ARGS=(
+                --speculative-algorithm NEXTN
+                --speculative-num-steps 3
+                --speculative-num-draft-tokens 4
+                --speculative-eagle-topk 1
+                --speculative-accept-threshold-single 1.0
+                --speculative-accept-threshold-acc 1.0
+              )
+            fi
+            JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+            python3 -m sgl_jax.launch_server \
+              "${BASE_ARGS[@]}" "${MTP_ARGS[@]}" \
+              >> "${SLOG}" 2>&1 &
+          }
+
+          # ── 4. Bench run helper ───────────────────────────────────────────────
+          bench_run() {
+            local MODE=$1
+            local OUT="${RESULTS_DIR}/${MODE}"
+            local SLOG="/tmp/server_${MODE}_${TIMESTAMP}.log"
+            local T0
+            T0=$(date +%s)
+
+            echo ""
+            echo "$(ts) ════════ Launching server: ${MODE} ════════"
+            launch_server "${MODE}" "${SLOG}"
+            local SRV=$!
+
+            echo "$(ts) Waiting for /health (PID=${SRV}) ..."
+            for i in $(seq 1 1440); do
+              if curl -sf http://localhost:30271/health >/dev/null 2>&1; then
+                echo "$(ts) Server ready in $(($(date +%s) - T0))s"
+                break
+              fi
+              if ! kill -0 "${SRV}" 2>/dev/null; then
+                echo "$(ts) ERROR: server exited (${MODE}). Last 80 lines:"
+                tail -80 "${SLOG}"
+                gsutil cp "${SLOG}" "${OUT}/server.log" 2>/dev/null || true
+                return 1
+              fi
+              [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting … $((i*5))s"
+              sleep 5
+            done
+
+            echo ""
+            echo "$(ts) === bench_serving ${MODE}: bsz 32 64 128 ==="
+            for bs in 32 64 128; do
+              local np=$((bs * 3))
+              local RF="/tmp/bench_${MODE}_bs${bs}_${TIMESTAMP}.jsonl"
+              local BL="/tmp/bench_${MODE}_bs${bs}_${TIMESTAMP}.log"
+              echo "$(ts) bsz=${bs} num_prompts=${np}"
+              python3 -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url http://127.0.0.1:30271 \
+                --model "${MODEL_PATH}" \
+                --dataset-name random \
+                --random-input-len 16384 \
+                --random-output-len 4096 \
+                --random-range-ratio 1 \
+                --max-concurrency "${bs}" \
+                --num-prompts "${np}" \
+                --warmup-requests 0 \
+                --output-file "${RF}" \
+                2>&1 | tee "${BL}" || true
+              gsutil cp "${RF}" "${OUT}/bs${bs}/result.jsonl" || true
+              gsutil cp "${BL}" "${OUT}/bs${bs}/bench.log"   || true
+            done
+
+            echo "$(ts) Uploading server log ..."
+            gsutil cp "${SLOG}" "${OUT}/server.log" || true
+
+            kill "${SRV}" 2>/dev/null || true
+            sleep 30
+          }
+
+          # ── 5. MTP run ────────────────────────────────────────────────────────
+          bench_run mtp
+
+          # ── 6. No-MTP run ─────────────────────────────────────────────────────
+          bench_run nomtp
+
+          echo ""
+          echo "$(ts) === Flash NFS benchmark complete ==="
+          echo "$(ts)   Results: ${RESULTS_DIR}/"
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
+          limits:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
