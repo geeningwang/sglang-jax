@@ -21,6 +21,7 @@
 | MTP 配置 | NEXTN 3-step，4 draft tokens/step（与 §五 完全一致） |
 | 服务器配置 | 与 §五 完全一致（DVFS P-state 7，NFS tmpfs 权重，tp=8 dp=2 ep=8） |
 | Manifest | `scripts/gke/mimo-v2-flash-1node-nfs-tpu7-dvfs7-sharegpt.yaml` |
+| 生命周期脚本 | `scripts/gke/run-flash-nfs-bench-dvfs7-sharegpt.sh` |
 | 结果输出 | `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-1node-nfs-tpu7-dvfs7-sharegpt/` |
 | 完成时间 | 2026-06-22T07:28Z |
 
@@ -64,6 +65,7 @@
 | MTP 配置 | NEXTN 3-step，4 draft tokens/step（与 §六 完全一致） |
 | 服务器配置 | 与 §六 完全一致（DVFS P-state 7，gcsfuse 权重，tp=32 dp=4 ep=32，4-host） |
 | Manifest | `scripts/gke/mimo-v2-pro-4host-tpu7-dvfs7-sharegpt.yaml` |
+| 生命周期脚本 | `scripts/gke/run-pro-bench-dvfs7-sharegpt.sh` |
 | 结果输出 | `gs://jingnw-mimo-v2-5-pro-us-central1/perf-results/pro-4host-tpu7-dvfs7-sharegpt/` |
 | 完成时间 | 2026-06-22T12:13Z |
 
