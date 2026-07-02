@@ -1,0 +1,178 @@
+# GKE TPU v7x (Ironwood) – GPT-2 124M training job for sglang-jax NNX port
+#
+# Cluster:   jingnw-tpu7-cluster  (us-central1-c, tpu-launchpad-playground)
+# Node pool: jingnw-dws-tpu7-4ch  (tpu7x-standard-4t, 2x2x1 = 4 chips)
+# Code:      gs://jingnw-nanogpt-code/sglang-jax-nanogpt/
+# Data:      gs://jingnw-nanogpt-code/data/openwebtext/{train,val}.bin
+# Checkpoints: gs://jingnw-nanogpt-code/checkpoints/gpt2-124m-nnx/ckpt.msgpack
+#
+# Prerequisites (one-time):
+#   Data is already in GCS (shared with nanogpt-tpu training).
+#   Code sync (run from sglang-jax repo root):
+#     gsutil -m rsync -r -x '^data/' examples/nanogpt/ \
+#       gs://jingnw-nanogpt-code/sglang-jax-nanogpt/
+#
+# DWS workflow:
+#   kubectl apply -f examples/nanogpt/gke-tpu-train-pr.yaml
+#   kubectl get provisioningrequest nanogpt-sglang-train-pr -w
+#   # wait for Provisioned=True, then:
+#   kubectl apply -f examples/nanogpt/gke-tpu-train-job.yaml
+#
+# Monitor / logs:
+#   kubectl logs -f job/nanogpt-sglang-train
+#   kubectl get job nanogpt-sglang-train
+#
+# Cleanup:
+#   kubectl delete job nanogpt-sglang-train
+#   kubectl delete provisioningrequest nanogpt-sglang-train-pr
+#   kubectl delete podtemplate nanogpt-sglang-train-template
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nanogpt-sglang-train
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: nanogpt-sglang-train-pr
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+
+      # ── Node scheduling ──────────────────────────────────────────────────────
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      # ────────────────────────────────────────────────────────────────────────
+
+      initContainers:
+
+      # ── 1. Fetch training code from GCS ─────────────────────────────────────
+      - name: fetch-code
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command: [sh, -c]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace/sglang-jax-nanogpt
+          gsutil -m rsync -r \
+            gs://jingnw-nanogpt-code/sglang-jax-nanogpt \
+            /workspace/sglang-jax-nanogpt
+          echo "Code ready: $(ls /workspace/sglang-jax-nanogpt/)"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+
+      # ── 2. Fetch tokenised training data from GCS ────────────────────────────
+      # train.bin ~17 GB, val.bin ~8.5 MB.  Parallel copy takes ~2-3 min.
+      - name: fetch-data
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command: [sh, -c]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace/sglang-jax-nanogpt/data/openwebtext
+          gsutil -m cp \
+            gs://jingnw-nanogpt-code/data/openwebtext/train.bin \
+            gs://jingnw-nanogpt-code/data/openwebtext/val.bin \
+            /workspace/sglang-jax-nanogpt/data/openwebtext/
+          echo "Data ready: $(du -sh /workspace/sglang-jax-nanogpt/data/openwebtext/)"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+
+      # ── 3. Fetch latest checkpoint from GCS (if one exists) ─────────────────
+      # NNX checkpoint is at a different path from the Linen version
+      # (gpt2-124m-nnx vs gpt2-124m) — the formats are incompatible.
+      - name: fetch-checkpoint
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command: [sh, -c]
+        args:
+        - |
+          set -euo pipefail
+          GCS_CKPT="gs://jingnw-nanogpt-code/checkpoints/gpt2-124m-nnx/ckpt.msgpack"
+          mkdir -p /workspace/sglang-jax-nanogpt/out
+          if gsutil -q stat "$GCS_CKPT" 2>/dev/null; then
+            echo "NNX checkpoint found — resuming."
+            gsutil cp "$GCS_CKPT" /workspace/sglang-jax-nanogpt/out/ckpt.msgpack
+            echo "resume" > /workspace/sglang-jax-nanogpt/out/init_from.txt
+          else
+            echo "No NNX checkpoint found — starting from scratch."
+            echo "scratch" > /workspace/sglang-jax-nanogpt/out/init_from.txt
+          fi
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+      # ────────────────────────────────────────────────────────────────────────
+
+      containers:
+      - name: train
+        image: python:3.11-slim
+        command: [/bin/bash, -c]
+        args:
+        - |
+          set -euxo pipefail
+
+          # ── 1. Install JAX with TPU backend ──────────────────────────────────
+          pip install --quiet --upgrade pip
+          pip install --quiet "jax[tpu]" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          # ── 2. Install Python dependencies ───────────────────────────────────
+          pip install --quiet \
+            flax \
+            optax \
+            numpy \
+            msgpack \
+            google-cloud-storage
+
+          # ── 3. Determine init_from (set by fetch-checkpoint init container) ──
+          INIT_FROM=$(cat /workspace/sglang-jax-nanogpt/out/init_from.txt 2>/dev/null || echo "scratch")
+          echo "init_from=$INIT_FROM"
+
+          # ── 4. Run training ───────────────────────────────────────────────────
+          cd /workspace/sglang-jax-nanogpt
+          python train.py config/train_gpt2.py \
+            --init_from="$INIT_FROM" \
+            --wandb_log=False \
+            --always_save_checkpoint=True \
+            --tpu_peak_tflops=2307.0
+
+          echo "Training session complete."
+
+        env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+        # GCS URI for checkpoint sync after each eval_interval.
+        # train.py reads this env var and uploads via google-cloud-storage.
+        - name: GCS_CHECKPOINT
+          value: "gs://jingnw-nanogpt-code/checkpoints/gpt2-124m-nnx/ckpt.msgpack"
+
+        resources:
+          requests:
+            google.com/tpu: 4
+          limits:
+            google.com/tpu: 4
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+
+      volumes:
+      - name: workspace
+        emptyDir: {}

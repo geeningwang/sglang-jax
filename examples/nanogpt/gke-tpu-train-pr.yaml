@@ -1,0 +1,55 @@
+# DWS ProvisioningRequest — NanoGPT (SGLang-JAX NNX) training on TPU v7x (Ironwood)
+#
+# Apply FIRST, wait for PROVISIONED=True, then apply the Job:
+#   kubectl apply -f examples/nanogpt/gke-tpu-train-pr.yaml
+#   kubectl get provisioningrequest nanogpt-sglang-train-pr -w
+#   kubectl apply -f examples/nanogpt/gke-tpu-train-job.yaml
+#
+# Cluster:   jingnw-tpu7-cluster  (us-central1-c, tpu-launchpad-playground)
+# Node pool: jingnw-dws-tpu7-4ch  (tpu7x-standard-4t, 2x2x1 = 4 chips)
+
+# ── PodTemplate: resource shape for the ProvisioningRequest ───────────────────
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: nanogpt-sglang-train-template
+  namespace: default
+template:
+  metadata:
+    labels:
+      app: nanogpt-sglang-train
+  spec:
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: "google.com/tpu"
+      operator: "Equal"
+      value: "present"
+      effect: "NoSchedule"
+    containers:
+    - name: train
+      image: python:3.11-slim
+      resources:
+        requests:
+          google.com/tpu: 4
+        limits:
+          google.com/tpu: 4
+
+---
+# ── ProvisioningRequest ───────────────────────────────────────────────────────
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: nanogpt-sglang-train-pr
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    # 24-hour DWS session window; resubmit PR + Job after expiry to continue.
+    maxRunDurationSeconds: "86400"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: nanogpt-sglang-train-template

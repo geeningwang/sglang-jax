@@ -1,0 +1,122 @@
+# GKE TPU v7x (Ironwood) – GPT-2 inference demo for sglang-jax NNX nanogpt port
+#
+# Loads pre-trained GPT-2 weights from HuggingFace, runs sample.py on 4 chips.
+#
+# Cluster:   jingnw-tpu7-cluster  (us-central1-c, tpu-launchpad-playground)
+# Node pool: jingnw-dws-tpu7-4ch  (tpu7x-standard-4t, 2x2x1 = 4 chips)
+# Code:      gs://jingnw-nanogpt-code/sglang-jax-nanogpt/
+#
+# Prerequisites:
+#   Apply ProvisioningRequest first (gke-tpu-train-pr.yaml), wait for Provisioned=True.
+#   Code sync (run from sglang-jax repo root):
+#     gsutil -m rsync -r -x '^data/' examples/nanogpt/ \
+#       gs://jingnw-nanogpt-code/sglang-jax-nanogpt/
+#
+# Monitor:
+#   kubectl logs -f job/nanogpt-sglang-sample
+#
+# Cleanup:
+#   kubectl delete job nanogpt-sglang-sample
+#   kubectl delete provisioningrequest nanogpt-sglang-train-pr
+#   kubectl delete podtemplate nanogpt-sglang-train-template
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nanogpt-sglang-sample
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 1
+  parallelism: 1
+  ttlSecondsAfterFinished: 7200
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: nanogpt-sglang-train-pr
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+
+      initContainers:
+
+      # ── Fetch code from GCS ──────────────────────────────────────────────────
+      - name: fetch-code
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+        command: [sh, -c]
+        args:
+        - |
+          set -euo pipefail
+          mkdir -p /workspace/sglang-jax-nanogpt
+          gsutil -m rsync -r \
+            gs://jingnw-nanogpt-code/sglang-jax-nanogpt \
+            /workspace/sglang-jax-nanogpt
+          echo "Code ready: $(ls /workspace/sglang-jax-nanogpt/)"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+
+      containers:
+      - name: sample
+        image: python:3.11-slim
+        command: [/bin/bash, -c]
+        args:
+        - |
+          set -euxo pipefail
+
+          # ── Install JAX with TPU backend ────────────────────────────────────
+          pip install --quiet --upgrade pip
+          pip install --quiet "jax[tpu]" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          # ── Install Python dependencies ─────────────────────────────────────
+          pip install --quiet \
+            flax \
+            optax \
+            numpy \
+            tiktoken \
+            huggingface_hub \
+            safetensors
+
+          # ── Run inference demo ───────────────────────────────────────────────
+          cd /workspace/sglang-jax-nanogpt
+          python sample.py \
+            --init_from=gpt2 \
+            --start="The meaning of life is" \
+            --num_samples=3 \
+            --max_new_tokens=200 \
+            --temperature=0.8 \
+            --top_k=200
+
+          echo "Inference demo complete."
+
+        env:
+        - name: PJRT_DEVICE
+          value: "TPU"
+
+        resources:
+          requests:
+            google.com/tpu: 4
+          limits:
+            google.com/tpu: 4
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+
+      volumes:
+      - name: workspace
+        emptyDir: {}
