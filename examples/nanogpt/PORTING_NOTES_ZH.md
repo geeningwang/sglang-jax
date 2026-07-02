@@ -1,570 +1,477 @@
-# nanogpt TPU → SGLang-JAX 移植详解
+# NanoGPT NNX 移植说明
 
-本文档逐行对比原始 `nanogpt-tpu` 实现（Flax **Linen**）与 SGLang-JAX 移植版（Flax **NNX**），并解释每处差异的原因。
+**源代码**：`~/transformer/nanogpt-tpu-nnx/`（Flax NNX，使用标准 NNX 层）
+**目标代码**：本仓库 `examples/nanogpt/`（Flax NNX，遵循 SGLang-JAX 约定）
 
-参考路径：
-- 原始版：`~/transformer/nanogpt-tpu/{model,sample}.py`
-- 移植版：`examples/nanogpt/{model,sample}.py`
-
----
-
-## 第一部分 — `model.py`
-
-### 1.1 导入
-
-**原始版（Linen）**
-```python
-import flax.linen as nn
-```
-
-**NNX 移植版**
-```python
-from flax import nnx
-```
-
-**原因：** Linen（`flax.linen`）和 NNX（`flax.nnx`）是 Flax 包内两套独立的模块系统。Linen 是较旧的函数式 API；NNX 是 Flax 0.8 引入的有状态 API。两者不能混用：Linen 的 `nn.Module` 不能作为 NNX `nnx.Module` 的子模块，反之亦然。
+两者均已是 Flax NNX 实现——这并非 Linen→NNX 的移植。差异在于 NNX 的使用方式：源代码依赖标准
+NNX 层（`nnx.Linear`、`nnx.LayerNorm`、`nnx.Dropout`）以及 `rngs` 构造模式；目标代码则以自定义
+的纯参数层替换之，以匹配 SGLang-JAX 服务栈的约定，并支持在不需要 `rngs` 对象的情况下直接赋值
+HuggingFace 权重。
 
 ---
 
-### 1.2 `GPTConfig` — 无变化
+## 第一部分 — model.py
 
-```python
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304
-    n_layer:  int = 12
-    n_head:   int = 12
-    n_embd:   int = 768
-    dropout:  float = 0.0
-    bias:     bool = True
-```
+### 1. 模块构造：移除 `rngs`
 
-两个版本完全相同。`@dataclass` 是纯 Python 结构，两个框架都可以使用。
-
----
-
-### 1.3 模块类声明
-
-**原始版**
-```python
-class CausalSelfAttention(nn.Module):
-    config: GPTConfig          # 类级别字段注解（Linen dataclass 风格）
-
-    @nn.compact                # 魔法装饰器：首次调用时初始化参数
-    def __call__(self, x, training: bool = False):
-        ...
-```
-
-**NNX 移植版**
+**源代码** (`nanogpt-tpu-nnx/model.py`)：
 ```python
 class CausalSelfAttention(nnx.Module):
-    # 无类级别字段注解
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        ...
+        self.c_attn = nnx.Linear(C, 3 * C, ..., rngs=rngs)
 
-    def __init__(self, config: GPTConfig):
-        cfg = config
-        ...                    # 所有子模块在此创建，存储为实例属性
+class Block(nnx.Module):
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        self.ln_1 = nnx.LayerNorm(config.n_embd, ..., rngs=rngs)
+        ...
+
+class GPT(nnx.Module):
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        ...
+        self.h = nnx.List([Block(config, rngs) for _ in range(config.n_layer)])
 ```
 
-**原因：**
-- **Linen** 模块是*冻结的 dataclass*。配置字段在类级别声明（`config: GPTConfig`）。参数和子模块**不**存储为实例属性；`@nn.compact` 将其创建推迟到首次调用时，并存入外部 pytree。`self.param(...)` 和 `nn.Dense` 在 `@nn.compact` 内部的调用会注册到该 pytree 中。
-- **NNX** 模块是*普通 Python 对象*。配置是常规的 `__init__` 参数。参数和子模块作为实例属性存储在 `__init__` 中赋值。没有 `@nn.compact`，没有延迟初始化。
+**目标代码** (`examples/nanogpt/model.py`)：
+```python
+class CausalSelfAttention(nnx.Module):
+    def __init__(self, config: GPTConfig):   # 无 rngs
+        ...
+        self.c_attn = Linear(cfg.n_embd, 3 * cfg.n_embd, ...)
+
+class Block(nnx.Module):
+    def __init__(self, config: GPTConfig):   # 无 rngs
+        self.ln_1 = LayerNorm(config.n_embd, ...)
+        ...
+
+class GPT(nnx.Module):
+    def __init__(self, config: GPTConfig):   # 无 rngs
+        ...
+        self.blocks = nnx.List([Block(cfg) for _ in range(cfg.n_layer)])
+```
+
+**原因**：标准 `nnx.Linear` 和 `nnx.LayerNorm` 在构造时需要 `rngs: nnx.Rngs` 参数（用于参数初始化）。
+目标代码使用自定义的 `Linear` 和 `LayerNorm` 类，通过固定的 `jax.random.PRNGKey` 初始化参数，
+无需 `rngs` 对象。这将实例化简化为 `model = GPT(cfg)`，也使直接赋值 HF 权重更加方便。
 
 ---
 
-### 1.4 LayerNorm
+### 2. `nnx.Linear` → 自定义 `Linear` 类；权重属性 `kernel` → `weight`
 
-**原始版**
+**源代码**：
 ```python
-self.ln_1 = nn.LayerNorm(use_bias=cfg.bias)
-```
-`nn.LayerNorm` 是 Linen 内置层，首次调用时在外部 pytree 中创建自己的 `scale` 和 `bias` 参数。
-
-**NNX 移植版**
-```python
-class LayerNorm(nnx.Module):
-    def __init__(self, num_features, use_bias=True, epsilon=1e-5, ...):
-        self.scale = nnx.Param(jnp.ones((num_features,), dtype=param_dtype))
-        self.bias: nnx.Param | None = (
-            nnx.Param(jnp.zeros((num_features,), dtype=param_dtype)) if use_bias else None
-        )
-
-    def __call__(self, x):
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var  = jnp.var(x,  axis=-1, keepdims=True)
-        x_norm = (x - mean) * jax.lax.rsqrt(var + self.epsilon)
-        out = self.scale.value * x_norm
-        if self.bias is not None:
-            out = out + self.bias.value
-        return out
+self.c_attn = nnx.Linear(
+    C, 3 * C,
+    use_bias=config.bias,
+    kernel_init=nnx.initializers.normal(0.02),
+    rngs=rngs,
+)
+# 参数属性：self.c_attn.kernel（标准 NNX 命名）
 ```
 
-**为什么不用 `nnx.LayerNorm`？** `nnx.LayerNorm` 存在，但构造时需要 `rngs` 参数（为未来随机扩展预留），会带来额外样板代码。自定义类避免了这一点，且使 `scale`/`bias` 属性显式可见，在 `sample.py` 中赋值 HuggingFace 权重时更加直接：`block.ln_1.scale.value = ...`。
-
-**为什么用 `jax.lax.rsqrt` 而不是 `jnp.sqrt`？** `lax.rsqrt` 是单个 XLA 算子（倒数平方根），可融合成一个 kernel；`1/jnp.sqrt(...)` 需要两个算子。
-
----
-
-### 1.5 线性层
-
-**原始版** — 直接内联使用 `nn.Dense`：
-```python
-qkv = nn.Dense(3 * C, use_bias=cfg.bias,
-               kernel_init=nn.initializers.normal(0.02),
-               name='c_attn')(x)
-```
-`nn.Dense` 是 Linen 内置层。在 `@nn.compact` 内部必须指定 `name=` 参数，才能在参数 pytree 中获得稳定的键名。
-
-**NNX 移植版** — 自定义 `Linear` 类：
+**目标代码**：
 ```python
 class Linear(nnx.Module):
-    def __init__(self, in_features, out_features, use_bias=True, std=0.02, ...):
+    def __init__(self, in_features, out_features, use_bias=True, std=0.02, dtype=jnp.float32):
         self.weight = nnx.Param(
             jax.random.normal(jax.random.PRNGKey(0), (in_features, out_features)) * std
         )
-        self.bias: nnx.Param | None = (
-            nnx.Param(jnp.zeros((out_features,), dtype=dtype)) if use_bias else None
-        )
+        self.bias = nnx.Param(jnp.zeros((out_features,))) if use_bias else None
 
     def __call__(self, x):
         out = x @ self.weight.value
         if self.bias is not None:
             out = out + self.bias.value
         return out
+
+self.c_attn = Linear(cfg.n_embd, 3 * cfg.n_embd, use_bias=cfg.bias, std=0.02)
+# 参数属性：self.c_attn.weight（从 kernel 改名）
 ```
 
-**为什么自定义类？**
-1. `nnx.Linear` 构造时需要 `rngs` 参数（与 LayerNorm 原因相同）。
-2. 自定义类以 `(in_features, out_features)` 布局存储权重，与 GPT-2 Conv1D 约定和 SGLang-JAX 服务模型中的 `LinearBase` 一致——权重加载时无需转置。
-3. 显式的 `self.weight` 和 `self.bias` 属性使 `sample.py` 中的 HuggingFace 权重赋值直接明了：`block.attn.c_attn.weight.value = ...`。
-
-**`nn.Dense` 的 kernel 布局**也是 `(in, out)`，因此数学上完全相同；区别仅在于参数的存储和访问方式。
+**原因**：自定义 `Linear` 避免了 `rngs` 依赖，并将权重命名为 `weight` 而非 `kernel`。两者均以
+`(in_features, out_features)` 布局存储权重——与 GPT-2 Conv1D 布局一致——因此加载 HF 权重时无需转置。
+属性名从 `kernel` 改为 `weight` 的变化在所有权重加载代码中同步体现。
 
 ---
 
-### 1.6 Dropout
+### 3. `nnx.LayerNorm` → 自定义 `LayerNorm` 类
 
-**原始版**
+**源代码**：
 ```python
-attn_weights = nn.Dropout(cfg.dropout)(attn_weights, deterministic=not training)
-```
-`nn.Dropout` 是 Linen 模块。`deterministic=True` 使其成为空操作（推理模式）。它通过调用点传入的 `rngs={'dropout': key}` 使用随机密钥——调用方负责传入密钥。
-
-**NNX 移植版**
-```python
-if self.dropout_rate > 0.0 and rng is not None:
-    rng, drop_rng = jax.random.split(rng)
-    keep = jax.random.bernoulli(drop_rng, 1.0 - self.dropout_rate, attn_weights.shape)
-    attn_weights = jnp.where(keep, attn_weights / (1.0 - self.dropout_rate), 0.0)
+self.ln_1 = nnx.LayerNorm(config.n_embd, use_bias=config.bias, rngs=rngs)
+# 参数：.scale, .bias（标准 NNX 属性名）
 ```
 
-**为什么手动实现而不用 `nnx.Dropout`？**
-- `nnx.Dropout` 持有有状态的 `nnx.Rngs` 对象。在 `jax.pmap` 下，每个设备需要自己的 `Rngs`，这要求在复制状态中传递每设备密钥——非常复杂。
-- 手动实现是透明的 `jnp.where`；JAX/XLA 将其编译为带掩码的乘法（与 Dropout kernel 底层实现相同）。
-- `if self.dropout_rate > 0.0 and rng is not None` 守卫意味着推理（不传 `rng`）是严格的空操作，**零开销**，不会将分支编译进 XLA。
+**目标代码**：
+```python
+class LayerNorm(nnx.Module):
+    def __init__(self, num_features, use_bias=True, epsilon=1e-5):
+        self.scale = nnx.Param(jnp.ones((num_features,)))
+        self.bias  = nnx.Param(jnp.zeros((num_features,))) if use_bias else None
+
+    def __call__(self, x):
+        orig_dtype = x.dtype
+        x      = x.astype(jnp.float32)
+        mean   = jnp.mean(x, axis=-1, keepdims=True)
+        var    = jnp.var(x, axis=-1, keepdims=True)
+        x_norm = (x - mean) * jax.lax.rsqrt(var + self.epsilon)
+        out    = self.scale.value * x_norm
+        if self.bias is not None:
+            out = out + self.bias.value
+        return out.astype(orig_dtype)
+
+self.ln_1 = LayerNorm(config.n_embd, use_bias=config.bias)
+# 参数：.scale, .bias（与 nnx.LayerNorm 相同的属性名）
+```
+
+**原因**：`nnx.LayerNorm` 需要 `rngs`。自定义类保留了相同的属性名（`.scale`、`.bias`），因此 HF
+权重赋值代码无需改动。实现手动计算均值和方差，并在计算时转为 `float32` 以保证数值稳定性，最后
+转回原始 dtype。
 
 ---
 
-### 1.7 Block 结构
+### 4. `nnx.Dropout` → 手动 Bernoulli Dropout；`training: bool` → `rng: Optional[jax.Array]`
 
-**原始版**
+**源代码**：
 ```python
-class Block(nn.Module):
-    config: GPTConfig
+# 构造时创建 Dropout 模块
+self.attn_drop  = nnx.Dropout(config.dropout, rngs=rngs)
+self.resid_drop = nnx.Dropout(config.dropout, rngs=rngs)
+self.drop       = nnx.Dropout(config.dropout, rngs=rngs)  # GPT 中的嵌入 Dropout
 
-    def setup(self):               # Linen 生命周期钩子：首次使用前调用一次
-        cfg = self.config
-        self.ln_1 = nn.LayerNorm(use_bias=cfg.bias)
-        self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = nn.LayerNorm(use_bias=cfg.bias)
-        self.mlp  = MLP(cfg)
-
-    def __call__(self, x, training: bool = False):
-        x = x + self.attn(self.ln_1(x), training=training)
-        x = x + self.mlp(self.ln_2(x), training=training)
-        return x
-```
-
-`setup()` 是 Linen 生命周期钩子，在首次调用 `__call__` 前运行。它是 `@nn.compact` 的替代方案，适用于需要显式子模块名称的场景（如按名称加载权重）。
-
-**NNX 移植版**
-```python
-class Block(nnx.Module):
-    def __init__(self, config: GPTConfig):
-        self.ln_1 = LayerNorm(config.n_embd, use_bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, use_bias=config.bias)
-        self.mlp  = MLP(config)
-
-    def __call__(self, x, rng=None):
-        attn_rng, mlp_rng = (jax.random.split(rng) if rng is not None else (None, None))
-        x = x + self.attn(self.ln_1(x), rng=attn_rng)
-        x = x + self.mlp(self.ln_2(x),  rng=mlp_rng)
-        return x
-```
-
-**为什么没有 `setup()`？** NNX 没有生命周期钩子；`__init__` 是唯一的构造函数。所有子模块作为普通属性赋值——使用 Python 自身的属性协议。
-
-**`rng` 传递：** 不再使用调用方与外部密钥组合的 `training: bool` 标志，而是在需要 dropout 时显式传递密钥。`None` 表示推理模式。
-
----
-
-### 1.8 顶层 GPT 模块 — 参数声明
-
-**原始版**（在 `@nn.compact __call__` 内部）：
-```python
-wte = self.param('wte', nn.initializers.normal(0.02), (cfg.vocab_size, cfg.n_embd))
-wpe = self.param('wpe', nn.initializers.normal(0.02), (cfg.block_size, cfg.n_embd))
-```
-`self.param(name, init_fn, shape)` 在外部参数 pytree 中以键 `name` 注册一个叶节点。初始化函数在首次 `model.apply(...)` 时调用一次。
-
-**NNX 移植版**（在 `__init__` 中）：
-```python
-self.wte = nnx.Param(
-    jax.random.normal(jax.random.PRNGKey(1), (cfg.vocab_size, cfg.n_embd)) * 0.02
-)
-self.wpe = nnx.Param(
-    jax.random.normal(jax.random.PRNGKey(2), (cfg.block_size, cfg.n_embd)) * 0.02
-)
-```
-`nnx.Param` 是 JAX 数组的薄包装器。在构造时立即创建（无延迟初始化）。关键区别：**张量存在于模块内部**，而非外部 pytree。
-
-**PRNGKey 种子：** 原始版从调用点传入 `model.apply(...)` 的 `rngs` 参数中获取密钥，种子由外部控制。NNX 版使用硬编码种子（`PRNGKey(1)`、`PRNGKey(2)`），因为初始值在 `sample.py` 中会立即被 HuggingFace 权重覆盖，或在训练中被 `nnx.split` + `nnx.merge` 替换——精确的初始化值无关紧要。
-
----
-
-### 1.9 层列表
-
-**原始版**
-```python
-for i in range(cfg.n_layer):
-    x = Block(cfg, name=f'h_{i}')(x, training=training)
-```
-Block 在每次 `@nn.compact` 调用时内联创建；Linen 按 `name` 缓存它们。`name=f'h_{i}'` 是必须的，这样每个 block 的参数在 pytree 中才有稳定的键（`h_0`、`h_1`……）。
-
-**NNX 移植版**
-```python
-self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
-```
-普通 Python 列表，包含 NNX 模块。`nnx.split` 递归遍历对象属性；列表元素自动包含在内。无需显式名称——NNX 使用整数索引作为 pytree 键。
-
-**`nnx.data` 注意：** SGLang-JAX 代码库中有时使用 `nnx.data([...])` 存放模块列表，但该 API 在 Flax 0.8.5（开发环境版本）中不存在。普通 Python 列表效果完全相同，因为 `nnx.split` 原生处理列表。
-
----
-
-### 1.10 权重绑定（Weight Tying）
-
-**原始版**（在 `@nn.compact` 内部）：
-```python
-wte = self.param('wte', ...)    # 局部变量，下方两处使用同一对象
-...
-logits = x @ wte.T              # wte 复用于 lm_head 投影
-```
-`wte` 是 `self.param` 返回的局部 JAX 数组。使用两次成本极低——两个 `jnp.matmul` 调用引用同一张量。
-
-**NNX 移植版**：
-```python
-self.wte = nnx.Param(...)       # self 的属性
-...
-logits = x @ self.wte.value.T   # .value 解包 nnx.Param 包装器
-```
-思路相同；需要 `.value` 是因为 `nnx.Param` 是包装类而非裸数组。访问 `.value` 返回底层 JAX 数组。
-
----
-
-### 1.11 `estimate_mfu` 签名
-
-**原始版**
-```python
-def estimate_mfu(self, params, fwdbwd_per_iter, dt, tpu_peak_tflops=2307.0):
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-```
-需要传入外部 `params` pytree，因为 Linen 模型不拥有自己的参数。
-
-**NNX 移植版**
-```python
-def estimate_mfu(self, fwdbwd_per_iter, dt, tpu_peak_tflops=918.0):
+# 调用签名
+def __call__(self, x, training: bool = False):
     ...
-def num_params(self):
+    attn_w = self.attn_drop(attn_w, deterministic=not training)
+    y      = self.resid_drop(y, deterministic=not training)
+```
+
+**目标代码**：
+```python
+# 不存储 Dropout 模块；只存 dropout_rate 浮点数
+self.dropout_rate = cfg.dropout
+
+# 调用签名
+def __call__(self, x, rng: Optional[jax.Array] = None):
+    ...
+    if self.dropout_rate > 0.0 and rng is not None:
+        rng, drop_rng = jax.random.split(rng)
+        keep = jax.random.bernoulli(drop_rng, 1.0 - self.dropout_rate, attn_weights.shape)
+        attn_weights = jnp.where(keep, attn_weights / (1.0 - self.dropout_rate), 0.0)
+```
+
+**原因**：`nnx.Dropout` 将自身的 RNG 状态存为 NNX 变量，增加了 `nnx.split/merge` 工作流的复杂度。
+目标代码改用手动 Bernoulli 掩码。`training: bool` 标志替换为 `rng: Optional[jax.Array]`——传入
+`rng=None` 即关闭 Dropout（推理模式），传入 key 则启用（训练模式）。
+
+---
+
+### 5. Block 列表重命名：`self.h` → `self.blocks`
+
+**源代码**：
+```python
+self.h = nnx.List([Block(config, rngs) for _ in range(config.n_layer)])
+
+for block in self.h:
+    x = block(x, training=training)
+```
+
+**目标代码**：
+```python
+self.blocks = nnx.List([Block(cfg) for _ in range(cfg.n_layer)])
+
+for block in self.blocks:
+    x = block(x, rng=block_rng)
+```
+
+**原因**：`blocks` 比 `h` 更具描述性。两者均使用 `nnx.List`——在较新版本的 Flax 中，普通 Python
+`list` 会因被视为包含数据的静态属性而抛出 `ValueError`。
+
+---
+
+### 6. 因果掩码填充值：`-jnp.inf` → `jnp.finfo(...).min`
+
+**源代码**：
+```python
+attn_w = jnp.where(causal_mask, attn_w, -jnp.inf)
+```
+
+**目标代码**：
+```python
+attn_weights = jnp.where(causal_mask, attn_weights, jnp.finfo(attn_weights.dtype).min)
+```
+
+**原因**：`-jnp.inf` 是 Python 的 `float64` 常量。使用 `jnp.finfo(dtype).min` 可生成实际计算
+dtype 的最小有限值（如 `float32` 对应 `-3.4e38`），避免在注意力行全被掩码时，`softmax` 计算出
+`nan`。
+
+---
+
+### 7. 新增 `num_params()` 方法；`estimate_mfu` 参数计数简化
+
+**源代码**——无 `num_params()` 方法；`estimate_mfu` 中直接过滤计数：
+```python
+n_params = sum(
+    v.size for v in jax.tree_util.tree_leaves(nnx.state(self, nnx.Param))
+)
+```
+
+**目标代码**——新增 `num_params()`，计数所有 state 叶节点（不过滤）：
+```python
+def num_params(self) -> int:
     state = nnx.state(self)
     return sum(v.size for v in jax.tree_util.tree_leaves(state))
 ```
-参数存在于模块内部，`nnx.state(self)` 无需外部参数即可提取。`num_params()` 被抽取为独立辅助方法。
 
-**默认 `tpu_peak_tflops` 差异：** 原始版默认 2307（v7x Ironwood）；NNX 移植版默认 918（v6e Trillium），因为训练脚本在 v7x 上运行时会通过 `--tpu_peak_tflops=2307.0` 覆盖。两者对各自用例均正确。
+不过滤是因为自定义模块只存储 `nnx.Param` 叶节点（没有 `nnx.BatchStat` 等其他变量类型），结果
+完全相同。`estimate_mfu` 调用 `self.num_params()` 而非重复计数逻辑。
 
 ---
 
-## 第二部分 — `sample.py`
+## 第二部分 — sample.py
 
-### 2.1 导入
+### 8. 默认 `init_from`：`'resume'` → `'gpt2'`
 
-**原始版**
+**源代码**：
 ```python
-from flax.training import train_state
-from flax import traverse_util
-import optax
-from model import GPTConfig, GPT     # Linen GPT
+init_from = 'resume'   # 默认：从检查点加载
 ```
 
-**NNX 移植版**
+**目标代码**：
 ```python
-from flax import nnx, serialization
-from model import GPT, GPTConfig     # NNX GPT
+init_from = "gpt2"     # 默认：下载 GPT-2 预训练权重
 ```
 
-- `train_state` 和 `traverse_util` 是 Linen 时代用于管理 `(params, opt_state)` 捆绑包的工具。NNX 没有等价物，因为模型自身拥有状态。
-- `sample.py` 中不导入 `optax`，因为推理不需要优化器。（原始版导入是为了重建检查点加载所需的优化器结构，因为 Linen 检查点嵌入了包含优化器状态的 `TrainState`。）
+**原因**：目标代码是独立的推理演示脚本，开箱即可运行，无需预先存在的检查点。
 
 ---
 
-### 2.2 配置部分
+### 9. 模型构造：`GPT(cfg, rngs)` → `GPT(cfg)`
 
-两个文件的配置块和 `exec(open('configurator.py').read())` 模式完全相同，无差异。
-
----
-
-### 2.3 HuggingFace 权重加载 — 方法对比
-
-**原始版** — 从零构建 Linen 参数 pytree：
+**源代码**：
 ```python
-def load_params_from_gpt2(model_type):
+rngs  = nnx.Rngs(params=0, dropout=42)
+model = GPT(cfg, rngs)
+```
+
+**目标代码**：
+```python
+model = GPT(cfg)   # 无 rngs
+```
+
+直接源于第 1 条中移除 `rngs` 的变更。
+
+---
+
+### 10. HF 权重加载：`.kernel.value` → `.weight.value`
+
+**源代码**（使用 `nnx.Linear`，属性名为 `kernel`）：
+```python
+block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+block.attn.c_proj.kernel.value = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
+block.mlp.c_fc.kernel.value    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
+block.mlp.c_proj.kernel.value  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
+```
+
+**目标代码**（使用自定义 `Linear`，属性名为 `weight`）：
+```python
+block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
+block.attn.c_proj.weight.value = jnp.array(pt[f"h.{i}.attn.c_proj.weight"])
+block.mlp.c_fc.weight.value    = jnp.array(pt[f"h.{i}.mlp.c_fc.weight"])
+block.mlp.c_proj.weight.value  = jnp.array(pt[f"h.{i}.mlp.c_proj.weight"])
+```
+
+HF safetensors 的键名（如 `h.0.attn.c_attn.weight`）不变；仅 Python 属性路径从 `kernel` 改为
+`weight`，以匹配自定义 `Linear` 类。
+
+---
+
+### 11. Block 迭代：`model.h` → `model.blocks`
+
+**源代码**：
+```python
+for i, block in enumerate(model.h):
+    _assign_block(block, p[f'h_{i}'], has_bias)
+```
+
+**目标代码**：
+```python
+for i, block in enumerate(model.blocks):
+    block.ln_1.scale.value = jnp.array(pt[f"h.{i}.ln_1.weight"])
     ...
-    params = {
-        'wte': np.concatenate([wte_np, pad], axis=0),
-        'wpe': pt['wpe.weight'],
-        'ln_f': {'scale': pt['ln_f.weight'], 'bias': pt['ln_f.bias']},
-    }
-    for i in range(n_layer):
-        params[f'h_{i}'] = {
-            'ln_1': {'scale': ..., 'bias': ...},
-            'attn': {
-                'c_attn': {'kernel': pt[f'h.{i}.attn.c_attn.weight'],
-                           'bias':   pt[f'h.{i}.attn.c_attn.bias']},
-                'c_proj': {'kernel': ..., 'bias': ...},
-            },
-            ...
-        }
-    return params, model_args
-```
-输出是嵌套字典，严格匹配 Linen pytree 布局：`params['h_0']['attn']['c_attn']['kernel']`。注意 Linen `nn.Dense` 将权重存于键 `'kernel'` 下。
-
-**NNX 移植版** — 直接赋值给 `nnx.Param.value`：
-```python
-def load_hf_weights(model: GPT, model_type: str) -> None:
-    ...
-    model.wte.value = jnp.array(wte_np)
-    model.wpe.value = jnp.array(pt['wpe.weight'])
-    model.ln_f.scale.value = jnp.array(pt['ln_f.weight'])
-    model.ln_f.bias.value  = jnp.array(pt['ln_f.bias'])
-    for i, block in enumerate(model.blocks):
-        block.ln_1.scale.value = jnp.array(pt[f'h.{i}.ln_1.weight'])
-        block.attn.c_attn.weight.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-        ...
 ```
 
-**关键差异：**
-| 方面 | 原始版（Linen） | NNX 移植版 |
-|---|---|---|
-| 返回值 | 新 dict `params` | `None`（就地修改模型） |
-| 权重键名 | `'kernel'`（Linen `nn.Dense`） | `'weight'`（自定义 `Linear`） |
-| LayerNorm scale 键名 | `'scale'` | `'scale'`（相同） |
-| 中间字典 | 手动构建 | 不需要 |
-| 设备传输 | 单独的 `jax.tree_util.tree_map(jnp.array, params)` 步骤 | 每个 `jnp.array(...)` 调用时完成 |
-
-**为什么是 `'kernel'` vs `'weight'`？** Linen 的 `nn.Dense` 将权重存于 pytree 键 `'kernel'`（遵循 Flax/Haiku 约定）。NNX 模型中自定义 `Linear` 的属性名为 `weight`，经 `nnx.split` 后成为 pytree 键 `'weight'`。
-
-**为什么就地修改？** NNX 模块是可变的 Python 对象。给 `nnx.Param.value` 赋值直接更新模块持有的张量。这避免了创建单独的参数字典再合并回来——`load_hf_weights` 返回后模型即可直接使用。
+直接源于第 5 条中的重命名变更。
 
 ---
 
-### 2.4 检查点加载
+### 12. 检查点格式：Linen `TrainState` → NNX `State`
 
-**原始版** — 重建完整 `TrainState` 并反序列化：
+**源代码**——加载 Linen 格式检查点（由 `nanogpt-tpu/train.py` 产生）：
 ```python
-def load_params_from_checkpoint(out_dir):
-    # 必须重建与保存时完全相同的 pytree 结构
-    temp_cfg = GPTConfig(...)
-    model = GPT(temp_cfg)
-    dummy_idx = jnp.zeros((1, temp_cfg.block_size), dtype=jnp.int32)
-    dummy_tgt = jnp.zeros((1, temp_cfg.block_size), dtype=jnp.int32)
-    init_params = model.init(jax.random.PRNGKey(0), dummy_idx, dummy_tgt)['params']
+def load_model_from_checkpoint(out_dir):
+    outer = serialization.msgpack_restore(raw)
+    p     = outer['state']['params']   # linen 参数 pytree: {'h_0': {'attn': {'c_attn': {'kernel': ...}}}}
 
-    tx = make_optimizer()
-    state = train_state.TrainState.create(apply_fn=model.apply, params=init_params, tx=tx)
-    target = {'state': state, 'iter_num': 0, 'best_val_loss': 1e9, ...}
-
-    restored = serialization.from_bytes(target, raw)
-    return restored['state'].params, restored['model_args']
+    model.wte.value = jnp.array(p['wte'])
+    for i, block in enumerate(model.h):
+        _assign_block(block, p[f'h_{i}'], has_bias)
+        # _assign_block 读取 linen 键：p['attn']['c_attn']['kernel']
 ```
 
-这很复杂，因为 Flax 的 `from_bytes` 需要一个与检查点结构**完全相同**的目标 pytree。为构建该目标，代码必须运行一次虚拟前向传播以初始化参数，然后将其包装进 `TrainState`。
+源代码有辅助函数 `_assign_block()`，用于解包 linen 的嵌套字典结构
+（`{'ln_1': {'scale': ..., 'bias': ...}, 'attn': {'c_attn': {'kernel': ...}}, ...}`）。
 
-**NNX 移植版** — 使用 `from_state_dict` + `nnx.update`：
+**目标代码**——加载 NNX 格式检查点（由新版 `train.py` 产生）：
 ```python
-def load_nnx_checkpoint(model: GPT, out_dir: str) -> None:
+def load_nnx_checkpoint(model, out_dir):
     _, state = nnx.split(model)
-    with open(path, 'rb') as f:
-        outer = serialization.msgpack_restore(f.read())
-    restored = serialization.from_state_dict(state, outer['state'])
+    outer    = serialization.msgpack_restore(f.read())
+    restored = serialization.from_state_dict(state, outer["state"])
     nnx.update(model, restored)
 ```
 
-`nnx.split(model)` 提取当前状态作为目标结构。无需虚拟前向传播——模型已通过 `GPT(cfg)` 初始化。`nnx.update` 将恢复的状态就地写回模型的 `nnx.Param` 对象。
+使用 `nnx.split` 获取与检查点结构匹配的 `nnx.State` pytree，再通过 `serialization.from_state_dict`
+还原，最后用 `nnx.update` 写回模型。Linen 的 `_assign_block` 辅助函数和 `h_0` / `kernel` 键名约定
+均已移除。
 
-**不兼容说明：** 两种检查点格式**不可互换**。Linen 检查点嵌入了包含优化器状态和 `apply_fn` 的 `TrainState`；NNX 检查点嵌入了原始 `nnx.State` pytree + 优化器状态。将旧 Linen 检查点加载到 NNX 模型（或反之）会失败。这就是 GKE job 使用独立 GCS 路径（`gpt2-124m-nnx/` vs `gpt2-124m/`）的原因。
-
----
-
-### 2.5 模型创建与初始化
-
-**原始版**
-```python
-cfg = GPTConfig(**model_args)
-model = GPT(cfg)
-# params 不在 model 内——它们存在于 load_params_* 返回的独立字典中
-params = jax.tree_util.tree_map(jnp.array, params)   # 主机 → TPU 设备传输
-```
-这里的 `model` 是无状态可调用对象；它只持有 `config`。所有张量在 `params` 中。显式的 `tree_map(jnp.array, params)` 将每个权重从 numpy（由 `safetensors.load_file` 返回）复制到 JAX 默认设备。
-
-**NNX 移植版**
-```python
-model = GPT(cfg)
-load_hf_weights(model, init_from)   # 将 jnp.array(...) 赋值给每个 nnx.Param.value
-```
-`model` 持有所有张量。设备传输在 `load_hf_weights` 内部每次 `jnp.array(...)` 调用时完成——无需单独步骤。
+**原因**：两种检查点格式不兼容。Linen `TrainState` 在 `state.params` 下存储参数，键名如 `h_0`、
+`attn`、`kernel`。NNX `State` pytree 使用属性路径，如 `blocks[0]`、`attn`、`weight`。目标代码的
+`train.py` 产生 NNX 格式检查点，因此需要不同的加载器。
 
 ---
 
-### 2.6 生成 — split/merge 模式
+### 13. 生成方式：`@nnx.jit + jax.lax.scan` → `@jax.jit + nnx.split/merge + Python 循环`
 
-**原始版** — `model.apply` 传入外部参数：
+**源代码**——通过 `jax.lax.scan` 将整个 token 循环编译为单个 XLA 程序：
 ```python
-@jax.jit
-def _gen(params, window, rng_key):
-    def step(carry, _):
-        win, key = carry
-        logits, _ = model.apply({'params': params}, win, training=False)
-        logits = logits[:, 0, :] / temperature   # (1, vocab_size)
-        ...
-    _, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
-    return tokens
+_gen_cache: dict = {}
+
+def generate(model, idx, max_new_tokens, rng_key, temperature=1.0, top_k=None):
+    cache_key = (id(model), top_k_val, float(temperature), max_new_tokens, vocab_size)
+    if cache_key not in _gen_cache:
+        @nnx.jit
+        def _gen(model, window, rng_key):
+            def step(carry, _):
+                win, key  = carry
+                logits, _ = model(win, training=False)   # (1, 1, vocab_size)
+                logits    = logits[:, 0, :] / temperature
+                # top-k 过滤 + 类别采样
+                win = jnp.concatenate([win[:, 1:], next_tok[:, None]], axis=1)
+                return (win, key), next_tok[0]
+
+            _, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
+            return tokens
+
+        _gen_cache[cache_key] = _gen
+
+    return _gen_cache[cache_key](model, window, rng_key)
 ```
-`model.apply({'params': params}, ...)` 是 Linen 调用约定：参数以字典形式传入，不存储在模型中。`{'params': params}` 字典是 Linen 期望的"变量集合"。
 
-使用 `jax.lax.scan` 将所有 `max_new_tokens` 步骤编译为**单个 XLA 程序**——一次调度，无 Python 循环开销，最大化 TPU 利用率。
+`@nnx.jit` 在 JIT 前自动提取模型状态，内部自动合并。`jax.lax.scan` 将全部 `max_new_tokens` 步
+编译为单个 XLA 程序，步间零 Python 开销。
 
-**NNX 移植版** — `nnx.split` + `nnx.merge`：
+**目标代码**——每步单独 JIT dispatch，外层 Python 循环：
 ```python
 graphdef, state = nnx.split(model)
 
 @jax.jit
 def generate_step(state, window, rng_key):
     m = nnx.merge(graphdef, state)
-    logits, _ = m(window)                # (1, 1, vocab_size)
+    logits, _ = m(window)           # (1, 1, vocab_size)
     logits = logits[0, 0, :] / temperature
-    ...
+    # top-k 过滤 + 类别采样
     return jax.random.categorical(rng_key, logits)
 
-# 外层 Python 循环
 for step_i in range(max_new_tokens):
     rng, step_rng = random.split(rng)
     next_tok = int(generate_step(state, window, step_rng))
-    ...
+    window = jnp.concatenate([window[:, 1:], jnp.array([[next_tok]])], axis=1)
 ```
 
-**`nnx.split(model)` → `(graphdef, state)`：**
-- `graphdef` 是模块树的静态、可哈希描述（结构、类型、元数据）。它被 jit 函数闭合捕获——JAX 追踪一次并缓存编译后的程序。
-- `state` 是所有参数数组的纯 JAX pytree。作为追踪参数传给 `generate_step`，JAX 可以在不重新编译的情况下调度不同的权重。
+使用 `@jax.jit`（非 `@nnx.jit`），在循环前显式调用 `nnx.split` 一次，在 JIT'd 函数内调用
+`nnx.merge`。每步是独立的 JIT dispatch。
 
-**`nnx.merge(graphdef, state)`** 在 jit 函数内部重建一个活跃的 NNX 模型对象。这是 NNX 等价于 Linen 的 `model.apply({'params': params}, ...)` 调用。
+**权衡对比**：
 
-**Python 循环 vs `lax.scan`：** NNX 移植版使用 Python `for` 循环而非 `lax.scan`。权衡如下：
-- `lax.scan` 将所有步骤编译为一个 XLA 程序 → 最大吞吐量，但需要静态 `length` 和固定的 carry/输出形状。
-- Python 循环每个 token 调用一次 `generate_step`，每次调度到缓存的 XLA 程序。首次调用慢（JIT 编译）；后续调用快。`step_i == 0` 时打印"first token compiled"标记此时刻。
-- 对于生成数百个 token 的演示，Python 循环更简单且足够快。对于批量生产吞吐量，`lax.scan` 更优。
+| | 源代码（`@nnx.jit + lax.scan`） | 目标代码（`@jax.jit + Python 循环`） |
+|---|---|---|
+| 编译 | 全部 N 步一个 XLA 程序 | 每步一个程序（形状不变则命中缓存） |
+| Python 开销 | 步间零开销 | 每步一次 Python 调用 |
+| 吞吐量 | `max_new_tokens` 大时更高 | 较低，但代码更简单 |
+| 可检视性 | 无法中途检查 token | 每步可直接查看生成 token |
+| `_gen_cache` | 必须（函数定义在 `generate()` 内部） | 不需要（模块级 `@jax.jit` 自动缓存） |
 
 ---
 
-### 2.7 `logits[:, 0, :]` vs `logits[0, 0, :]`
+### 14. `_gen_cache` → 移除
 
-**原始版**
+**源代码**：
 ```python
-logits = logits[:, 0, :] / temperature   # shape: (batch=1, 1, vocab) → (1, vocab)
+_gen_cache: dict = {}
+cache_key = (id(model), top_k_val, float(temperature), max_new_tokens, vocab_size)
+if cache_key not in _gen_cache:
+    @nnx.jit
+    def _gen(model, window, rng_key): ...
+    _gen_cache[cache_key] = _gen
 ```
 
-**NNX 移植版**
-```python
-logits = logits[0, 0, :] / temperature   # shape: (vocab,)
-```
+`_gen` 定义在 `generate()` 函数内部，每次调用都会创建新的 Python 函数对象。若无缓存，`@nnx.jit`
+在函数对象变化时会触发重新编译。模块级字典以 `(model_id, 采样参数)` 为键缓存编译结果。
 
-两者都从 `(1, 1, vocab_size)`（推理模式下 batch=1，一个位置）开始。原始版用 `[:, 0, :]` 保留 batch 维度；NNX 移植版用 `[0, 0, :]` 直接得到一维向量。对于 batch=1 两者均正确；NNX 版稍微简洁，因为 `jax.random.categorical` 直接接受一维 logits，无需额外压缩维度。
+**目标代码**：`generate_step` 是模块级函数，以 `@jax.jit` 定义一次。JAX 内置编译缓存（以函数对象
+标识 + 参数抽象值为键）自动处理去重，无需手动缓存。
 
 ---
 
-### 2.8 Top-k 过滤
+### 15. Prompt 处理与输出收集
 
-**原始版**（在 `jax.lax.scan` 体内，编译进 XLA）：
+**源代码**：
 ```python
-top_vals = jnp.sort(logits, axis=-1)[..., -top_k_val]
-logits   = jnp.where(logits < top_vals[..., None], -jnp.inf, logits)
-```
-`top_k_val = min(top_k, real_vocab)` 是 Python int，在 JIT 前计算一次。`jnp.sort` 升序排序；`[..., -top_k_val]` 取第 `top_k_val` 大的值。
-
-**NNX 移植版**（在 `@jax.jit generate_step` 内）：
-```python
-kth_val = jnp.sort(logits)[-_TOP_K]     # _TOP_K 是模块级 Python int
-logits = jnp.where(logits < kth_val, -jnp.inf, logits)
-```
-逻辑完全相同；`_TOP_K` 在导入时作为模块级常量计算一次，JIT 时是静态 Python int（不是追踪值），保持编译图形状稳定。
-
----
-
-### 2.9 词表掩码
-
-两个文件都用 `-jnp.inf` 屏蔽填充词表 token（索引 ≥ 50257），确保模型不生成真实 GPT-2 BPE 词表之外的 token。两者逻辑相同，无差异。
-
----
-
-### 2.10 生成输出
-
-**原始版** — `lax.scan` 一次性返回完整 token 序列：
-```python
-_, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
-# tokens: int32[max_new_tokens]
-return jnp.concatenate([idx[0], gen_tokens])[None, :]  # (1, T + max_new_tokens)
+x = jnp.array(start_ids, dtype=jnp.int32)[None, :]   # (1, T)
+# 左填充在 generate() 内部处理
+y    = generate(model, x, max_new_tokens, gen_rng, temperature=temperature, top_k=top_k)
+text = decode(y[0].tolist())   # y 包含 prompt + 生成 token
+print(text)
 ```
 
-**NNX 移植版** — 在循环中累积到 Python 列表：
+**目标代码**：
 ```python
-generated = list(start_ids)
+prompt = jnp.array(start_ids, dtype=jnp.int32)[None, :]
+# 循环前先左填充到 block_size
+T        = prompt.shape[1]
+pad_tok  = int(prompt[0, 0])
+pad      = jnp.full((1, cfg.block_size - T), pad_tok, dtype=jnp.int32)
+init_window = jnp.concatenate([pad, prompt], axis=1)
+
+generated = list(start_ids)   # Python 列表：prompt + 生成 token
+
 for step_i in range(max_new_tokens):
-    ...
-    next_tok = int(generate_step(...))
+    next_tok = int(generate_step(state, window, step_rng))
     generated.append(next_tok)
+    window = jnp.concatenate([window[:, 1:], jnp.array([[next_tok]])], axis=1)
+
 print(decode(generated))
 ```
-`int(...)` 将标量从设备具体化到 Python。这是每 token 一次主机-设备同步（大批量时较慢），但对演示完全足够，并去除了 scan 样板代码。
+
+源代码在 `generate()` 内部做左填充，返回包含 prompt 的完整序列 JAX 数组。目标代码在循环前填充，
+用普通 Python 列表累积 token，JAX `window` 数组仅作为滑动上下文窗口单独维护。Python 列表避免了
+在输出侧重复进行 JAX 数组拼接的开销。
 
 ---
 
-## 汇总对比表
+## 总结对比表
 
-| 概念 | 原始版（Linen） | NNX 移植版 |
+| 方面 | `nanogpt-tpu-nnx`（源代码） | `sglang-jax/examples/nanogpt`（目标代码） |
 |---|---|---|
-| 模块基类 | `nn.Module`（冻结 dataclass） | `nnx.Module`（普通 Python 类） |
-| 参数存储 | 外部 pytree（通过 `apply` 传入） | 模块内部，以 `nnx.Param` 存储 |
-| 模块初始化 | `@nn.compact` / `setup()`（延迟） | `__init__`（立即） |
-| 层名称注册 | 必须指定 `name=` 参数 | 不需要 |
-| `model(x)` 调用 | `model.apply({'params': p}, x)` | 直接 `model(x)` |
-| Dropout | `nn.Dropout(r)(x, deterministic=...)` | 手动 `bernoulli` + `jnp.where` |
-| LayerNorm | `nn.LayerNorm` 内置 | 自定义 `LayerNorm(nnx.Module)` |
-| 线性层 | `nn.Dense` 内置 | 自定义 `Linear(nnx.Module)` |
-| 线性权重键名 | `'kernel'` | `'weight'` |
-| 权重绑定 | 局部变量 `wte` 使用两次 | `self.wte.value` 使用两次 |
-| `estimate_mfu` 签名 | 需要外部 `params` | 无外部参数（`nnx.state(self)`） |
-| pmap / jit 接口 | params 作为位置参数 | `nnx.split` → `(graphdef, state)` |
-| HF 权重加载 | 构建参数字典并返回 | 就地赋值给 `nnx.Param.value` |
-| 检查点加载 | `from_bytes` 配合 `TrainState` 目标 | `from_state_dict` + `nnx.update` |
-| 生成循环 | `jax.lax.scan`（单次 XLA 调度） | Python `for` 循环（每 token 一次 JIT） |
-| 检查点格式 | Linen `TrainState`（不兼容） | NNX `State` pytree |
+| 线性层 | `nnx.Linear`，属性名 `kernel` | 自定义 `Linear`，属性名 `weight` |
+| 归一化层 | `nnx.LayerNorm` | 自定义 `LayerNorm`（手动均值+方差） |
+| Dropout | `nnx.Dropout`，`training: bool` 标志 | 手动 Bernoulli，`rng: Optional[Array]` |
+| 模块构造 | `__init__(config, rngs: nnx.Rngs)` | `__init__(config)` — 无 rngs |
+| Block 列表名 | `self.h` | `self.blocks` |
+| 因果掩码填充值 | `-jnp.inf` | `jnp.finfo(dtype).min` |
+| 默认 `init_from` | `'resume'` | `'gpt2'` |
+| HF 权重属性路径 | `.c_attn.kernel.value` | `.c_attn.weight.value` |
+| 检查点格式 | Linen `TrainState`（键：`h_0`、`kernel`） | NNX `State`（路径：`blocks[0]`、`weight`） |
+| 生成方式 | `@nnx.jit + jax.lax.scan`（单 XLA 程序） | `@jax.jit + nnx.split/merge + Python 循环` |
+| 编译缓存 | 手动 `_gen_cache` 字典 | JAX 内置（模块级 `@jax.jit`） |

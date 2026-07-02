@@ -1,685 +1,490 @@
-# nanogpt TPU → SGLang-JAX Port: Detailed Comparison
+# NanoGPT NNX Porting Notes
 
-This document compares the original `nanogpt-tpu` implementation (Flax **Linen**) with
-the SGLang-JAX port (Flax **NNX**), line by line.  Every meaningful difference is listed
-with an explanation of *why* it changed.
+**Source**: `~/transformer/nanogpt-tpu-nnx/` (Flax NNX, uses standard NNX layers)
+**Destination**: `examples/nanogpt/` in this repo (Flax NNX, SGLang-JAX conventions)
 
-Reference paths:
-- Original: `~/transformer/nanogpt-tpu/{model,sample}.py`
-- Port: `examples/nanogpt/{model,sample}.py`
-
----
-
-## Part 1 — `model.py`
-
-### 1.1 Imports
-
-**Original (Linen)**
-```python
-import flax.linen as nn
-```
-
-**NNX port**
-```python
-from flax import nnx
-```
-
-**Why:** Linen (`flax.linen`) and NNX (`flax.nnx`) are two independent module
-systems inside the Flax package.  Linen is the older, functional API; NNX is the
-newer, stateful API introduced in Flax 0.8.  They cannot be mixed: a Linen
-`nn.Module` cannot be a child of an NNX `nnx.Module` and vice versa.
+Both are already Flax NNX implementations — this is not a Linen→NNX port. The differences are
+about how NNX is used: the source relies on standard NNX layers (`nnx.Linear`, `nnx.LayerNorm`,
+`nnx.Dropout`) and the `rngs` construction pattern; the destination replaces those with custom
+parameter-only layers to match SGLang-JAX's serving-stack conventions and to support direct HF
+weight assignment without needing a `rngs` object.
 
 ---
 
-### 1.2 `GPTConfig` — unchanged
+## Part 1 — model.py
 
-```python
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304
-    n_layer:  int = 12
-    n_head:   int = 12
-    n_embd:   int = 768
-    dropout:  float = 0.0
-    bias:     bool = True
-```
+### 1. Module construction: `rngs` removed
 
-Identical in both versions.  `@dataclass` is a plain Python construct that both
-frameworks accept as a config carrier.
-
----
-
-### 1.3 Module class declaration
-
-**Original**
-```python
-class CausalSelfAttention(nn.Module):
-    config: GPTConfig          # class-level field annotation (Linen dataclass style)
-
-    @nn.compact                # magic decorator: first call initialises params
-    def __call__(self, x, training: bool = False):
-        ...
-```
-
-**NNX port**
+**Source** (`nanogpt-tpu-nnx/model.py`):
 ```python
 class CausalSelfAttention(nnx.Module):
-    # no class-level field annotation
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        ...
+        self.c_attn = nnx.Linear(C, 3 * C, ..., rngs=rngs)
 
-    def __init__(self, config: GPTConfig):
-        cfg = config
-        ...                    # all sub-modules created here, stored as instance attrs
+class Block(nnx.Module):
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        self.ln_1 = nnx.LayerNorm(config.n_embd, ..., rngs=rngs)
+        ...
+
+class GPT(nnx.Module):
+    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+        ...
+        self.h = nnx.List([Block(config, rngs) for _ in range(config.n_layer)])
 ```
 
-**Why:**
-- **Linen** modules are *frozen dataclasses*.  Config fields are declared at the
-  class level (`config: GPTConfig`).  Parameters and sub-modules are **not** stored
-  as instance attributes; instead `@nn.compact` defers their creation to the first
-  call and stores them inside an external pytree.  `self.param(...)` and `nn.Dense`
-  calls inside `@nn.compact` register into that pytree.
-- **NNX** modules are *normal Python objects*.  Config is a regular `__init__`
-  argument.  Parameters and sub-modules are stored as instance attributes assigned
-  in `__init__`.  There is no `@nn.compact`, no deferred initialisation.
+**Destination** (`examples/nanogpt/model.py`):
+```python
+class CausalSelfAttention(nnx.Module):
+    def __init__(self, config: GPTConfig):   # no rngs
+        ...
+        self.c_attn = Linear(cfg.n_embd, 3 * cfg.n_embd, ...)
+
+class Block(nnx.Module):
+    def __init__(self, config: GPTConfig):   # no rngs
+        self.ln_1 = LayerNorm(config.n_embd, ...)
+        ...
+
+class GPT(nnx.Module):
+    def __init__(self, config: GPTConfig):   # no rngs
+        ...
+        self.blocks = nnx.List([Block(cfg) for _ in range(cfg.n_layer)])
+```
+
+**Why**: Standard `nnx.Linear` and `nnx.LayerNorm` require an `rngs: nnx.Rngs` argument at
+construction time (for parameter initialization). The destination uses custom `Linear` and
+`LayerNorm` classes that initialize parameters from a fixed `jax.random.PRNGKey`, so no `rngs`
+object is needed. This simplifies instantiation to `model = GPT(cfg)` and makes direct HF weight
+assignment straightforward.
 
 ---
 
-### 1.4 LayerNorm
+### 2. `nnx.Linear` → custom `Linear` class; weight attribute `kernel` → `weight`
 
-**Original**
+**Source**:
 ```python
-self.ln_1 = nn.LayerNorm(use_bias=cfg.bias)
-```
-`nn.LayerNorm` is a Linen built-in that creates its own `scale` and `bias` params
-inside the external pytree on first call.
-
-**NNX port**
-```python
-class LayerNorm(nnx.Module):
-    def __init__(self, num_features, use_bias=True, epsilon=1e-5, ...):
-        self.scale = nnx.Param(jnp.ones((num_features,), dtype=param_dtype))
-        self.bias: nnx.Param | None = (
-            nnx.Param(jnp.zeros((num_features,), dtype=param_dtype)) if use_bias else None
-        )
-
-    def __call__(self, x):
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var  = jnp.var(x,  axis=-1, keepdims=True)
-        x_norm = (x - mean) * jax.lax.rsqrt(var + self.epsilon)
-        out = self.scale.value * x_norm
-        if self.bias is not None:
-            out = out + self.bias.value
-        return out
+self.c_attn = nnx.Linear(
+    C, 3 * C,
+    use_bias=config.bias,
+    kernel_init=nnx.initializers.normal(0.02),
+    rngs=rngs,
+)
+# parameter attribute: self.c_attn.kernel  (standard NNX name)
 ```
 
-**Why a custom class instead of `nnx.LayerNorm`?**  `nnx.LayerNorm` exists but
-requires an `rngs` argument at construction time (for future stochastic extensions),
-which adds boilerplate.  The custom class avoids that and makes the `scale`/`bias`
-attributes explicit, which simplifies HuggingFace weight assignment in `sample.py`.
-
-**Why `jax.lax.rsqrt` instead of `jnp.sqrt`?**  `lax.rsqrt` is a single XLA op
-(reciprocal square root) that fuses into one kernel; `1/jnp.sqrt(...)` would be
-two ops.
-
----
-
-### 1.5 Linear layer
-
-**Original** — uses `nn.Dense` directly inline:
-```python
-qkv = nn.Dense(3 * C, use_bias=cfg.bias,
-               kernel_init=nn.initializers.normal(0.02),
-               name='c_attn')(x)
-```
-`nn.Dense` is a Linen built-in.  The `name=` argument is mandatory inside
-`@nn.compact` to get a stable key in the param pytree.
-
-**NNX port** — custom `Linear` class:
+**Destination**:
 ```python
 class Linear(nnx.Module):
-    def __init__(self, in_features, out_features, use_bias=True, std=0.02, ...):
+    def __init__(self, in_features, out_features, use_bias=True, std=0.02, dtype=jnp.float32):
         self.weight = nnx.Param(
             jax.random.normal(jax.random.PRNGKey(0), (in_features, out_features)) * std
         )
-        self.bias: nnx.Param | None = (
-            nnx.Param(jnp.zeros((out_features,), dtype=dtype)) if use_bias else None
-        )
+        self.bias = nnx.Param(jnp.zeros((out_features,))) if use_bias else None
 
     def __call__(self, x):
         out = x @ self.weight.value
         if self.bias is not None:
             out = out + self.bias.value
         return out
+
+self.c_attn = Linear(cfg.n_embd, 3 * cfg.n_embd, use_bias=cfg.bias, std=0.02)
+# parameter attribute: self.c_attn.weight  (renamed from kernel)
 ```
 
-**Why a custom class?**
-1. `nnx.Linear` requires `rngs` at construction time (same reason as LayerNorm).
-2. The custom class stores weight in `(in_features, out_features)` layout, which
-   matches both GPT-2's Conv1D convention and `LinearBase` in the SGLang-JAX
-   serving model — no transposition needed at weight-loading time.
-3. Explicit `self.weight` and `self.bias` attributes make HuggingFace weight
-   assignment in `sample.py` straightforward: `block.attn.c_attn.weight.value = ...`
-
-**`nn.Dense` kernel layout** is `(in, out)` too, so the math is identical; the
-difference is only in how params are stored and accessed.
+**Why**: The custom `Linear` avoids the `rngs` dependency and names the weight `weight` instead of
+`kernel`. Both store weights in `(in_features, out_features)` layout — matching GPT-2's Conv1D
+layout — so no transposition is needed when loading HF weights. The name change from `kernel` to
+`weight` is reflected everywhere in the weight-loading code.
 
 ---
 
-### 1.6 Dropout
+### 3. `nnx.LayerNorm` → custom `LayerNorm` class
 
-**Original**
+**Source**:
 ```python
-attn_weights = nn.Dropout(cfg.dropout)(attn_weights, deterministic=not training)
-```
-`nn.Dropout` is a Linen module.  `deterministic=True` makes it a no-op (inference
-mode).  It uses an `rngs={'dropout': key}` passed to `model.apply(...)` at the
-call site — the caller is responsible for wiring the key through.
-
-**NNX port**
-```python
-if self.dropout_rate > 0.0 and rng is not None:
-    rng, drop_rng = jax.random.split(rng)
-    keep = jax.random.bernoulli(drop_rng, 1.0 - self.dropout_rate, attn_weights.shape)
-    attn_weights = jnp.where(keep, attn_weights / (1.0 - self.dropout_rate), 0.0)
+self.ln_1 = nnx.LayerNorm(config.n_embd, use_bias=config.bias, rngs=rngs)
+# parameters: .scale, .bias  (standard NNX attribute names)
 ```
 
-**Why manual instead of `nnx.Dropout`?**
-- `nnx.Dropout` holds a stateful `nnx.Rngs` object.  Under `jax.pmap` each device
-  needs its own `Rngs`, which requires threading per-device keys through the
-  replicated state — complicated.
-- The manual approach is a transparent `jnp.where`; JAX/XLA compiles it to a
-  masked multiply (same as the Dropout kernel under the hood).
-- The guard `if self.dropout_rate > 0.0 and rng is not None` means inference
-  (no `rng` passed) is a strict no-op with **zero** overhead, not a branch compiled
-  into XLA.
+**Destination**:
+```python
+class LayerNorm(nnx.Module):
+    def __init__(self, num_features, use_bias=True, epsilon=1e-5):
+        self.scale = nnx.Param(jnp.ones((num_features,)))
+        self.bias  = nnx.Param(jnp.zeros((num_features,))) if use_bias else None
+
+    def __call__(self, x):
+        orig_dtype = x.dtype
+        x = x.astype(jnp.float32)
+        mean   = jnp.mean(x, axis=-1, keepdims=True)
+        var    = jnp.var(x, axis=-1, keepdims=True)
+        x_norm = (x - mean) * jax.lax.rsqrt(var + self.epsilon)
+        out    = self.scale.value * x_norm
+        if self.bias is not None:
+            out = out + self.bias.value
+        return out.astype(orig_dtype)
+
+self.ln_1 = LayerNorm(config.n_embd, use_bias=config.bias)
+# parameters: .scale, .bias  (same attribute names as nnx.LayerNorm)
+```
+
+**Why**: `nnx.LayerNorm` requires `rngs`. The custom class has identical attribute names (`.scale`,
+`.bias`) so HF weight assignment code is unchanged. The implementation manually computes mean and
+variance, and casts to `float32` for numerical stability before casting back.
 
 ---
 
-### 1.7 Block structure
+### 4. `nnx.Dropout` → manual Bernoulli dropout; `training: bool` → `rng: Optional[jax.Array]`
 
-**Original**
+**Source**:
 ```python
-class Block(nn.Module):
-    config: GPTConfig
+# Construction
+self.attn_drop  = nnx.Dropout(config.dropout, rngs=rngs)
+self.resid_drop = nnx.Dropout(config.dropout, rngs=rngs)
+self.drop       = nnx.Dropout(config.dropout, rngs=rngs)  # embedding dropout in GPT
 
-    def setup(self):               # Linen lifecycle hook: called once before first use
-        cfg = self.config
-        self.ln_1 = nn.LayerNorm(use_bias=cfg.bias)
-        self.attn = CausalSelfAttention(cfg)
-        self.ln_2 = nn.LayerNorm(use_bias=cfg.bias)
-        self.mlp  = MLP(cfg)
-
-    def __call__(self, x, training: bool = False):
-        x = x + self.attn(self.ln_1(x), training=training)
-        x = x + self.mlp(self.ln_2(x), training=training)
-        return x
-```
-
-`setup()` is a Linen lifecycle hook that runs before the first call to `__call__`.
-It is the alternative to `@nn.compact` for modules that need explicit sub-module
-names (e.g. for weight loading by name).
-
-**NNX port**
-```python
-class Block(nnx.Module):
-    def __init__(self, config: GPTConfig):
-        self.ln_1 = LayerNorm(config.n_embd, use_bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, use_bias=config.bias)
-        self.mlp  = MLP(config)
-
-    def __call__(self, x, rng=None):
-        attn_rng, mlp_rng = (jax.random.split(rng) if rng is not None else (None, None))
-        x = x + self.attn(self.ln_1(x), rng=attn_rng)
-        x = x + self.mlp(self.ln_2(x),  rng=mlp_rng)
-        return x
-```
-
-**Why no `setup()`?**  NNX has no lifecycle hooks; `__init__` is the only
-constructor.  All sub-modules are assigned as plain attributes — Python's own
-attribute protocol.
-
-**`rng` threading:**  Instead of a `training: bool` flag that the caller combines
-with an external key, NNX passes the key explicitly when dropout is needed.  `None`
-means inference.
-
----
-
-### 1.8 Top-level GPT module — parameter declaration
-
-**Original** (inside `@nn.compact __call__`):
-```python
-wte = self.param('wte', nn.initializers.normal(0.02), (cfg.vocab_size, cfg.n_embd))
-wpe = self.param('wpe', nn.initializers.normal(0.02), (cfg.block_size, cfg.n_embd))
-```
-`self.param(name, init_fn, shape)` registers a leaf in the external param pytree
-under the key `name`.  The initialiser is called once on first `model.apply(...)`.
-
-**NNX port** (in `__init__`):
-```python
-self.wte = nnx.Param(
-    jax.random.normal(jax.random.PRNGKey(1), (cfg.vocab_size, cfg.n_embd)) * 0.02
-)
-self.wpe = nnx.Param(
-    jax.random.normal(jax.random.PRNGKey(2), (cfg.block_size, cfg.n_embd)) * 0.02
-)
-```
-`nnx.Param` is a thin wrapper around a JAX array.  It is created eagerly at
-construction time (no deferred initialisation).  The key difference: **the tensor
-lives inside the module**, not in an external pytree.
-
-**PRNGKey seeding:** The original draws keys from the `rngs` argument passed to
-`model.apply(...)` at the call site, so the seed is controlled externally.  The NNX
-version uses hard-coded seeds (`PRNGKey(1)`, `PRNGKey(2)`) because the initial
-values are immediately overwritten by HuggingFace weights in `sample.py` or by
-`nnx.split` + `nnx.merge` in training — the exact initialisation doesn't matter.
-
----
-
-### 1.9 Layer list
-
-**Original**
-```python
-for i in range(cfg.n_layer):
-    x = Block(cfg, name=f'h_{i}')(x, training=training)
-```
-Blocks are created inline inside `@nn.compact` on every call; Linen caches them by
-`name`.  The `name=f'h_{i}'` is mandatory so each block's params get a stable key
-(`h_0`, `h_1`, …) in the pytree.
-
-**NNX port**
-```python
-self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
-```
-A plain Python list of NNX modules.  NNX's `nnx.split` traverses object attributes
-recursively; list elements are included automatically.  No explicit names are
-needed — NNX uses the integer index as the pytree key.
-
-**`nnx.data` note:**  The SGLang-JAX codebase sometimes uses `nnx.data([...])` for
-module lists, but that API does not exist in Flax 0.8.5 (the dev environment's
-version).  A plain Python list works identically because `nnx.split` handles lists
-natively.
-
----
-
-### 1.10 Weight tying
-
-**Original** (inside `@nn.compact`):
-```python
-wte = self.param('wte', ...)    # local variable, same object used twice below
-...
-logits = x @ wte.T              # wte reused for lm_head projection
-```
-`wte` is a local JAX array returned by `self.param`.  Using it twice is trivially
-cheap — it is the same tensor referenced in two `jnp.matmul` calls.
-
-**NNX port**:
-```python
-self.wte = nnx.Param(...)       # attribute on self
-...
-logits = x @ self.wte.value.T   # .value unwraps the nnx.Param wrapper
-```
-Same idea; `.value` is needed because `nnx.Param` is a wrapper class, not a bare
-array.  Accessing `.value` returns the underlying JAX array.
-
----
-
-### 1.11 `estimate_mfu` signature
-
-**Original**
-```python
-def estimate_mfu(self, params, fwdbwd_per_iter, dt, tpu_peak_tflops=2307.0):
-    n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
-```
-Requires the external `params` pytree to be passed in because the Linen model
-does not own its parameters.
-
-**NNX port**
-```python
-def estimate_mfu(self, fwdbwd_per_iter, dt, tpu_peak_tflops=918.0):
+# Call signature
+def __call__(self, x, training: bool = False):
     ...
-def num_params(self):
+    attn_w = self.attn_drop(attn_w, deterministic=not training)
+    y      = self.resid_drop(y, deterministic=not training)
+```
+
+**Destination**:
+```python
+# No Dropout module stored; dropout_rate stored as plain float
+self.dropout_rate = cfg.dropout
+
+# Call signature
+def __call__(self, x, rng: Optional[jax.Array] = None):
+    ...
+    if self.dropout_rate > 0.0 and rng is not None:
+        rng, drop_rng = jax.random.split(rng)
+        keep = jax.random.bernoulli(drop_rng, 1.0 - self.dropout_rate, attn_weights.shape)
+        attn_weights = jnp.where(keep, attn_weights / (1.0 - self.dropout_rate), 0.0)
+```
+
+**Why**: `nnx.Dropout` stores its own RNG state as an NNX variable, adding complexity for
+`nnx.split/merge` workflows. The destination avoids this by using manual Bernoulli masking. The
+`training: bool` flag is replaced by `rng: Optional[jax.Array]` — passing `rng=None` disables
+dropout (inference mode) and passing a key enables it (training mode).
+
+---
+
+### 5. Block list renamed: `self.h` → `self.blocks`
+
+**Source**:
+```python
+self.h = nnx.List([Block(config, rngs) for _ in range(config.n_layer)])
+
+for block in self.h:
+    x = block(x, training=training)
+```
+
+**Destination**:
+```python
+self.blocks = nnx.List([Block(cfg) for _ in range(cfg.n_layer)])
+
+for block in self.blocks:
+    x = block(x, rng=block_rng)
+```
+
+**Why**: `blocks` is more descriptive than `h`. Both use `nnx.List` — a plain Python `list` raises
+a `ValueError` in newer Flax versions because Flax sees it as a static attribute containing data.
+
+---
+
+### 6. Causal mask fill value: `-jnp.inf` → `jnp.finfo(...).min`
+
+**Source**:
+```python
+attn_w = jnp.where(causal_mask, attn_w, -jnp.inf)
+```
+
+**Destination**:
+```python
+attn_weights = jnp.where(causal_mask, attn_weights, jnp.finfo(attn_weights.dtype).min)
+```
+
+**Why**: `-jnp.inf` is a Python `float64` constant. Using `jnp.finfo(dtype).min` produces the
+minimum finite value for the actual computation dtype (e.g. `-3.4e38` for `float32`), which avoids
+`nan` propagation through softmax when an entire attention row is masked.
+
+---
+
+### 7. `num_params()` method added; `estimate_mfu` param counting simplified
+
+**Source** — no `num_params()` method; `estimate_mfu` filters to `nnx.Param`:
+```python
+n_params = sum(
+    v.size for v in jax.tree_util.tree_leaves(nnx.state(self, nnx.Param))
+)
+```
+
+**Destination** — `num_params()` added; counts all state leaves (no filter):
+```python
+def num_params(self) -> int:
     state = nnx.state(self)
     return sum(v.size for v in jax.tree_util.tree_leaves(state))
 ```
-Parameters live inside the module, so `nnx.state(self)` extracts them without
-any external argument.  `num_params()` is factored out as a separate helper method.
 
-**Default `tpu_peak_tflops` discrepancy:**  The original defaults to 2307 (v7x
-Ironwood); the NNX port defaults to 918 (v6e Trillium) because the training script
-overrides it with `--tpu_peak_tflops=2307.0` when running on v7x.  Both are
-correct for their respective use cases.
+The filter is omitted because the custom modules only store `nnx.Param` leaves (no `nnx.BatchStat`
+or other variable types), so the result is identical. `estimate_mfu` calls `self.num_params()`
+instead of repeating the counting logic.
 
 ---
 
-## Part 2 — `sample.py`
+## Part 2 — sample.py
 
-### 2.1 Imports
+### 8. Default `init_from`: `'resume'` → `'gpt2'`
 
-**Original**
+**Source**:
 ```python
-from flax.training import train_state
-from flax import traverse_util
-import optax
-from model import GPTConfig, GPT     # Linen GPT
+init_from = 'resume'   # default: load from checkpoint
 ```
 
-**NNX port**
+**Destination**:
 ```python
-from flax import nnx, serialization
-from model import GPT, GPTConfig     # NNX GPT
+init_from = "gpt2"     # default: download GPT-2 pretrained weights
 ```
 
-- `train_state` and `traverse_util` are Linen-era utilities for managing the
-  `(params, opt_state)` bundle.  NNX has no equivalent because the model owns its
-  own state.
-- `optax` is not imported in the NNX sample.py because generation does not need
-  an optimiser.  (The original imports it to reconstruct the optimizer structure
-  for checkpoint loading, since the Linen checkpoint embeds `TrainState` including
-  the optimizer state.)
+**Why**: The destination is a standalone inference demo. Defaulting to `'gpt2'` makes it runnable
+out of the box without a pre-existing checkpoint.
 
 ---
 
-### 2.2 Config section
+### 9. Model construction: `GPT(cfg, rngs)` → `GPT(cfg)`
 
-Both files have an identical config block and `exec(open('configurator.py').read())`
-pattern.  No difference.
-
----
-
-### 2.3 HuggingFace weight loading — approach
-
-**Original** — builds a Linen param pytree from scratch:
+**Source**:
 ```python
-def load_params_from_gpt2(model_type):
+rngs  = nnx.Rngs(params=0, dropout=42)
+model = GPT(cfg, rngs)
+```
+
+**Destination**:
+```python
+model = GPT(cfg)   # no rngs
+```
+
+Direct consequence of the `rngs` removal in §1.
+
+---
+
+### 10. HF weight loading: `.kernel.value` → `.weight.value`
+
+**Source** (uses `nnx.Linear`, attribute name is `kernel`):
+```python
+block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+block.attn.c_proj.kernel.value = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
+block.mlp.c_fc.kernel.value    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
+block.mlp.c_proj.kernel.value  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
+```
+
+**Destination** (uses custom `Linear`, attribute name is `weight`):
+```python
+block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
+block.attn.c_proj.weight.value = jnp.array(pt[f"h.{i}.attn.c_proj.weight"])
+block.mlp.c_fc.weight.value    = jnp.array(pt[f"h.{i}.mlp.c_fc.weight"])
+block.mlp.c_proj.weight.value  = jnp.array(pt[f"h.{i}.mlp.c_proj.weight"])
+```
+
+The HF safetensors key names (e.g. `h.0.attn.c_attn.weight`) are unchanged. Only the Python
+attribute path changes (`kernel` → `weight`) to match the custom `Linear` class.
+
+---
+
+### 11. Block iteration: `model.h` → `model.blocks`
+
+**Source**:
+```python
+for i, block in enumerate(model.h):
+    _assign_block(block, p[f'h_{i}'], has_bias)
+```
+
+**Destination**:
+```python
+for i, block in enumerate(model.blocks):
+    block.ln_1.scale.value = jnp.array(pt[f"h.{i}.ln_1.weight"])
     ...
-    params = {
-        'wte': np.concatenate([wte_np, pad], axis=0),
-        'wpe': pt['wpe.weight'],
-        'ln_f': {'scale': pt['ln_f.weight'], 'bias': pt['ln_f.bias']},
-    }
-    for i in range(n_layer):
-        params[f'h_{i}'] = {
-            'ln_1': {'scale': ..., 'bias': ...},
-            'attn': {
-                'c_attn': {'kernel': pt[f'h.{i}.attn.c_attn.weight'],
-                           'bias':   pt[f'h.{i}.attn.c_attn.bias']},
-                'c_proj': {'kernel': ..., 'bias': ...},
-            },
-            ...
-        }
-    return params, model_args
-```
-The output is a nested dict matching the Linen pytree layout exactly:
-`params['h_0']['attn']['c_attn']['kernel']`.  Note that Linen `nn.Dense` stores
-weights under the key `'kernel'`.
-
-**NNX port** — assigns directly to `nnx.Param.value`:
-```python
-def load_hf_weights(model: GPT, model_type: str) -> None:
-    ...
-    model.wte.value = jnp.array(wte_np)
-    model.wpe.value = jnp.array(pt['wpe.weight'])
-    model.ln_f.scale.value = jnp.array(pt['ln_f.weight'])
-    model.ln_f.bias.value  = jnp.array(pt['ln_f.bias'])
-    for i, block in enumerate(model.blocks):
-        block.ln_1.scale.value = jnp.array(pt[f'h.{i}.ln_1.weight'])
-        block.attn.c_attn.weight.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-        ...
 ```
 
-**Key differences:**
-| Aspect | Original (Linen) | NNX port |
-|---|---|---|
-| Return value | New dict `params` | `None` (mutates model in-place) |
-| Key for weight | `'kernel'` (Linen `nn.Dense`) | `'weight'` (custom `Linear`) |
-| Key for LayerNorm scale | `'scale'` | `'scale'` (same) |
-| Intermediate dict | Built manually | Not needed |
-| Device transfer | Separate `jax.tree_util.tree_map(jnp.array, params)` step | Happens at each `jnp.array(...)` call |
-
-**Why `'kernel'` vs `'weight'`?**  Linen's `nn.Dense` stores weights under the
-pytree key `'kernel'` (following the Flax/Haiku convention).  The custom `Linear`
-in the NNX model stores under the attribute name `weight`, which becomes the
-pytree key `'weight'` after `nnx.split`.
-
-**Why in-place mutation?**  NNX modules are mutable Python objects.  Assigning to
-`nnx.Param.value` updates the tensor held by the module's parameter directly.  This
-avoids creating a separate params dict and then merging it back — the model is ready
-to use immediately after `load_hf_weights` returns.
+Direct consequence of the rename in §5.
 
 ---
 
-### 2.4 Checkpoint loading
+### 12. Checkpoint format: linen `TrainState` → NNX `State`
 
-**Original** — reconstructs a full `TrainState` and deserialises into it:
+**Source** — loads linen-format checkpoints (produced by `nanogpt-tpu/train.py`):
 ```python
-def load_params_from_checkpoint(out_dir):
-    # Must reconstruct the exact same pytree structure the checkpoint was saved with.
-    temp_cfg = GPTConfig(...)
-    model = GPT(temp_cfg)
-    dummy_idx = jnp.zeros((1, temp_cfg.block_size), dtype=jnp.int32)
-    dummy_tgt = jnp.zeros((1, temp_cfg.block_size), dtype=jnp.int32)
-    init_params = model.init(jax.random.PRNGKey(0), dummy_idx, dummy_tgt)['params']
+def load_model_from_checkpoint(out_dir):
+    outer = serialization.msgpack_restore(raw)
+    p     = outer['state']['params']   # linen params pytree: {'h_0': {'attn': {'c_attn': {'kernel': ...}}}}
 
-    tx = make_optimizer()
-    state = train_state.TrainState.create(apply_fn=model.apply, params=init_params, tx=tx)
-    target = {'state': state, 'iter_num': 0, 'best_val_loss': 1e9, ...}
-
-    restored = serialization.from_bytes(target, raw)
-    return restored['state'].params, restored['model_args']
+    model.wte.value = jnp.array(p['wte'])
+    for i, block in enumerate(model.h):
+        _assign_block(block, p[f'h_{i}'], has_bias)
+        # _assign_block reads linen keys: p['attn']['c_attn']['kernel']
+        block.attn.c_attn.kernel.value = jnp.array(p['attn']['c_attn']['kernel'])
 ```
 
-This is complex because Flax's `from_bytes` requires a *target* pytree with the
-exact same structure as the checkpoint.  To build that target, the code must run a
-dummy forward pass to initialise params, then wrap them in `TrainState`.
+The source has a `_assign_block()` helper that unpacks the linen nested dict structure
+(`{'ln_1': {'scale': ..., 'bias': ...}, 'attn': {'c_attn': {'kernel': ...}}, ...}`).
 
-**NNX port** — uses `from_state_dict` + `nnx.update`:
+**Destination** — loads NNX-format checkpoints (produced by the new `train.py`):
 ```python
-def load_nnx_checkpoint(model: GPT, out_dir: str) -> None:
+def load_nnx_checkpoint(model, out_dir):
     _, state = nnx.split(model)
-    with open(path, 'rb') as f:
-        outer = serialization.msgpack_restore(f.read())
-    restored = serialization.from_state_dict(state, outer['state'])
+    outer    = serialization.msgpack_restore(f.read())
+    restored = serialization.from_state_dict(state, outer["state"])
     nnx.update(model, restored)
 ```
 
-`nnx.split(model)` extracts the current state as the target structure.  No dummy
-forward pass is needed — the model was already initialised by `GPT(cfg)`.
-`nnx.update` writes the restored state back into the model's `nnx.Param` objects
-in-place.
+Uses `nnx.split` to get an `nnx.State` pytree that structurally matches the checkpoint, then
+`serialization.from_state_dict` to restore into it, and `nnx.update` to apply back to the model.
+The linen `_assign_block` helper and the `h_0` / `kernel` key convention are gone.
 
-**Incompatibility note:**  The two checkpoint formats are **not interchangeable**.
-The Linen checkpoint embeds a `TrainState` (including optimizer moments and the
-`apply_fn`); the NNX checkpoint embeds a raw `nnx.State` pytree + optimizer state.
-Loading an old Linen checkpoint into the NNX model (or vice versa) will fail.  This
-is why the GKE job uses a separate GCS path (`gpt2-124m-nnx/` vs `gpt2-124m/`).
+**Why**: The two checkpoint formats are incompatible. The linen `TrainState` stores params under
+`state.params` with keys like `h_0`, `attn`, `kernel`. The NNX `State` pytree uses attribute
+paths like `blocks[0]`, `attn`, `weight`. The destination's `train.py` produces NNX-format
+checkpoints, so a different loader is needed.
 
 ---
 
-### 2.5 Model creation and initialisation
+### 13. Generation: `@nnx.jit + jax.lax.scan` → `@jax.jit + nnx.split/merge + Python loop`
 
-**Original**
+**Source** — entire token loop compiled into one XLA program via `jax.lax.scan`:
 ```python
-cfg = GPTConfig(**model_args)
-model = GPT(cfg)
-# Params are NOT inside model — they live in the separate dict returned by load_params_*
-params = jax.tree_util.tree_map(jnp.array, params)   # host → TPU device transfer
+_gen_cache: dict = {}
+
+def generate(model, idx, max_new_tokens, rng_key, temperature=1.0, top_k=None):
+    cache_key = (id(model), top_k_val, float(temperature), max_new_tokens, vocab_size)
+    if cache_key not in _gen_cache:
+        @nnx.jit
+        def _gen(model, window, rng_key):
+            def step(carry, _):
+                win, key  = carry
+                logits, _ = model(win, training=False)   # (1, 1, vocab_size)
+                logits    = logits[:, 0, :] / temperature
+                # top-k filter + categorical sample
+                win = jnp.concatenate([win[:, 1:], next_tok[:, None]], axis=1)
+                return (win, key), next_tok[0]
+
+            _, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
+            return tokens
+
+        _gen_cache[cache_key] = _gen
+
+    return _gen_cache[cache_key](model, window, rng_key)
 ```
-`model` here is a stateless callable; it holds only the `config`.  All tensors are
-in `params`.  The explicit `tree_map(jnp.array, params)` copies every weight from
-numpy (returned by `safetensors.load_file`) to the JAX default device.
 
-**NNX port**
-```python
-model = GPT(cfg)
-load_hf_weights(model, init_from)   # assigns jnp.array(...) to each nnx.Param.value
-```
-`model` holds all tensors.  The device transfer happens inside `load_hf_weights`
-at each `jnp.array(...)` call — there is no separate step.
+`@nnx.jit` automatically extracts model state before JIT and merges it back inside.
+`jax.lax.scan` compiles all `max_new_tokens` steps into a single XLA program with zero Python
+re-entry between steps.
 
----
-
-### 2.6 Generation — split/merge pattern
-
-**Original** — `model.apply` with external params:
-```python
-@jax.jit
-def _gen(params, window, rng_key):
-    def step(carry, _):
-        win, key = carry
-        logits, _ = model.apply({'params': params}, win, training=False)
-        logits = logits[:, 0, :] / temperature   # (1, vocab_size)
-        ...
-    _, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
-    return tokens
-```
-`model.apply({'params': params}, ...)` is the Linen call convention: params are
-passed as a dict, not stored in the model.  The `{'params': params}` dict is the
-"variable collection" Linen expects.
-
-Uses `jax.lax.scan` to compile all `max_new_tokens` steps into a **single XLA
-program** — one dispatch, no Python loop overhead, maximum TPU utilisation.
-
-**NNX port** — `nnx.split` + `nnx.merge`:
+**Destination** — one step per JIT dispatch, Python loop:
 ```python
 graphdef, state = nnx.split(model)
 
 @jax.jit
 def generate_step(state, window, rng_key):
     m = nnx.merge(graphdef, state)
-    logits, _ = m(window)                # (1, 1, vocab_size)
+    logits, _ = m(window)           # (1, 1, vocab_size)
     logits = logits[0, 0, :] / temperature
-    ...
+    # top-k filter + categorical sample
     return jax.random.categorical(rng_key, logits)
 
-# Python loop at the outer level
 for step_i in range(max_new_tokens):
     rng, step_rng = random.split(rng)
     next_tok = int(generate_step(state, window, step_rng))
-    ...
+    window = jnp.concatenate([window[:, 1:], jnp.array([[next_tok]])], axis=1)
 ```
 
-**`nnx.split(model)` → `(graphdef, state)`:**
-- `graphdef` is a static, hashable description of the module tree (structure, types,
-  metadata).  It is closed over by the jitted function — JAX traces through it once
-  and caches the compiled program.
-- `state` is the pure JAX pytree of all parameter arrays.  It is passed as a traced
-  argument to `generate_step`, so JAX can dispatch different weights without
-  recompilation.
+Uses `@jax.jit` (not `@nnx.jit`), explicitly calling `nnx.split` once before the loop and
+`nnx.merge` inside the JIT'd step. Each of the `max_new_tokens` steps is a separate JIT dispatch.
 
-**`nnx.merge(graphdef, state)`** reconstructs a live NNX model object inside the
-jitted function.  This is the NNX equivalent of the Linen
-`model.apply({'params': params}, ...)` call.
+**Trade-offs**:
 
-**Python loop vs `lax.scan`:**  The NNX port uses a Python `for` loop instead of
-`lax.scan`.  The tradeoff:
-- `lax.scan` compiles all steps into one XLA program → maximum throughput, but
-  requires a static `length` and fixed carry/output shapes.
-- Python loop calls `generate_step` once per token, each call dispatches to the
-  cached XLA program.  First call is slow (JIT compile); subsequent calls are fast.
-  The "first token compiled" print at `step_i == 0` marks this.
-- For a demo that generates a few hundred tokens, the Python loop is simpler and
-  fast enough.  For batch production throughput, `lax.scan` is preferred.
+| | Source (`@nnx.jit + lax.scan`) | Destination (`@jax.jit + Python loop`) |
+|---|---|---|
+| Compilation | One XLA program for all N steps | One program per step (shape-cached) |
+| Python overhead | Zero between steps | One Python call per step |
+| Throughput | Higher for large `max_new_tokens` | Lower, but simpler |
+| Inspectability | Cannot inspect mid-generation | Easy to inspect each token |
+| `_gen_cache` | Needed (function defined inside `generate()`) | Not needed (module-level `@jax.jit`) |
 
 ---
 
-### 2.7 `logits[:, 0, :]` vs `logits[0, 0, :]`
+### 14. `_gen_cache` → removed
 
-**Original**
+**Source**:
 ```python
-logits = logits[:, 0, :] / temperature   # shape: (batch=1, 1, vocab) → (1, vocab)
+_gen_cache: dict = {}
+cache_key = (id(model), top_k_val, float(temperature), max_new_tokens, vocab_size)
+if cache_key not in _gen_cache:
+    @nnx.jit
+    def _gen(model, window, rng_key): ...
+    _gen_cache[cache_key] = _gen
 ```
 
-**NNX port**
-```python
-logits = logits[0, 0, :] / temperature   # shape: (vocab,)
-```
+`_gen` is defined inside the `generate()` function, so a new Python object is created on every
+call. Without the cache, `@nnx.jit` would recompile on each invocation because function identity
+changes.
 
-Both start from `(1, 1, vocab_size)` (batch=1, one position in inference mode).
-The original slices with `[:, 0, :]` keeping the batch dimension; the NNX port
-uses `[0, 0, :]` to get a 1-D vector directly.  Both are correct for batch=1;
-the NNX version is slightly cleaner since `jax.random.categorical` accepts 1-D
-logits without requiring a squeeze.
+**Destination**: `generate_step` is a module-level function defined once with `@jax.jit`. JAX's
+own compilation cache (keyed on function identity + argument abstract values) handles deduplication
+automatically. No manual cache needed.
 
 ---
 
-### 2.8 Top-k filtering
+### 15. Prompt handling and output collection
 
-**Original** (inside `jax.lax.scan` body, compiled into XLA):
+**Source**:
 ```python
-top_vals = jnp.sort(logits, axis=-1)[..., -top_k_val]
-logits   = jnp.where(logits < top_vals[..., None], -jnp.inf, logits)
-```
-`top_k_val = min(top_k, real_vocab)` is a Python int, computed once before JIT.
-`jnp.sort` sorts ascending; `[..., -top_k_val]` picks the `top_k_val`-th largest.
-
-**NNX port** (inside `@jax.jit generate_step`):
-```python
-kth_val = jnp.sort(logits)[-_TOP_K]     # _TOP_K is a module-level Python int
-logits = jnp.where(logits < kth_val, -jnp.inf, logits)
-```
-Identical logic; `_TOP_K` is computed once at import time as a module-level
-constant so it's a static Python int at JIT time (not a traced value), keeping the
-compiled graph shape stable across calls.
-
----
-
-### 2.9 Vocabulary masking
-
-Both files mask the padded vocab tokens (indices ≥ 50257) with `-jnp.inf` before
-sampling, so the model never generates tokens outside the real GPT-2 BPE vocab.
-
-**Original**
-```python
-pad_mask = jnp.arange(vocab_size) >= real_vocab
-logits   = jnp.where(pad_mask, -jnp.inf, logits)
+x = jnp.array(start_ids, dtype=jnp.int32)[None, :]   # (1, T)
+# left-pad handled inside generate()
+y    = generate(model, x, max_new_tokens, gen_rng, temperature=temperature, top_k=top_k)
+text = decode(y[0].tolist())   # y includes prompt + generated tokens
+print(text)
 ```
 
-**NNX port** — identical logic, same variable names.  No difference.
-
----
-
-### 2.10 Generation output
-
-**Original** — uses `lax.scan` which returns the full token sequence in one shot:
+**Destination**:
 ```python
-_, tokens = jax.lax.scan(step, (window, rng_key), None, length=max_new_tokens)
-# tokens: int32[max_new_tokens]
-return jnp.concatenate([idx[0], gen_tokens])[None, :]  # (1, T + max_new_tokens)
-```
+prompt = jnp.array(start_ids, dtype=jnp.int32)[None, :]
+# left-pad to block_size before loop
+T = prompt.shape[1]
+pad_tok      = int(prompt[0, 0])
+pad          = jnp.full((1, cfg.block_size - T), pad_tok, dtype=jnp.int32)
+init_window  = jnp.concatenate([pad, prompt], axis=1)
 
-**NNX port** — accumulates into a Python list during the loop:
-```python
-generated = list(start_ids)
+generated = list(start_ids)   # Python list: prompt + generated tokens
+
 for step_i in range(max_new_tokens):
-    ...
-    next_tok = int(generate_step(...))
+    next_tok = int(generate_step(state, window, step_rng))
     generated.append(next_tok)
+    window = jnp.concatenate([window[:, 1:], jnp.array([[next_tok]])], axis=1)
+
 print(decode(generated))
 ```
-`int(...)` materialises the scalar from device to Python.  This is a host–device
-sync per token (slower for large batches), but for a demo it is perfectly fine and
-removes the scan boilerplate.
+
+The source left-pads inside `generate()` and returns the full sequence as a JAX array. The
+destination left-pads before the loop, accumulates tokens in a plain Python list, and slides the
+window array separately. The Python list avoids repeated JAX array concatenations on the output
+side.
 
 ---
 
-## Summary table
+## Summary Table
 
-| Concept | Original (Linen) | NNX port |
+| Aspect | `nanogpt-tpu-nnx` (source) | `sglang-jax/examples/nanogpt` (destination) |
 |---|---|---|
-| Module base class | `nn.Module` (frozen dataclass) | `nnx.Module` (plain Python class) |
-| Parameter storage | External pytree (passed to `apply`) | Inside module as `nnx.Param` |
-| Module initialisation | `@nn.compact` / `setup()` (deferred) | `__init__` (eager) |
-| Layer name registration | `name=` arg required | Not needed |
-| `model(x)` call | `model.apply({'params': p}, x)` | `model(x)` directly |
-| Dropout | `nn.Dropout(r)(x, deterministic=...)` | Manual `bernoulli` + `jnp.where` |
-| LayerNorm | `nn.LayerNorm` built-in | Custom `LayerNorm(nnx.Module)` |
-| Linear layer | `nn.Dense` built-in | Custom `Linear(nnx.Module)` |
-| Weight key for linear | `'kernel'` | `'weight'` |
-| Weight tying | `wte` local var used twice | `self.wte.value` used twice |
-| `estimate_mfu` signature | Requires external `params` | No external args (`nnx.state(self)`) |
-| pmap / jit interface | params as positional arg | `nnx.split` → `(graphdef, state)` |
-| HF weight loading | Builds param dict, returns it | Assigns to `nnx.Param.value` in-place |
-| Checkpoint loading | `from_bytes` with `TrainState` target | `from_state_dict` + `nnx.update` |
-| Generation loop | `jax.lax.scan` (one XLA dispatch) | Python `for` loop (one JIT per token) |
-| Checkpoint format | Linen `TrainState` (incompatible) | NNX `State` pytree |
+| Linear layer | `nnx.Linear`, attribute `kernel` | Custom `Linear`, attribute `weight` |
+| LayerNorm | `nnx.LayerNorm` | Custom `LayerNorm` (manual mean+var) |
+| Dropout | `nnx.Dropout`, `training: bool` flag | Manual Bernoulli, `rng: Optional[Array]` |
+| Module construction | `__init__(config, rngs: nnx.Rngs)` | `__init__(config)` — no rngs |
+| Block list name | `self.h` | `self.blocks` |
+| Causal mask fill | `-jnp.inf` | `jnp.finfo(dtype).min` |
+| Default `init_from` | `'resume'` | `'gpt2'` |
+| HF weight attr path | `.c_attn.kernel.value` | `.c_attn.weight.value` |
+| Checkpoint format | Linen `TrainState` (`h_0`, `kernel` keys) | NNX `State` (`blocks[0]`, `weight` keys) |
+| Generation | `@nnx.jit + jax.lax.scan` (one XLA program) | `@jax.jit + nnx.split/merge + Python loop` |
+| Compile cache | Manual `_gen_cache` dict | JAX built-in (module-level `@jax.jit`) |
