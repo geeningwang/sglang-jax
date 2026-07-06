@@ -501,6 +501,68 @@ print(decode(generated))
 
 ---
 
+## 附录：完整模型张量列表（GPT-2 124M）
+
+所有参数张量均为 `float32`。源代码与目标代码的张量形状完全相同，区别仅在属性路径：
+线性层权重在目标代码中为 `weight`，在源代码中为 `kernel`；block 列表在目标代码中为
+`blocks[i]`，在源代码中为 `h[i]`。
+
+默认训练使用 `bias=False`。"入检查点？"列以 `bias=False` 检查点为准；若 `bias=True`
+则偏置张量存在。
+
+**词嵌入与位置嵌入**
+
+| 张量 — 目标路径 | 源路径 | 形状 | 参数量 |
+|---|---|---|---|
+| `wte`（词元嵌入） | `wte` | `(50304, 768)` | 38,633,472 |
+| `wpe`（位置嵌入） | `wpe` | `(1024, 768)` | 786,432 |
+
+**逐 Block × 12** — 目标 `blocks[i].*` / 源 `h[i].*`
+
+| 张量 — 目标 | 源 | 形状 | 参数量 | 入检查点？（`bias=False`） |
+|---|---|---|---|---|
+| `ln_1.scale` | `ln_1.scale` | `(768,)` | 768 | 是 |
+| `ln_1.bias` | `ln_1.bias` | `(768,)` | 768 | 否 |
+| `attn.c_attn.weight` | `attn.c_attn.kernel` | `(768, 2304)` | 1,769,472 | 是 |
+| `attn.c_attn.bias` | `attn.c_attn.bias` | `(2304,)` | 2,304 | 否 |
+| `attn.c_proj.weight` | `attn.c_proj.kernel` | `(768, 768)` | 589,824 | 是 |
+| `attn.c_proj.bias` | `attn.c_proj.bias` | `(768,)` | 768 | 否 |
+| `ln_2.scale` | `ln_2.scale` | `(768,)` | 768 | 是 |
+| `ln_2.bias` | `ln_2.bias` | `(768,)` | 768 | 否 |
+| `mlp.c_fc.weight` | `mlp.c_fc.kernel` | `(768, 3072)` | 2,359,296 | 是 |
+| `mlp.c_fc.bias` | `mlp.c_fc.bias` | `(3072,)` | 3,072 | 否 |
+| `mlp.c_proj.weight` | `mlp.c_proj.kernel` | `(3072, 768)` | 2,359,296 | 是 |
+| `mlp.c_proj.bias` | `mlp.c_proj.bias` | `(768,)` | 768 | 否 |
+| **单 Block 小计（bias=True）** | | | **7,087,872** | |
+| **单 Block 小计（bias=False）** | | | **7,079,424** | |
+| **× 12 blocks（bias=True）** | | | **85,054,464** | |
+| **× 12 blocks（bias=False）** | | | **84,953,088** | |
+
+**最终 LayerNorm**
+
+| 张量 — 目标 | 源 | 形状 | 参数量 | 入检查点？（`bias=False`） |
+|---|---|---|---|---|
+| `ln_f.scale` | `ln_f.scale` | `(768,)` | 768 | 是 |
+| `ln_f.bias` | `ln_f.bias` | `(768,)` | 768 | 否 |
+
+**总计**
+
+| 模块 | 参数量（bias=True） | 参数量（bias=False） | 内存（float32，bias=False） |
+|---|---|---|---|
+| 嵌入层（`wte` + `wpe`） | 39,419,904 | 39,419,904 | 150.37 MiB |
+| 12 × blocks | 85,054,464 | 84,953,088 | 324.08 MiB |
+| `ln_f` | 1,536 | 768 | 3 KiB |
+| **合计** | **124,475,904** | **124,373,760** | **474.45 MiB** |
+
+> `wte` 通过权重共享同时作为输出投影（`logits = x @ wte.value.T`），两个版本均无独立的
+> `lm_head` 张量。
+>
+> 验证：`124,373,760 × 4 字节 = 497,495,040 字节 ≈ 474.45 MiB`。`train.py` 保存的检查点
+> 文件约大 3.7 KiB：额外字节为 msgpack 对元数据（`iter_num`、`best_val_loss`、
+> `model_args`、`config`）的封装开销。
+
+---
+
 ## 总结对比表
 
 | 方面 | `nanogpt-tpu-nnx`（源代码） | `sglang-jax/examples/nanogpt`（目标代码） |

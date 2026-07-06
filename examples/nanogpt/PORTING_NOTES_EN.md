@@ -514,6 +514,68 @@ side.
 
 ---
 
+## Appendix: Complete Model Tensor List (GPT-2 124M)
+
+All parameter tensors are `float32`. Shapes are identical between source and destination —
+only the attribute path differs: linear layers use `weight` (destination) vs `kernel` (source),
+and the block list is `blocks[i]` (destination) vs `h[i]` (source).
+
+Default training uses `bias=False`. The "In ckpt?" column reflects a `bias=False` checkpoint;
+when `bias=True` the bias tensors are present.
+
+**Embeddings**
+
+| Tensor — destination path | Source path | Shape | Params |
+|---|---|---|---|
+| `wte` (token embedding) | `wte` | `(50304, 768)` | 38,633,472 |
+| `wpe` (position embedding) | `wpe` | `(1024, 768)` | 786,432 |
+
+**Per Block × 12** — destination `blocks[i].*` / source `h[i].*`
+
+| Tensor — destination | Source | Shape | Params | In ckpt? (`bias=False`) |
+|---|---|---|---|---|
+| `ln_1.scale` | `ln_1.scale` | `(768,)` | 768 | yes |
+| `ln_1.bias` | `ln_1.bias` | `(768,)` | 768 | no |
+| `attn.c_attn.weight` | `attn.c_attn.kernel` | `(768, 2304)` | 1,769,472 | yes |
+| `attn.c_attn.bias` | `attn.c_attn.bias` | `(2304,)` | 2,304 | no |
+| `attn.c_proj.weight` | `attn.c_proj.kernel` | `(768, 768)` | 589,824 | yes |
+| `attn.c_proj.bias` | `attn.c_proj.bias` | `(768,)` | 768 | no |
+| `ln_2.scale` | `ln_2.scale` | `(768,)` | 768 | yes |
+| `ln_2.bias` | `ln_2.bias` | `(768,)` | 768 | no |
+| `mlp.c_fc.weight` | `mlp.c_fc.kernel` | `(768, 3072)` | 2,359,296 | yes |
+| `mlp.c_fc.bias` | `mlp.c_fc.bias` | `(3072,)` | 3,072 | no |
+| `mlp.c_proj.weight` | `mlp.c_proj.kernel` | `(3072, 768)` | 2,359,296 | yes |
+| `mlp.c_proj.bias` | `mlp.c_proj.bias` | `(768,)` | 768 | no |
+| **Block subtotal (bias=True)** | | | **7,087,872** | |
+| **Block subtotal (bias=False)** | | | **7,079,424** | |
+| **× 12 blocks (bias=True)** | | | **85,054,464** | |
+| **× 12 blocks (bias=False)** | | | **84,953,088** | |
+
+**Final LayerNorm**
+
+| Tensor — destination | Source | Shape | Params | In ckpt? (`bias=False`) |
+|---|---|---|---|---|
+| `ln_f.scale` | `ln_f.scale` | `(768,)` | 768 | yes |
+| `ln_f.bias` | `ln_f.bias` | `(768,)` | 768 | no |
+
+**Totals**
+
+| Section | Params (bias=True) | Params (bias=False) | Memory (float32, bias=False) |
+|---|---|---|---|
+| Embeddings (`wte` + `wpe`) | 39,419,904 | 39,419,904 | 150.37 MiB |
+| 12 × blocks | 85,054,464 | 84,953,088 | 324.08 MiB |
+| `ln_f` | 1,536 | 768 | 3 KiB |
+| **Grand total** | **124,475,904** | **124,373,760** | **474.45 MiB** |
+
+> `wte` doubles as the output projection (`logits = x @ wte.value.T`) via weight tying —
+> no separate `lm_head` tensor exists in either version.
+>
+> Verified: `124,373,760 × 4 bytes = 497,495,040 bytes ≈ 474.45 MiB`. A checkpoint
+> saved by `train.py` is ~3.7 KiB larger: the extra bytes are msgpack framing for
+> metadata (`iter_num`, `best_val_loss`, `model_args`, `config`).
+
+---
+
 ## Summary Table
 
 | Aspect | `nanogpt-tpu-nnx` (source) | `sglang-jax/examples/nanogpt` (destination) |
