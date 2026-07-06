@@ -263,17 +263,17 @@ model = GPT(cfg)   # 无 rngs
 
 ---
 
-### 10. HF 权重加载：`.kernel.value` → `.weight.value`
+### 10. HF 权重加载：`kernel[...] =` → `weight.value =`
 
-**源代码**（使用 `nnx.Linear`，属性名为 `kernel`）：
+**源代码**（使用 `nnx.Linear`，属性名为 `kernel`；用 `[...]` 切片赋值）：
 ```python
-block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-block.attn.c_proj.kernel.value = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
-block.mlp.c_fc.kernel.value    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
-block.mlp.c_proj.kernel.value  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
+block.attn.c_attn.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+block.attn.c_proj.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
+block.mlp.c_fc.kernel[...]    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
+block.mlp.c_proj.kernel[...]  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
 ```
 
-**目标代码**（使用自定义 `Linear`，属性名为 `weight`）：
+**目标代码**（使用自定义 `Linear`，属性名为 `weight`；用 `.value` 赋值）：
 ```python
 block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
 block.attn.c_proj.weight.value = jnp.array(pt[f"h.{i}.attn.c_proj.weight"])
@@ -281,22 +281,23 @@ block.mlp.c_fc.weight.value    = jnp.array(pt[f"h.{i}.mlp.c_fc.weight"])
 block.mlp.c_proj.weight.value  = jnp.array(pt[f"h.{i}.mlp.c_proj.weight"])
 ```
 
-HF safetensors 的键名（如 `h.0.attn.c_attn.weight`）不变；仅 Python 属性路径从 `kernel` 改为
-`weight`，以匹配自定义 `Linear` 类。
+两处变化：属性名（`kernel` → `weight`）和赋值方式（`param[...] = v` vs `param.value = v`）。
+两者在 Flax NNX 中均可设置底层数组；源代码统一使用 `[...]` 切片赋值，目标代码统一使用 `.value`。
+HF safetensors 的键名（如 `h.0.attn.c_attn.weight`）在两者中均不变。
 
 ---
 
 ### 11. Block 迭代：`model.h` → `model.blocks`
 
-**源代码**——HF 权重加载路径：
+**源代码**——HF 权重加载路径（全程使用 `[...]` 切片赋值）：
 ```python
 for i, block in enumerate(model.h):
-    block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-    block.ln_1.scale.value         = jnp.array(pt[f'h.{i}.ln_1.weight'])
+    block.attn.c_attn.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+    block.ln_1.scale[...]         = jnp.array(pt[f'h.{i}.ln_1.weight'])
     ...
 ```
 
-**目标代码**：
+**目标代码**（全程使用 `.value` 赋值）：
 ```python
 for i, block in enumerate(model.blocks):
     block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
@@ -304,8 +305,8 @@ for i, block in enumerate(model.blocks):
     ...
 ```
 
-直接源于第 5 条中的重命名变更。HF safetensors 键名（`h.{i}.*`）两者完全相同，仅线性层权重的
-Python 属性路径从 `kernel` 改为 `weight`。
+两处变化：block 列表名（`model.h` → `model.blocks`）和赋值方式（`[...]` → `.value`）。
+HF safetensors 键名（`h.{i}.*`）和 LayerNorm 属性名（`.scale`、`.bias`）在两者中均不变。
 
 ---
 
@@ -349,7 +350,7 @@ def load_model_from_checkpoint(out_dir):
     model.wte[...] = jnp.array(p['wte'])
     for i, block in enumerate(model.h):
         _assign_block(block, p[f'h_{i}'], has_bias)
-        # 解包：p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel.value
+        # 解包：p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel[...]
 ```
 
 **目标代码 `train.py`**（`sglang-jax/examples/nanogpt/train.py`）——保存原生 NNX `State`：
@@ -511,7 +512,7 @@ print(decode(generated))
 | Block 列表名 | `self.h` | `self.blocks` |
 | 因果掩码填充值 | `-jnp.inf` | `jnp.finfo(dtype).min` |
 | 默认 `init_from` | `'resume'` | `'gpt2'` |
-| HF 权重属性路径 | `.c_attn.kernel.value` | `.c_attn.weight.value` |
+| HF 权重属性名 | `.c_attn.kernel`（用 `kernel[...] = v`） | `.c_attn.weight`（用 `weight.value = v`） |
 | 检查点恢复 | 自有 `train.py` 通过 `_get_linen_params()` 保存 Linen 兼容格式（键：`h_0`、`kernel`）；由 `_assign_block()` 加载 | 自有 `train.py` 保存原生 NNX `State` pytree（路径：`blocks[0]`、`weight`）；由 `serialization.from_state_dict` 加载 |
 | 生成方式 | `@nnx.jit + jax.lax.scan`（单 XLA 程序） | `@jax.jit + nnx.split/merge + Python 循环` |
 | 编译缓存 | 手动 `_gen_cache` 字典 | JAX 内置（模块级 `@jax.jit`） |

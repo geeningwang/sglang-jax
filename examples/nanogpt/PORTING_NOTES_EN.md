@@ -272,15 +272,15 @@ Direct consequence of the `rngs` removal in §1.
 
 ### 10. HF weight loading: `.kernel.value` → `.weight.value`
 
-**Source** (uses `nnx.Linear`, attribute name is `kernel`):
+**Source** (uses `nnx.Linear`, attribute name is `kernel`; assigns via `[...]` slice syntax):
 ```python
-block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-block.attn.c_proj.kernel.value = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
-block.mlp.c_fc.kernel.value    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
-block.mlp.c_proj.kernel.value  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
+block.attn.c_attn.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+block.attn.c_proj.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_proj.weight'])
+block.mlp.c_fc.kernel[...]    = jnp.array(pt[f'h.{i}.mlp.c_fc.weight'])
+block.mlp.c_proj.kernel[...]  = jnp.array(pt[f'h.{i}.mlp.c_proj.weight'])
 ```
 
-**Destination** (uses custom `Linear`, attribute name is `weight`):
+**Destination** (uses custom `Linear`, attribute name is `weight`; assigns via `.value`):
 ```python
 block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
 block.attn.c_proj.weight.value = jnp.array(pt[f"h.{i}.attn.c_proj.weight"])
@@ -288,22 +288,24 @@ block.mlp.c_fc.weight.value    = jnp.array(pt[f"h.{i}.mlp.c_fc.weight"])
 block.mlp.c_proj.weight.value  = jnp.array(pt[f"h.{i}.mlp.c_proj.weight"])
 ```
 
-The HF safetensors key names (e.g. `h.0.attn.c_attn.weight`) are unchanged. Only the Python
-attribute path changes (`kernel` → `weight`) to match the custom `Linear` class.
+Two differences: the attribute name (`kernel` → `weight`) and the assignment style
+(`param[...] = v` vs `param.value = v`). Both are valid NNX patterns that set the underlying
+array. The source consistently uses `[...]` slice assignment; the destination uses `.value`.
+The HF safetensors key names (e.g. `h.0.attn.c_attn.weight`) are unchanged in both.
 
 ---
 
 ### 11. Block iteration: `model.h` → `model.blocks`
 
-**Source** — HF weight loading path:
+**Source** — HF weight loading path (uses `[...]` slice assignment throughout):
 ```python
 for i, block in enumerate(model.h):
-    block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
-    block.ln_1.scale.value         = jnp.array(pt[f'h.{i}.ln_1.weight'])
+    block.attn.c_attn.kernel[...] = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+    block.ln_1.scale[...]         = jnp.array(pt[f'h.{i}.ln_1.weight'])
     ...
 ```
 
-**Destination**:
+**Destination** (uses `.value` assignment throughout):
 ```python
 for i, block in enumerate(model.blocks):
     block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
@@ -311,8 +313,9 @@ for i, block in enumerate(model.blocks):
     ...
 ```
 
-Direct consequence of the rename in §5. The HF safetensors key names (`h.{i}.*`) are unchanged in
-both; only the Python attribute path for the linear weight changes (`kernel` → `weight`).
+Two changes from source: block list name (`model.h` → `model.blocks`) and assignment style
+(`[...]` → `.value`). The HF safetensors key names (`h.{i}.*`) and the LayerNorm attribute
+names (`.scale`, `.bias`) are unchanged in both.
 
 ---
 
@@ -353,10 +356,10 @@ def load_model_from_checkpoint(out_dir):
     outer = serialization.msgpack_restore(raw)
     p     = outer['state']['params']   # {'h_0': {'attn': {'c_attn': {'kernel': ...}}}, ...}
 
-    model.wte.value = jnp.array(p['wte'])
+    model.wte[...] = jnp.array(p['wte'])
     for i, block in enumerate(model.h):
         _assign_block(block, p[f'h_{i}'], has_bias)
-        # unpacks: p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel.value
+        # unpacks: p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel[...]
 ```
 
 **Destination `train.py`** (`sglang-jax/examples/nanogpt/train.py`) — saves native NNX `State`:
@@ -522,7 +525,7 @@ side.
 | Block list name | `self.h` | `self.blocks` |
 | Causal mask fill | `-jnp.inf` | `jnp.finfo(dtype).min` |
 | Default `init_from` | `'resume'` | `'gpt2'` |
-| HF weight attr path | `.c_attn.kernel.value` | `.c_attn.weight.value` |
+| HF weight attr name | `.c_attn.kernel` (via `kernel[...] = v`) | `.c_attn.weight` (via `weight.value = v`) |
 | Checkpoint resume | Own `train.py` saves linen-compatible format via `_get_linen_params()` (`h_0`, `kernel` keys); loaded via `_assign_block()` | Own `train.py` saves native NNX `State` pytree (`blocks[0]`, `weight` keys); loaded via `serialization.from_state_dict` |
 | Generation | `@nnx.jit + jax.lax.scan` (one XLA program) | `@jax.jit + nnx.split/merge + Python loop` |
 | Compile cache | Manual `_gen_cache` dict | JAX built-in (module-level `@jax.jit`) |
