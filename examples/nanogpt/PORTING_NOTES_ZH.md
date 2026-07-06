@@ -288,41 +288,82 @@ HF safetensors 的键名（如 `h.0.attn.c_attn.weight`）不变；仅 Python �
 
 ### 11. Block 迭代：`model.h` → `model.blocks`
 
-**源代码**：
+**源代码**——HF 权重加载路径：
 ```python
 for i, block in enumerate(model.h):
-    _assign_block(block, p[f'h_{i}'], has_bias)
+    block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+    block.ln_1.scale.value         = jnp.array(pt[f'h.{i}.ln_1.weight'])
+    ...
 ```
 
 **目标代码**：
 ```python
 for i, block in enumerate(model.blocks):
-    block.ln_1.scale.value = jnp.array(pt[f"h.{i}.ln_1.weight"])
+    block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
+    block.ln_1.scale.value         = jnp.array(pt[f"h.{i}.ln_1.weight"])
     ...
 ```
 
-直接源于第 5 条中的重命名变更。
+直接源于第 5 条中的重命名变更。HF safetensors 键名（`h.{i}.*`）两者完全相同，仅线性层权重的
+Python 属性路径从 `kernel` 改为 `weight`。
 
 ---
 
-### 12. 检查点格式：Linen `TrainState` → NNX `State`
+### 12. 检查点格式：Linen 兼容字典 → 原生 NNX `State` pytree
 
-**源代码**——加载 Linen 格式检查点（由 `nanogpt-tpu/train.py` 产生）：
+`nanogpt-tpu-nnx` 和 `sglang-jax` 各自都有 `train.py`，但使用不同的检查点格式，
+因此 `sample.py` 中需要不同的加载器。
+
+**源代码 `train.py`**（`nanogpt-tpu-nnx/train.py`）——以 Linen 兼容格式保存：
+```python
+def _get_linen_params(model) -> dict:
+    """将 NNX 模型权重提取为 Linen 兼容的嵌套字典。"""
+    p = {
+        'wte': np.array(model.wte[...]),
+        'wpe': np.array(model.wpe[...]),
+        'ln_f': {'scale': np.array(model.ln_f.scale[...])},
+    }
+    for i, block in enumerate(model.h):
+        p[f'h_{i}'] = {
+            'attn': {'c_attn': {'kernel': np.array(block.attn.c_attn.kernel[...])}, ...},
+            ...
+        }
+    return p
+
+def save_checkpoint(param_state_sharded, iter_num, best_val_loss):
+    params = _get_linen_params(m)
+    ckpt = {'state': {'params': params}, 'iter_num': iter_num, ...}
+    serialization.to_bytes(ckpt)
+```
+
+虽然模型是 NNX 格式，`train.py` 在保存时刻意将权重转换为 Linen 风格的嵌套字典
+（`h_0`、`h_1`...、`kernel`，按层嵌套），以便与 `nanogpt-tpu/sample.py`（原始 Linen
+推理脚本）保持兼容。
+
+**源代码 `sample.py`**（`nanogpt-tpu-nnx/sample.py`）——通过 `_assign_block` 辅助函数加载：
 ```python
 def load_model_from_checkpoint(out_dir):
     outer = serialization.msgpack_restore(raw)
-    p     = outer['state']['params']   # linen 参数 pytree: {'h_0': {'attn': {'c_attn': {'kernel': ...}}}}
+    p     = outer['state']['params']   # {'h_0': {'attn': {'c_attn': {'kernel': ...}}}, ...}
 
-    model.wte.value = jnp.array(p['wte'])
+    model.wte[...] = jnp.array(p['wte'])
     for i, block in enumerate(model.h):
         _assign_block(block, p[f'h_{i}'], has_bias)
-        # _assign_block 读取 linen 键：p['attn']['c_attn']['kernel']
+        # 解包：p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel.value
 ```
 
-源代码有辅助函数 `_assign_block()`，用于解包 linen 的嵌套字典结构
-（`{'ln_1': {'scale': ..., 'bias': ...}, 'attn': {'c_attn': {'kernel': ...}}, ...}`）。
+**目标代码 `train.py`**（`sglang-jax/examples/nanogpt/train.py`）——保存原生 NNX `State`：
+```python
+def save_checkpoint(state, opt_state, iter_num, best_val_loss):
+    state0 = jax.tree_util.tree_map(lambda x: x[0], state)   # 取 device-0 切片
+    ckpt   = {"state": state0, "opt_state": opt0, "iter_num": iter_num, ...}
+    serialization.to_bytes(ckpt)
+```
 
-**目标代码**——加载 NNX 格式检查点（由新版 `train.py` 产生）：
+此处 `state` 是 `nnx.split(model)` 产生的原始 `nnx.State` pytree，其结构直接对应
+模型的 Python 属性路径：`blocks[0].attn.c_attn.weight` 等。
+
+**目标代码 `sample.py`**（`sglang-jax/examples/nanogpt/sample.py`）——原生 NNX 加载器：
 ```python
 def load_nnx_checkpoint(model, out_dir):
     _, state = nnx.split(model)
@@ -331,13 +372,12 @@ def load_nnx_checkpoint(model, out_dir):
     nnx.update(model, restored)
 ```
 
-使用 `nnx.split` 获取与检查点结构匹配的 `nnx.State` pytree，再通过 `serialization.from_state_dict`
-还原，最后用 `nnx.update` 写回模型。Linen 的 `_assign_block` 辅助函数和 `h_0` / `kernel` 键名约定
-均已移除。
+`serialization.from_state_dict` 可直接还原，因为检查点的 `state` 键已持有与
+`nnx.split` 产生的相同 pytree 结构——无需 `_assign_block` 辅助函数。
 
-**原因**：两种检查点格式不兼容。Linen `TrainState` 在 `state.params` 下存储参数，键名如 `h_0`、
-`attn`、`kernel`。NNX `State` pytree 使用属性路径，如 `blocks[0]`、`attn`、`weight`。目标代码的
-`train.py` 产生 NNX 格式检查点，因此需要不同的加载器。
+**格式不兼容的原因**：源代码使用 Linen 兼容字典格式（`h_0`、`kernel`）以实现跨项目
+兼容性；目标代码使用原始 NNX `State` pytree（`blocks[0]`、`weight`），更简洁但与源
+格式不兼容。
 
 ---
 
@@ -472,6 +512,6 @@ print(decode(generated))
 | 因果掩码填充值 | `-jnp.inf` | `jnp.finfo(dtype).min` |
 | 默认 `init_from` | `'resume'` | `'gpt2'` |
 | HF 权重属性路径 | `.c_attn.kernel.value` | `.c_attn.weight.value` |
-| 检查点格式 | Linen `TrainState`（键：`h_0`、`kernel`） | NNX `State`（路径：`blocks[0]`、`weight`） |
+| 检查点恢复 | 自有 `train.py` 通过 `_get_linen_params()` 保存 Linen 兼容格式（键：`h_0`、`kernel`）；由 `_assign_block()` 加载 | 自有 `train.py` 保存原生 NNX `State` pytree（路径：`blocks[0]`、`weight`）；由 `serialization.from_state_dict` 加载 |
 | 生成方式 | `@nnx.jit + jax.lax.scan`（单 XLA 程序） | `@jax.jit + nnx.split/merge + Python 循环` |
 | 编译缓存 | 手动 `_gen_cache` 字典 | JAX 内置（模块级 `@jax.jit`） |

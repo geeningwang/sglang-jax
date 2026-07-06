@@ -295,42 +295,82 @@ attribute path changes (`kernel` → `weight`) to match the custom `Linear` clas
 
 ### 11. Block iteration: `model.h` → `model.blocks`
 
-**Source**:
+**Source** — HF weight loading path:
 ```python
 for i, block in enumerate(model.h):
-    _assign_block(block, p[f'h_{i}'], has_bias)
+    block.attn.c_attn.kernel.value = jnp.array(pt[f'h.{i}.attn.c_attn.weight'])
+    block.ln_1.scale.value         = jnp.array(pt[f'h.{i}.ln_1.weight'])
+    ...
 ```
 
 **Destination**:
 ```python
 for i, block in enumerate(model.blocks):
-    block.ln_1.scale.value = jnp.array(pt[f"h.{i}.ln_1.weight"])
+    block.attn.c_attn.weight.value = jnp.array(pt[f"h.{i}.attn.c_attn.weight"])
+    block.ln_1.scale.value         = jnp.array(pt[f"h.{i}.ln_1.weight"])
     ...
 ```
 
-Direct consequence of the rename in §5.
+Direct consequence of the rename in §5. The HF safetensors key names (`h.{i}.*`) are unchanged in
+both; only the Python attribute path for the linear weight changes (`kernel` → `weight`).
 
 ---
 
-### 12. Checkpoint format: linen `TrainState` → NNX `State`
+### 12. Checkpoint format: linen-compatible dict → native NNX `State` pytree
 
-**Source** — loads linen-format checkpoints (produced by `nanogpt-tpu/train.py`):
+Both `nanogpt-tpu-nnx` and `sglang-jax` have their own `train.py`, but they use different
+checkpoint formats, which forces different loaders in `sample.py`.
+
+**Source `train.py`** (`nanogpt-tpu-nnx/train.py`) — saves in linen-compatible format:
+```python
+def _get_linen_params(model) -> dict:
+    """Extract NNX model weights as a linen-compatible nested dict."""
+    p = {
+        'wte': np.array(model.wte[...]),
+        'wpe': np.array(model.wpe[...]),
+        'ln_f': {'scale': np.array(model.ln_f.scale[...])},
+    }
+    for i, block in enumerate(model.h):
+        p[f'h_{i}'] = {
+            'attn': {'c_attn': {'kernel': np.array(block.attn.c_attn.kernel[...])}, ...},
+            ...
+        }
+    return p
+
+def save_checkpoint(param_state_sharded, iter_num, best_val_loss):
+    params = _get_linen_params(m)
+    ckpt = {'state': {'params': params}, 'iter_num': iter_num, ...}
+    serialization.to_bytes(ckpt)
+```
+
+Even though the model is NNX, `train.py` deliberately converts weights to a linen-style nested
+dict before saving (`h_0`, `h_1`, ..., `kernel`, nested by layer). This preserves compatibility
+with `nanogpt-tpu/sample.py` (the original Linen inference script).
+
+**Source `sample.py`** (`nanogpt-tpu-nnx/sample.py`) — loads via `_assign_block` helper:
 ```python
 def load_model_from_checkpoint(out_dir):
     outer = serialization.msgpack_restore(raw)
-    p     = outer['state']['params']   # linen params pytree: {'h_0': {'attn': {'c_attn': {'kernel': ...}}}}
+    p     = outer['state']['params']   # {'h_0': {'attn': {'c_attn': {'kernel': ...}}}, ...}
 
     model.wte.value = jnp.array(p['wte'])
     for i, block in enumerate(model.h):
         _assign_block(block, p[f'h_{i}'], has_bias)
-        # _assign_block reads linen keys: p['attn']['c_attn']['kernel']
-        block.attn.c_attn.kernel.value = jnp.array(p['attn']['c_attn']['kernel'])
+        # unpacks: p['attn']['c_attn']['kernel'] → block.attn.c_attn.kernel.value
 ```
 
-The source has a `_assign_block()` helper that unpacks the linen nested dict structure
-(`{'ln_1': {'scale': ..., 'bias': ...}, 'attn': {'c_attn': {'kernel': ...}}, ...}`).
+**Destination `train.py`** (`sglang-jax/examples/nanogpt/train.py`) — saves native NNX `State`:
+```python
+def save_checkpoint(state, opt_state, iter_num, best_val_loss):
+    state0 = jax.tree_util.tree_map(lambda x: x[0], state)   # device-0 slice
+    ckpt   = {"state": state0, "opt_state": opt0, "iter_num": iter_num, ...}
+    serialization.to_bytes(ckpt)
+```
 
-**Destination** — loads NNX-format checkpoints (produced by the new `train.py`):
+`state` here is the raw `nnx.State` pytree from `nnx.split(model)`. Its structure mirrors the
+model's Python attributes directly: `blocks[0].attn.c_attn.weight`, etc.
+
+**Destination `sample.py`** (`sglang-jax/examples/nanogpt/sample.py`) — native NNX loader:
 ```python
 def load_nnx_checkpoint(model, out_dir):
     _, state = nnx.split(model)
@@ -339,14 +379,12 @@ def load_nnx_checkpoint(model, out_dir):
     nnx.update(model, restored)
 ```
 
-Uses `nnx.split` to get an `nnx.State` pytree that structurally matches the checkpoint, then
-`serialization.from_state_dict` to restore into it, and `nnx.update` to apply back to the model.
-The linen `_assign_block` helper and the `h_0` / `kernel` key convention are gone.
+`serialization.from_state_dict` can restore directly because the checkpoint `state` key already
+holds the same pytree shape that `nnx.split` produces — no `_assign_block` helper needed.
 
-**Why**: The two checkpoint formats are incompatible. The linen `TrainState` stores params under
-`state.params` with keys like `h_0`, `attn`, `kernel`. The NNX `State` pytree uses attribute
-paths like `blocks[0]`, `attn`, `weight`. The destination's `train.py` produces NNX-format
-checkpoints, so a different loader is needed.
+**Why the formats differ**: The source uses a linen-compatible dict format (`h_0`, `kernel`) for
+cross-project compatibility. The destination uses the raw NNX `State` pytree (`blocks[0]`, `weight`)
+which is simpler but incompatible with the source's format.
 
 ---
 
@@ -485,6 +523,6 @@ side.
 | Causal mask fill | `-jnp.inf` | `jnp.finfo(dtype).min` |
 | Default `init_from` | `'resume'` | `'gpt2'` |
 | HF weight attr path | `.c_attn.kernel.value` | `.c_attn.weight.value` |
-| Checkpoint format | Linen `TrainState` (`h_0`, `kernel` keys) | NNX `State` (`blocks[0]`, `weight` keys) |
+| Checkpoint resume | Own `train.py` saves linen-compatible format via `_get_linen_params()` (`h_0`, `kernel` keys); loaded via `_assign_block()` | Own `train.py` saves native NNX `State` pytree (`blocks[0]`, `weight` keys); loaded via `serialization.from_state_dict` |
 | Generation | `@nnx.jit + jax.lax.scan` (one XLA program) | `@jax.jit + nnx.split/merge + Python loop` |
 | Compile cache | Manual `_gen_cache` dict | JAX built-in (module-level `@jax.jit`) |
