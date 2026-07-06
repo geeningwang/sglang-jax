@@ -799,3 +799,63 @@ Manifest 路径：`scripts/gke/mimo-v2-flash-1node-nfs-tpu7-{cp4096,ps128,ps128c
 **最可能的解释**：§1.3 原始测试在专属/预留 TPU 实例上运行，该实例具备比 DWS queued-provisioning 按需分配节点更优的芯片 binning 或频率配置。DWS 节点通过竞争性队列分配，无法保证与原始测试相同档位的硬件。这一差距（≈7%）与同类 TPU 实例 binning 方差的典型范围一致，属于硬件层面的固有不确定性，无法通过软件参数调整消弭。
 
 **对原始结论的影响**：MTP vs No-MTP 加速比趋势、MTP 接受率（≥97.6%）与 §1.3 高度一致，各 bsz 档位的相对性能排序完全保留。7% 的绝对吞吐差距系硬件环境差异所致，不影响算法正确性和相对性能结论。
+
+---
+
+**8\. mimo-tpu7-stage2 复现记录（MiMo-V2-Flash）**
+
+以上 §1–§7 所有数据均基于 **mimo-tpu7-stage1** 分支（`primatrix/sglang-jax`，commit `1bc2227`）。本节在 **mimo-tpu7-stage2** 分支（`geeningwang/sglang-jax`，同一 HEAD commit `1bc2227`，以新分支名独立验证）上重复 §五 DVFS P-state 7 最优配置，确认代码从 primatrix 仓库迁移至 geeningwang 仓库后行为一致。
+
+**8.1 复现环境**
+
+| 项目 | 配置 |
+| ----- | ----- |
+| GCP 项目 | `tpu-launchpad-playground` |
+| GKE 集群 | `jingnw-tpu7-cluster`（us-central1-c） |
+| DWS Node Pool | `jingnw-dws-tpu7-4ch`（`tpu7x-standard-4t`，topology `2x2x1`，4 chips / 8 JAX devices） |
+| 测试仓库 | `geeningwang/sglang-jax`，branch `mimo-tpu7-stage2` |
+| 测试 commit | `1bc2227`（与 stage1 完全一致） |
+| 模型权重 | `gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights`（HF safetensors，NFS tmpfs 挂载） |
+| 结果输出 | `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-1node-nfs-stage2/` |
+| 容器镜像 | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1` |
+| DVFS P-state | `LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7"`（与 §五 完全一致） |
+| Manifest | `scripts/gke/mimo-v2-flash-1node-nfs-stage2.yaml` |
+| 生命周期脚本 | `scripts/gke/run-flash-nfs-bench-stage2.sh` |
+
+**8.2 bench_serving 端到端指标（commit `1bc2227`，v7x 4-chip，16384 in / 4096 out）**
+
+吞吐（*结果待填入*）：
+
+| bsz | MTP 输入 tok/s | No-MTP 输入 tok/s | MTP 输出 tok/s | No-MTP 输出 tok/s | 输出加速 | MTP bench peak tok/s | No-MTP bench peak tok/s |
+| :---: | ----: | ----: | ----: | ----: | ----: | ----: | ----: |
+| 32  | — | — | — | — | — | — | — |
+| 64  | — | — | — | — | — | — | — |
+| 128 | — | — | — | — | — | — | — |
+
+延迟（*结果待填入*）：
+
+| bsz | MTP Mean TTFT ms | No-MTP Mean TTFT ms | MTP P99 TTFT ms | No-MTP P99 TTFT ms | MTP Mean ITL ms | No-MTP Mean ITL ms | MTP P99 ITL ms | No-MTP P99 ITL ms |
+| :---: | ----: | ----: | ----: | ----: | ----: | ----: | ----: | ----: |
+| 32  | — | — | — | — | — | — | — | — |
+| 64  | — | — | — | — | — | — | — | — |
+| 128 | — | — | — | — | — | — | — | — |
+
+**8.3 server decode 指标**
+
+| bsz | MTP steady tok/s | No-MTP steady tok/s | MTP peak p95 tok/s | No-MTP peak p95 tok/s | MTP 接受率 % |
+| :---: | ----: | ----: | ----: | ----: | ----: |
+| 32  | — | — | — | — | — |
+| 64  | — | — | — | — | — |
+| 128 | — | — | — | — | — |
+
+**8.4 与 §五 stage1 结果对比**
+
+bench_serving 输出 tok/s：
+
+| bsz | §五 MTP tok/s（stage1 dvfs7 Run 2） | stage2 MTP tok/s | 差距 | §五 No-MTP tok/s | stage2 No-MTP tok/s | 差距 |
+| :---: | ----: | ----: | ----: | ----: | ----: | ----: |
+| 32  | 1346.23 | — | — | 1164.30 | — | — |
+| 64  | 1552.78 | — | — | 1463.11 | — | — |
+| 128 | 1800.31 | — | — | 1751.15 | — | — |
+
+*作业正在运行中（GKE job `mimo-v2-flash-1node-nfs-stage2`，预计 ~80 min 完成）。结果将在作业完成后从 `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-1node-nfs-stage2/` 读取并填入。*
