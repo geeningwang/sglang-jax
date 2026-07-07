@@ -44,15 +44,16 @@ gcloud compute firewall-rules create allow-direct-ssh \
 
 # ── Step 1: Cleanup stale GCS flags ─────────────────────────────────────────
 
-log "=== Step 1: Clearing GCS coordination flags ==="
+log "=== Step 1: Clearing pod coordination flags ==="
 for FLAG in \
-    "${READY_FLAG}" "${NFS_IP_FLAG}" \
     "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod0-ip" \
     "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod1-done" \
     "gs://jingnw-mimo-v2-flash-us-central1/pd1p1d-pod0-ip" \
     "gs://jingnw-mimo-v2-flash-us-central1/pd1p1d-pod1-done"; do
   gsutil rm "${FLAG}" 2>/dev/null || true
 done
+# NFS VM flags (READY_FLAG, NFS_IP_FLAG) are NOT cleared here:
+# Step 2 checks them to skip VM creation if the VM is already ready.
 
 # ── Step 2: Create NFS VM (background) + submit PD 1P1D job ─────────────────
 
