@@ -120,23 +120,9 @@ NFS_VM_PID=$!
 kubectl apply -f "${SCRIPT_DIR}/${PD_JOB}.yaml"
 log "PD 1P1D job submitted. DWS may take minutes to hours to provision."
 
-# ── Step 3: Wait for DWS provisioning (PD) + NFS VM ─────────────────────────
+# ── Step 3: Wait for NFS VM ──────────────────────────────────────────────────
 
-wait_dws() {
-  local PR_NAME="$1"
-  for i in $(seq 1 720); do
-    STATUS=$(kubectl get provisioningrequest "${PR_NAME}" \
-      -o jsonpath='{.status.conditions[?(@.type=="Provisioned")].status}' 2>/dev/null || echo "Unknown")
-    [ "${STATUS}" = "True" ] && { log "DWS ${PR_NAME} provisioned after $((i*30))s"; return 0; }
-    [ $((i % 12)) -eq 0 ] && log "DWS ${PR_NAME} still queuing... $((i*30))s (${STATUS})"
-    sleep 30
-  done
-  log "WARNING: DWS ${PR_NAME} wait timed out after 6h"
-}
-
-log "=== Step 3: Waiting for DWS provisioning (PD) ==="
-wait_dws "${PD_JOB}"
-
+log "=== Step 3: Waiting for NFS VM ==="
 log "Waiting for NFS VM to be ready..."
 wait "${NFS_VM_PID}" && log "NFS VM create call returned"
 log "Polling GCS for NFS ready flag (up to 30 min)..."
@@ -171,8 +157,7 @@ gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod0-ip" 2>/dev/null || t
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod1-done" 2>/dev/null || true
 
 kubectl apply -f "${SCRIPT_DIR}/${NONPD_JOB}.yaml"
-log "Non-PD job submitted. Waiting for DWS provisioning..."
-wait_dws "${NONPD_JOB}"
+log "Non-PD job submitted."
 
 # ── Step 6: Wait for Non-PD job ───────────────────────────────────────────────
 
