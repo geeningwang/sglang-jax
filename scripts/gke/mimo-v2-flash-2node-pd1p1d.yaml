@@ -7,7 +7,7 @@
 # NOTE: stage2 disaggregation requires dp_size=1 (dp>1 not yet implemented).
 #       The decode pod runs dp=1 on all 8 JAX devices via tp=8.
 #
-# DWS: count=1 provisions the full 2-VM multi-host slice atomically.
+# DWS: count=2 equals the gang size, provisions both VMs atomically.
 # IndexedJob (2 pods) shares the same PR; each pod lands on one VM.
 #
 # Repo:   https://github.com/geeningwang/sglang-jax.git
@@ -55,7 +55,7 @@ spec:
   parameters:
     maxRunDurationSeconds: "21600"
   podSets:
-  - count: 1
+  - count: 2
     podTemplateRef:
       name: mimo-v2-flash-2node-pd1p1d-template
 ---

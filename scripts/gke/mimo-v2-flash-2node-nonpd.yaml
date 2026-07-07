@@ -3,7 +3,7 @@
 # each running the full server (tp=8, dp=2, ep=8, moe-backend=fused_v2).
 # Pod 1 also runs a round-robin proxy on port 30000 and drives bench_serving.
 #
-# DWS: count=1 provisions the full 2-VM multi-host slice atomically.
+# DWS: count=2 equals the gang size, provisions both VMs atomically.
 # IndexedJob (2 pods) shares the same PR; each pod lands on one VM.
 #
 # Repo:   https://github.com/geeningwang/sglang-jax.git
@@ -51,7 +51,7 @@ spec:
   parameters:
     maxRunDurationSeconds: "21600"
   podSets:
-  - count: 1
+  - count: 2
     podTemplateRef:
       name: mimo-v2-flash-2node-nonpd-template
 ---
