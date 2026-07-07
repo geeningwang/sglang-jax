@@ -115,7 +115,7 @@ else
 fi
 
 kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd1p1d.yaml"
-log "PD 1P1D job submitted (1 PR count=1, 2-pod IndexedJob)."
+log "PD 1P1D job submitted (1 PR count=2, 2-pod IndexedJob)."
 
 # ── Step 3: Wait for DWS (PD) + NFS VM ───────────────────────────────────────
 
@@ -176,7 +176,7 @@ gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod0-ip" 2>/dev/null || t
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod1-done" 2>/dev/null || true
 
 kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd.yaml"
-log "Non-PD job submitted (1 PR count=1, 2-pod IndexedJob)."
+log "Non-PD job submitted (1 PR count=2, 2-pod IndexedJob)."
 
 log "=== Step 5b: Waiting for Non-PD DWS provisioning ==="
 wait_dws "mimo-v2-flash-2node-nonpd" &
