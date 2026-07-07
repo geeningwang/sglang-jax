@@ -859,3 +859,69 @@ bench_serving 输出 tok/s：
 | 128 | 1800.31 | 1847.93 | +2.6% | 1751.15 | 1751.48 | +0.0% |
 
 **结论**：stage2 与 stage1 吞吐差距均在 ±3% 以内（No-MTP ≤ ±0.1%，MTP ≤ +2.6%），属硬件批次正常方差范围，确认代码从 `primatrix/sglang-jax` 迁移至 `geeningwang/sglang-jax` 后行为完全一致。
+
+---
+
+**9\. PD 分离复现记录（MiMo-V2-Flash，2 台 TPU v7x 4-chip）**
+
+参考文档：《基于 SGLangJax 的 MiMo-V2-Flash PD 分离性能报告》（内部报告，primatrix `epic/mimo-pd-disggragation`，commit `c6105f1`）
+
+本节使用 `geeningwang/sglang-jax mimo-tpu7-stage2` 分支，在 2 台 TPU v7x 4-chip 上复现两种配置并对比，验证 PD 分离的吞吐与延迟收益。
+
+**9.1 测试环境**
+
+| 项目 | 配置 |
+| ----- | ----- |
+| GCP 项目 | `tpu-launchpad-playground` |
+| GKE 集群 | `jingnw-tpu7-cluster`（us-central1-c） |
+| DWS Node Pool | `jingnw-dws-tpu7-4ch`（`tpu7x-standard-4t`，topology `2x2x1`） |
+| 测试仓库 | `geeningwang/sglang-jax`，branch `mimo-tpu7-stage2` |
+| 模型权重 | `gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights`（NFS tmpfs 挂载） |
+| KV 传输机制 | `jax_transfer`（无 Raiden 依赖；原始报告使用 Raiden） |
+| DVFS P-state | `--xla_tpu_dvfs_p_state=7` |
+| Manifest | `scripts/gke/mimo-v2-flash-2node-nonpd.yaml` + `mimo-v2-flash-2node-pd1p1d.yaml` |
+| 生命周期脚本 | `scripts/gke/run-flash-2node-bench.sh` |
+
+**9.2 配置说明**
+
+| 配置 | 资源 | 参数 | 说明 |
+| ----- | ----- | ----- | ----- |
+| Non-PD serve-level DP | 2 pods | tp=8, dp=2, ep=8 | 两个完整服务器 + round-robin 代理，bsz=64/128 |
+| PD 1P1D | 2 pods | tp=8, dp=1, ep=8 | 1 prefill pod + 1 decode pod；dp=1（stage2 PD 限制，原始报告 dp=2） |
+
+**⚠️ 注意**：stage2 的 PD 分离实现（`runtime.py`）暂不支持 `dp_size > 1`，因此 PD 测试 dp=1，与原始报告的 dp=2 有差异。原始报告使用 primatrix Raiden 传输；本次使用 stage2 内置 JAX transfer。绝对吞吐数值不可直接与原始报告对比，但 PD vs Non-PD 相对收益有参考价值。
+
+**9.3 bench_serving 参数**
+
+| 参数 | 值 |
+| ----- | ----- |
+| 数据集 | random，16384 in / 4096 out，range_ratio=1 |
+| bsz | 64、128 |
+| num_prompts | 384 |
+| seed | 12345 |
+| Non-PD 客户端 | `http://localhost:30000`（round-robin 代理） |
+| PD 客户端 | `http://localhost:10001`（decode pod 直连） |
+
+**9.4 结果（Non-PD vs PD 1P1D）**
+
+*作业待运行（GKE jobs `mimo-v2-flash-2node-nonpd` + `mimo-v2-flash-2node-pd1p1d`）。结果将从以下路径读取：*
+
+- `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/`
+- `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/`
+
+bench_serving 端到端指标：
+
+| 配置 | bsz | total tok/s | input tok/s | output tok/s | Mean ITL ms | Mean TTFT ms |
+| ----- | :---: | ----: | ----: | ----: | ----: | ----: |
+| Non-PD 2-pod | 64 | — | — | — | — | — |
+| Non-PD 2-pod | 128 | — | — | — | — | — |
+| PD 1P1D (dp=1) | 64 | — | — | — | — | — |
+| PD 1P1D (dp=1) | 128 | — | — | — | — | — |
+
+与原始报告（dp=2，Raiden）对比（仅供参考，配置不同）：
+
+| 配置 | bsz | 原始报告 total tok/s | 本次 total tok/s | 备注 |
+| ----- | :---: | ----: | ----: | ----- |
+| Non-PD 2-pod | 64 | 11.70K | — | 同 dp=2 配置，可直接对比 |
+| Non-PD 2-pod | 128 | 12.78K | — | 同 dp=2 配置，可直接对比 |
+| PD 1P1D | 128 | 13.64K | — | 配置不同（dp=1 vs dp=2），仅趋势参考 |

@@ -1,0 +1,306 @@
+# §9b MiMo-V2-Flash 2-pod PD 1P1D disaggregation test
+# 2 × TPU v7x 4-chip (jingnw-dws-tpu7-4ch).
+#   Pod 0 = prefill server  (tp=8, dp=1, ep=8, port=10000) + bootstrap (port=8998)
+#   Pod 1 = decode server   (tp=8, dp=1, ep=8, port=10001) + benchmark
+#
+# KV transfer: jax_transfer (built-in, no Raiden dependency).
+# NOTE: stage2 disaggregation requires dp_size=1 (dp>1 not yet implemented).
+#       This differs from the PDF's dp=2 configuration (primatrix PD branch).
+#       The decode pod runs dp=1 on all 8 JAX devices via tp=8.
+#
+# Repo:   https://github.com/geeningwang/sglang-jax.git
+# Branch: mimo-tpu7-stage2
+# Model:  /tmp/flash-model  (NFS-served from tmpfs)
+# Out:    gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-2node-pd1p1d-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-2node-pd1p1d
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-2node-pd1p1d
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"   # 6 h
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: mimo-v2-flash-2node-pd1p1d-template
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-2node-pd1p1d
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-2node-pd1p1d
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-2node-pd1p1d
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          IDX="${JOB_COMPLETION_INDEX}"
+          RESULTS_BUCKET="gs://jingnw-mimo-v2-flash-us-central1"
+          RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-2node-pd1p1d"
+          NFS_IP_FLAG="${RESULTS_BUCKET}/nfs-flash-2node-ip"
+          POD0_IP_FLAG="${RESULTS_BUCKET}/pd1p1d-pod0-ip"
+          DONE_FLAG="${RESULTS_BUCKET}/pd1p1d-pod1-done"
+          BOOTSTRAP_PORT=8998
+          PREFILL_PORT=10000
+          DECODE_PORT=10001
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          # ── 1. Clone + install ────────────────────────────────────────────────
+          echo "$(ts) === [pod${IDX}] Clone geeningwang/sglang-jax branch mimo-tpu7-stage2 ==="
+          git clone https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          git checkout mimo-tpu7-stage2
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          # ── 2. Mount NFS ──────────────────────────────────────────────────────
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          echo "$(ts) Polling GCS for NFS server IP..."
+          NFS_SERVER=""
+          for i in $(seq 1 360); do
+            if NFS_SERVER=$(gsutil cat "${NFS_IP_FLAG}" 2>/dev/null) && [ -n "${NFS_SERVER}" ]; then
+              echo "$(ts) NFS server IP: ${NFS_SERVER}"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) waiting for NFS IP... (${i}×5s)"
+            sleep 5
+          done
+          [ -z "${NFS_SERVER}" ] && { echo "$(ts) ERROR: NFS IP never appeared"; exit 1; }
+
+          MODEL_PATH=/tmp/flash-model
+          mkdir -p "${MODEL_PATH}"
+          for i in $(seq 1 120); do
+            if mount -t nfs -o nfsvers=3,nolock,rsize=1048576,wsize=1048576,hard,intr,timeo=600 \
+                "${NFS_SERVER}:/export/flash" "${MODEL_PATH}" 2>/dev/null; then
+              echo "$(ts) NFS mounted (attempt ${i})"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) NFS not ready, retrying..."
+            sleep 5
+          done
+          echo "$(ts) Flash weights: $(ls ${MODEL_PATH}/*.safetensors 2>/dev/null | wc -l) files"
+
+          # ── 3. Common server args ─────────────────────────────────────────────
+          COMMON_ARGS=(
+            --model-path "${MODEL_PATH}"
+            --trust-remote-code
+            --enable-sequence-parallel
+            --tp-size 8
+            --dp-size 1
+            --ep-size 8
+            --moe-backend fused_v2
+            --nnodes 1
+            --node-rank 0
+            --host 0.0.0.0
+            --page-size 256
+            --context-length 262144
+            --disable-radix-cache
+            --chunked-prefill-size 2048
+            --max-prefill-tokens 16384
+            --dtype bfloat16
+            --mem-fraction-static 0.84
+            --swa-full-tokens-ratio 0.2
+            --skip-server-warmup
+            --log-level info
+            --decode-log-interval 1
+            --max-running-requests 256
+            --dp-schedule-policy round_robin
+            --precompile-bs-paddings 1 4 8 16 32 64 128 256
+            --precompile-token-paddings 4096
+          )
+
+          # ── 4. Get this pod's IP ──────────────────────────────────────────────
+          MY_IP=$(curl -sf http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip \
+                    -H "Metadata-Flavor: Google")
+          echo "$(ts) [pod${IDX}] IP: ${MY_IP}"
+
+          # ── 5. Pod-specific logic ─────────────────────────────────────────────
+          if [ "${IDX}" = "0" ]; then
+            # ────────────────────────────── Pod 0: PREFILL ───────────────────────
+            # 5a. Start standalone bootstrap server
+            BLOG="/tmp/bootstrap.log"
+            PLOG="/tmp/server_prefill.log"
+            echo "$(ts) [pod0] Starting bootstrap server on port ${BOOTSTRAP_PORT}..."
+            python3 -m sgl_jax.srt.disaggregation.run_bootstrap \
+              --host 0.0.0.0 \
+              --port "${BOOTSTRAP_PORT}" \
+              >> "${BLOG}" 2>&1 &
+            BOOTSTRAP_PID=$!
+            # Wait for bootstrap to become reachable
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:${BOOTSTRAP_PORT}/health >/dev/null 2>&1 || \
+                 curl -sf http://localhost:${BOOTSTRAP_PORT}/ >/dev/null 2>&1 || \
+                 ss -tlnp 2>/dev/null | grep -q ":${BOOTSTRAP_PORT} "; then
+                echo "$(ts) [pod0] Bootstrap ready after $((i*2))s"; break
+              fi
+              sleep 2
+            done
+            # Publish IP so decode pod can find the bootstrap URL
+            echo "${MY_IP}" | gsutil cp - "${POD0_IP_FLAG}"
+            echo "$(ts) [pod0] IP ${MY_IP} written to GCS."
+
+            # 5b. Start prefill server
+            echo "$(ts) [pod0] Starting prefill server on port ${PREFILL_PORT}..."
+            JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+            python3 -m sgl_jax.launch_server \
+              "${COMMON_ARGS[@]}" \
+              --port "${PREFILL_PORT}" \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-url "http://localhost:${BOOTSTRAP_PORT}" \
+              >> "${PLOG}" 2>&1 &
+            PREFILL_PID=$!
+
+            # 5c. Wait for done signal from decode pod
+            echo "$(ts) [pod0] Waiting for pod1 done signal..."
+            until gsutil ls "${DONE_FLAG}" >/dev/null 2>&1; do sleep 10; done
+            echo "$(ts) [pod0] Done. Uploading logs."
+            gsutil cp "${BLOG}" "${RESULTS_DIR}/bootstrap.log"     || true
+            gsutil cp "${PLOG}" "${RESULTS_DIR}/server-prefill.log" || true
+            kill "${PREFILL_PID}"   2>/dev/null || true
+            kill "${BOOTSTRAP_PID}" 2>/dev/null || true
+
+          else
+            # ────────────────────────────── Pod 1: DECODE ────────────────────────
+            # 5a. Wait for prefill pod's IP
+            echo "$(ts) [pod1] Waiting for pod0 (prefill) IP..."
+            POD0_IP=""
+            for i in $(seq 1 120); do
+              if POD0_IP=$(gsutil cat "${POD0_IP_FLAG}" 2>/dev/null) && [ -n "${POD0_IP}" ]; then
+                echo "$(ts) [pod1] pod0 IP: ${POD0_IP}"; break
+              fi
+              sleep 5
+            done
+            [ -z "${POD0_IP}" ] && { echo "$(ts) ERROR: pod0 IP never appeared"; exit 1; }
+
+            # 5b. Start decode server
+            DLOG="/tmp/server_decode.log"
+            echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."
+            JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+            python3 -m sgl_jax.launch_server \
+              "${COMMON_ARGS[@]}" \
+              --port "${DECODE_PORT}" \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-url "http://${POD0_IP}:${BOOTSTRAP_PORT}" \
+              >> "${DLOG}" 2>&1 &
+            DECODE_PID=$!
+
+            # 5c. Wait for decode server healthy
+            echo "$(ts) [pod1] Waiting for decode server /health..."
+            for i in $(seq 1 1440); do
+              if curl -sf http://localhost:${DECODE_PORT}/health >/dev/null 2>&1; then
+                echo "$(ts) [pod1] Decode server ready after $((i*5))s"; break
+              fi
+              kill -0 "${DECODE_PID}" 2>/dev/null || { echo "ERROR: decode server exited"; tail -50 "${DLOG}"; exit 1; }
+              [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting... $((i*5))s"
+              sleep 5
+            done
+
+            # 5d. Benchmark
+            BENCH_URL="http://127.0.0.1:${DECODE_PORT}"
+            echo "$(ts) === [pod1] bench_serving: bsz 64 128 ==="
+            for bsz in 64 128; do
+              np=384
+              RF="/tmp/bench_pd1p1d_bs${bsz}.jsonl"
+              BL="/tmp/bench_pd1p1d_bs${bsz}.log"
+              echo "$(ts) bsz=${bsz} num_prompts=${np}"
+              python3 -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url "${BENCH_URL}" \
+                --model "${MODEL_PATH}" \
+                --dataset-name random \
+                --random-input-len 16384 \
+                --random-output-len 4096 \
+                --random-range-ratio 1 \
+                --max-concurrency "${bsz}" \
+                --num-prompts "${np}" \
+                --warmup-requests 0 \
+                --seed 12345 \
+                --output-file "${RF}" \
+                2>&1 | tee "${BL}" || true
+              gsutil cp "${RF}" "${RESULTS_DIR}/bs${bsz}/result.jsonl" || true
+              gsutil cp "${BL}" "${RESULTS_DIR}/bs${bsz}/bench.log"   || true
+            done
+
+            echo "$(ts) Uploading decode server log..."
+            gsutil cp "${DLOG}" "${RESULTS_DIR}/server-decode.log" || true
+
+            echo "$(ts) Signalling pod0 done."
+            echo "done" | gsutil cp - "${DONE_FLAG}"
+            kill "${DECODE_PID}" 2>/dev/null || true
+          fi
+
+          echo "$(ts) === [pod${IDX}] Done ==="
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: LIBTPU_INIT_ARGS
+          value: "--xla_tpu_dvfs_p_state=7"
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
+          limits:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"

@@ -1,0 +1,300 @@
+# §9a MiMo-V2-Flash 2-pod Non-PD serve-level DP comparison
+# 2 × TPU v7x 4-chip (jingnw-dws-tpu7-4ch), each running the full server
+# (tp=8, dp=2, ep=8, moe-backend=fused_v2).  Pod 1 also runs a round-robin
+# proxy on port 30000 and drives bench_serving (bsz=64 and bsz=128).
+#
+# Repo:   https://github.com/geeningwang/sglang-jax.git
+# Branch: mimo-tpu7-stage2
+# Model:  /tmp/flash-model  (NFS-served from tmpfs, same as stage1/stage2)
+# Out:    gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-2node-nonpd-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-2node-nonpd
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-2node-nonpd
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"   # 6 h
+  podSets:
+  - count: 2
+    podTemplateRef:
+      name: mimo-v2-flash-2node-nonpd-template
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-2node-nonpd
+  namespace: default
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-2node-nonpd
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-2node-nonpd
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          IDX="${JOB_COMPLETION_INDEX}"
+          RESULTS_BUCKET="gs://jingnw-mimo-v2-flash-us-central1"
+          RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-2node-nonpd"
+          NFS_IP_FLAG="${RESULTS_BUCKET}/nfs-flash-2node-ip"
+          POD0_IP_FLAG="${RESULTS_BUCKET}/nonpd-pod0-ip"
+          DONE_FLAG="${RESULTS_BUCKET}/nonpd-pod1-done"
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          # ── 1. Clone + install ────────────────────────────────────────────────
+          echo "$(ts) === [pod${IDX}] Clone geeningwang/sglang-jax branch mimo-tpu7-stage2 ==="
+          git clone https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          git checkout mimo-tpu7-stage2
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          # ── 2. Mount NFS ──────────────────────────────────────────────────────
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          echo "$(ts) Polling GCS for NFS server IP..."
+          NFS_SERVER=""
+          for i in $(seq 1 360); do
+            if NFS_SERVER=$(gsutil cat "${NFS_IP_FLAG}" 2>/dev/null) && [ -n "${NFS_SERVER}" ]; then
+              echo "$(ts) NFS server IP: ${NFS_SERVER}"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) waiting for NFS IP... (${i}×5s)"
+            sleep 5
+          done
+          [ -z "${NFS_SERVER}" ] && { echo "$(ts) ERROR: NFS IP never appeared"; exit 1; }
+
+          MODEL_PATH=/tmp/flash-model
+          mkdir -p "${MODEL_PATH}"
+          for i in $(seq 1 120); do
+            if mount -t nfs -o nfsvers=3,nolock,rsize=1048576,wsize=1048576,hard,intr,timeo=600 \
+                "${NFS_SERVER}:/export/flash" "${MODEL_PATH}" 2>/dev/null; then
+              echo "$(ts) NFS mounted (attempt ${i})"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) NFS not ready, retrying..."
+            sleep 5
+          done
+          echo "$(ts) Flash weights: $(ls ${MODEL_PATH}/*.safetensors 2>/dev/null | wc -l) files"
+
+          # ── 3. Get this pod's IP ───────────────────────────────────────────────
+          MY_IP=$(curl -sf http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip \
+                    -H "Metadata-Flavor: Google")
+          echo "$(ts) [pod${IDX}] IP: ${MY_IP}"
+
+          # ── 4. Launch server (both pods) ──────────────────────────────────────
+          SERVER_PORT=30010
+          SLOG="/tmp/server_pod${IDX}.log"
+          echo "$(ts) === [pod${IDX}] Launching server (tp=8 dp=2 ep=8 port=${SERVER_PORT}) ==="
+          JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+          python3 -m sgl_jax.launch_server \
+            --model-path "${MODEL_PATH}" \
+            --trust-remote-code \
+            --enable-sequence-parallel \
+            --tp-size 8 \
+            --dp-size 2 \
+            --ep-size 8 \
+            --moe-backend fused_v2 \
+            --nnodes 1 \
+            --node-rank 0 \
+            --host 0.0.0.0 \
+            --port "${SERVER_PORT}" \
+            --page-size 256 \
+            --context-length 262144 \
+            --disable-radix-cache \
+            --chunked-prefill-size 2048 \
+            --max-prefill-tokens 16384 \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.84 \
+            --swa-full-tokens-ratio 0.2 \
+            --skip-server-warmup \
+            --log-level info \
+            --decode-log-interval 1 \
+            --max-running-requests 256 \
+            --dp-schedule-policy round_robin \
+            --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
+            --precompile-token-paddings 4096 \
+            >> "${SLOG}" 2>&1 &
+          SRV_PID=$!
+
+          # ── 5. Pod-specific logic ─────────────────────────────────────────────
+          if [ "${IDX}" = "0" ]; then
+            # ── Pod 0: write IP, wait for done signal ─────────────────────────
+            echo "${MY_IP}" | gsutil cp - "${POD0_IP_FLAG}"
+            echo "$(ts) [pod0] IP written to GCS. Waiting for pod1 done signal..."
+            until gsutil ls "${DONE_FLAG}" >/dev/null 2>&1; do sleep 10; done
+            echo "$(ts) [pod0] Done signal received. Uploading server log."
+            gsutil cp "${SLOG}" "${RESULTS_DIR}/server-pod0.log" || true
+            kill "${SRV_PID}" 2>/dev/null || true
+          else
+            # ── Pod 1: proxy + benchmark ──────────────────────────────────────
+            # Wait for pod 0 IP
+            echo "$(ts) [pod1] Waiting for pod0 IP..."
+            POD0_IP=""
+            for i in $(seq 1 120); do
+              if POD0_IP=$(gsutil cat "${POD0_IP_FLAG}" 2>/dev/null) && [ -n "${POD0_IP}" ]; then
+                echo "$(ts) [pod1] pod0 IP: ${POD0_IP}"; break
+              fi
+              sleep 5
+            done
+            [ -z "${POD0_IP}" ] && { echo "$(ts) ERROR: pod0 IP never appeared"; exit 1; }
+
+            # Wait for both servers healthy
+            echo "$(ts) [pod1] Waiting for local server (localhost:${SERVER_PORT})..."
+            for i in $(seq 1 1440); do
+              if curl -sf http://localhost:${SERVER_PORT}/health >/dev/null 2>&1; then
+                echo "$(ts) [pod1] Local server ready after $((i*5))s"; break
+              fi
+              kill -0 "${SRV_PID}" 2>/dev/null || { echo "ERROR: local server exited"; tail -30 "${SLOG}"; exit 1; }
+              [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting... $((i*5))s"
+              sleep 5
+            done
+
+            echo "$(ts) [pod1] Waiting for pod0 server (${POD0_IP}:${SERVER_PORT})..."
+            for i in $(seq 1 360); do
+              if curl -sf http://${POD0_IP}:${SERVER_PORT}/health >/dev/null 2>&1; then
+                echo "$(ts) [pod1] pod0 server ready after $((i*5))s"; break
+              fi
+              [ $((i % 12)) -eq 0 ] && echo "$(ts) waiting for pod0 server..."
+              sleep 5
+            done
+
+            # Start round-robin proxy on port 30000
+            PROXY_PORT=30000
+            PROXY_LOG="/tmp/proxy.log"
+            cat > /tmp/rr_proxy.py << PROXY_SCRIPT
+          import asyncio, itertools, aiohttp, sys
+          from aiohttp import web
+
+          BACKENDS = ["http://${POD0_IP}:${SERVER_PORT}", "http://127.0.0.1:${SERVER_PORT}"]
+          _cycle = itertools.cycle(BACKENDS)
+
+          async def proxy_handler(request):
+              backend = next(_cycle)
+              url = backend + str(request.rel_url)
+              headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
+              data = await request.read()
+              timeout = aiohttp.ClientTimeout(total=3600)
+              async with aiohttp.ClientSession(timeout=timeout) as session:
+                  async with session.request(request.method, url, headers=headers, data=data) as resp:
+                      body = await resp.read()
+                      skip = {'transfer-encoding', 'content-encoding', 'content-length'}
+                      hdrs = {k: v for k, v in resp.headers.items() if k.lower() not in skip}
+                      return web.Response(status=resp.status, headers=hdrs, body=body)
+
+          app = web.Application(client_max_size=500*1024*1024)
+          app.router.add_route('*', '/{path_info:.*}', proxy_handler)
+          web.run_app(app, host='0.0.0.0', port=${PROXY_PORT})
+          PROXY_SCRIPT
+            python3 /tmp/rr_proxy.py >> "${PROXY_LOG}" 2>&1 &
+            PROXY_PID=$!
+            sleep 3
+            echo "$(ts) [pod1] Round-robin proxy started (backends: ${POD0_IP}:${SERVER_PORT} + localhost:${SERVER_PORT})"
+
+            # Benchmark
+            BENCH_URL="http://127.0.0.1:${PROXY_PORT}"
+            echo "$(ts) === [pod1] bench_serving: bsz 64 128 ==="
+            for bsz in 64 128; do
+              np=384
+              RF="/tmp/bench_nonpd_bs${bsz}.jsonl"
+              BL="/tmp/bench_nonpd_bs${bsz}.log"
+              echo "$(ts) bsz=${bsz} num_prompts=${np}"
+              python3 -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url "${BENCH_URL}" \
+                --model "${MODEL_PATH}" \
+                --dataset-name random \
+                --random-input-len 16384 \
+                --random-output-len 4096 \
+                --random-range-ratio 1 \
+                --max-concurrency "${bsz}" \
+                --num-prompts "${np}" \
+                --warmup-requests 0 \
+                --seed 12345 \
+                --output-file "${RF}" \
+                2>&1 | tee "${BL}" || true
+              gsutil cp "${RF}" "${RESULTS_DIR}/bs${bsz}/result.jsonl" || true
+              gsutil cp "${BL}" "${RESULTS_DIR}/bs${bsz}/bench.log"   || true
+            done
+
+            echo "$(ts) Uploading logs..."
+            gsutil cp "${SLOG}"     "${RESULTS_DIR}/server-pod1.log" || true
+            gsutil cp "${PROXY_LOG}" "${RESULTS_DIR}/proxy.log"       || true
+
+            echo "$(ts) Signalling pod0 done."
+            echo "done" | gsutil cp - "${DONE_FLAG}"
+
+            kill "${SRV_PID}" 2>/dev/null || true
+            kill "${PROXY_PID}" 2>/dev/null || true
+          fi
+
+          echo "$(ts) === [pod${IDX}] Done ==="
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: LIBTPU_INIT_ARGS
+          value: "--xla_tpu_dvfs_p_state=7"
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
+          limits:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
