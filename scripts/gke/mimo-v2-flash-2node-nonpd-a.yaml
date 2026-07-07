@@ -1,0 +1,170 @@
+# Non-PD — Pod A: server only, writes IP to GCS, waits for done signal
+# Single-pod job with its own ProvisioningRequest (count=1).
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-2node-nonpd-a-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-2node-nonpd-a
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-2node-nonpd-a
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-2node-nonpd-a-template
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-v2-flash-2node-nonpd-a
+  namespace: default
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-2node-nonpd-a
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      tolerations:
+      - key: google.com/tpu
+        operator: Equal
+        value: present
+        effect: NoSchedule
+      containers:
+      - name: mimo-v2-flash-2node-nonpd-a
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          export PATH="/opt/venv/bin:${PATH}"
+          RESULTS_BUCKET="gs://jingnw-mimo-v2-flash-us-central1"
+          RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-2node-nonpd"
+          NFS_IP_FLAG="${RESULTS_BUCKET}/nfs-flash-2node-ip"
+          POD0_IP_FLAG="${RESULTS_BUCKET}/nonpd-pod0-ip"
+          DONE_FLAG="${RESULTS_BUCKET}/nonpd-pod1-done"
+          SERVER_PORT=30010
+          ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+
+          echo "$(ts) === [nonpd-a] Clone geeningwang/sglang-jax branch mimo-tpu7-stage2 ==="
+          git clone https://github.com/geeningwang/sglang-jax.git /workspace
+          cd /workspace
+          git checkout mimo-tpu7-stage2
+          echo "$(ts) HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          uv pip install -e "python[all]"
+          uv pip install "orbax-checkpoint>=0.12.0"
+
+          apt-get update -qq && apt-get install -y -qq nfs-common
+          echo "$(ts) Polling GCS for NFS server IP..."
+          NFS_SERVER=""
+          for i in $(seq 1 360); do
+            if NFS_SERVER=$(gsutil cat "${NFS_IP_FLAG}" 2>/dev/null) && [ -n "${NFS_SERVER}" ]; then
+              echo "$(ts) NFS server IP: ${NFS_SERVER}"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) waiting for NFS IP... (${i}×5s)"
+            sleep 5
+          done
+          [ -z "${NFS_SERVER}" ] && { echo "$(ts) ERROR: NFS IP never appeared"; exit 1; }
+
+          MODEL_PATH=/tmp/flash-model
+          mkdir -p "${MODEL_PATH}"
+          for i in $(seq 1 120); do
+            if mount -t nfs -o nfsvers=3,nolock,rsize=1048576,wsize=1048576,hard,intr,timeo=600 \
+                "${NFS_SERVER}:/export/flash" "${MODEL_PATH}" 2>/dev/null; then
+              echo "$(ts) NFS mounted (attempt ${i})"; break
+            fi
+            [ $((i % 12)) -eq 0 ] && echo "$(ts) NFS not ready, retrying..."
+            sleep 5
+          done
+
+          MY_IP=$(curl -sf http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip \
+                    -H "Metadata-Flavor: Google")
+          echo "$(ts) [nonpd-a] IP: ${MY_IP}"
+
+          SLOG="/tmp/server_a.log"
+          JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
+          python3 -m sgl_jax.launch_server \
+            --model-path "${MODEL_PATH}" \
+            --trust-remote-code --enable-sequence-parallel \
+            --tp-size 8 --dp-size 2 --ep-size 8 \
+            --moe-backend fused_v2 \
+            --nnodes 1 --node-rank 0 --host 0.0.0.0 \
+            --port "${SERVER_PORT}" \
+            --page-size 256 --context-length 262144 \
+            --disable-radix-cache \
+            --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
+            --dtype bfloat16 --mem-fraction-static 0.84 \
+            --swa-full-tokens-ratio 0.2 \
+            --skip-server-warmup --log-level info \
+            --decode-log-interval 1 --max-running-requests 256 \
+            --dp-schedule-policy round_robin \
+            --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
+            --precompile-token-paddings 4096 \
+            >> "${SLOG}" 2>&1 &
+          SRV_PID=$!
+
+          echo "${MY_IP}" | gsutil cp - "${POD0_IP_FLAG}"
+          echo "$(ts) [nonpd-a] IP written to GCS. Waiting for pod-b done signal..."
+          until gsutil ls "${DONE_FLAG}" >/dev/null 2>&1; do sleep 10; done
+          echo "$(ts) [nonpd-a] Done. Uploading server log."
+          gsutil cp "${SLOG}" "${RESULTS_DIR}/server-pod0.log" || true
+          kill "${SRV_PID}" 2>/dev/null || true
+          echo "$(ts) === [nonpd-a] Done ==="
+        env:
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: LIBTPU_INIT_ARGS
+          value: "--xla_tpu_dvfs_p_state=7"
+        securityContext:
+          privileged: true
+        resources:
+          requests:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"
+          limits:
+            cpu: "220"
+            memory: "900Gi"
+            google.com/tpu: "4"

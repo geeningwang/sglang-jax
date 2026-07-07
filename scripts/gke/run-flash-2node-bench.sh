@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 # run-flash-2node-bench.sh — MiMo-V2-Flash 2-pod PD 1P1D + Non-PD bench
 #
-# Runs two sequential GKE jobs against the same NFS model VM:
-#   1. PD 1P1D disaggregation (prefill pod + decode pod, dp=1 each, JAX transfer)
-#   2. Non-PD serve-level DP  (2 pods × dp=2, round-robin proxy)
+# DWS on this cluster has gang size=1 for 2x2x1 TPU; count=2 PRs are rejected.
+# Each pod therefore gets its own ProvisioningRequest (count=1) and single-pod Job.
+#
+# Order:
+#   1. PD 1P1D:  prefill job + decode job (submitted together, PRs provision in parallel)
+#   2. Non-PD:   pod-a job + pod-b job (submitted together after PD completes)
+#   3. Tear down NFS VM
+#
+# NFS VM:
+#   - Created in background during DWS wait for PD jobs (skipped if already ready)
+#   - Serves Flash weights to all 4 pods via NFS
 #
 # Results:
 #   gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/
 #   gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/
-#
-# Dependencies: gcloud, kubectl, gsutil
-# Notes:
-#   - Requires 4 TPU v7x 4-chip slots (DWS queued-provisioning); may queue.
-#   - PD and non-PD jobs run sequentially; NFS VM serves both.
-#   - PD test uses dp=1 (stage2 PD disaggregation limitation; PDF used dp=2).
 
 set -euo pipefail
 
 PROJECT="tpu-launchpad-playground"
 VM_NAME="nfs-flash-2node"
-NONPD_JOB="mimo-v2-flash-2node-nonpd"
-PD_JOB="mimo-v2-flash-2node-pd1p1d"
 READY_FLAG="gs://jingnw-mimo-v2-flash-us-central1/nfs-flash-2node-ready"
 NFS_IP_FLAG="gs://jingnw-mimo-v2-flash-us-central1/nfs-flash-2node-ip"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,9 +40,9 @@ gcloud compute firewall-rules create allow-iap-ssh \
 gcloud compute firewall-rules create allow-direct-ssh \
   --project="${PROJECT}" --network=default --allow=tcp:22 \
   --source-ranges=0.0.0.0/0 \
-  --description="Allow direct SSH from anywhere (recreated each run)" --quiet
+  --description="Allow direct SSH from anywhere" --quiet
 
-# ── Step 1: Cleanup stale GCS flags ─────────────────────────────────────────
+# ── Step 1: Clear pod coordination flags (preserve NFS VM flags) ──────────────
 
 log "=== Step 1: Clearing pod coordination flags ==="
 for FLAG in \
@@ -52,12 +52,10 @@ for FLAG in \
     "gs://jingnw-mimo-v2-flash-us-central1/pd1p1d-pod1-done"; do
   gsutil rm "${FLAG}" 2>/dev/null || true
 done
-# NFS VM flags (READY_FLAG, NFS_IP_FLAG) are NOT cleared here:
-# Step 2 checks them to skip VM creation if the VM is already ready.
 
-# ── Step 2: Create NFS VM (background) + submit PD 1P1D job ─────────────────
+# ── Step 2: Create NFS VM (if not already ready) + submit PD jobs ────────────
 
-log "=== Step 2: Creating NFS VM in background and submitting PD 1P1D job ==="
+log "=== Step 2: NFS VM check + PD jobs ==="
 
 create_nfs_vm() {
   local STARTUP
@@ -65,17 +63,13 @@ create_nfs_vm() {
 #!/bin/bash
 exec > /var/log/nfs-setup.log 2>&1
 set -euxo pipefail
-echo "[startup] Installing NFS server..."
 apt-get update -qq
 apt-get install -y -qq nfs-kernel-server rpcbind
-echo "[startup] Creating 315 GiB tmpfs..."
 mkdir -p /export/flash
 mount -t tmpfs -o size=315g tmpfs /export/flash
-echo "[startup] Configuring NFS export..."
 echo '/export/flash *(ro,no_root_squash,sync,no_subtree_check,no_wdelay)' > /etc/exports
 systemctl enable --now rpcbind nfs-server
 exportfs -ra
-showmount -e localhost
 echo "[startup] Copying Flash weights from GCS (~5 min)..."
 gsutil -m cp 'gs://jingnw-mimo-v2-5-pro-us-central1/mimo-v2-flash-hf-weights/*' /export/flash/
 COUNT=$(ls /export/flash/*.safetensors 2>/dev/null | wc -l)
@@ -88,18 +82,14 @@ echo "ready at $(date -u) ip=${INTERNAL_IP}" | gsutil cp - \
 echo "[startup] NFS setup complete."
 STARTUP_SCRIPT
 )
-
   local CREATED_ZONE=""
   for ZONE in us-central1-c us-central1-f us-central1-ai1a; do
     log "[nfs-vm] Trying zone ${ZONE}..."
     echo "${STARTUP}" > /tmp/nfs-2node-startup.sh
     if gcloud compute instances create "${VM_NAME}" \
-      --project="${PROJECT}" \
-      --zone="${ZONE}" \
-      --machine-type=n2-highmem-48 \
-      --boot-disk-size=50GB \
-      --boot-disk-type=pd-standard \
-      --image-family=debian-12 \
+      --project="${PROJECT}" --zone="${ZONE}" \
+      --machine-type=n2-highmem-48 --boot-disk-size=50GB \
+      --boot-disk-type=pd-standard --image-family=debian-12 \
       --image-project=debian-cloud \
       --scopes=storage-rw,logging-write,monitoring-write \
       --network=default --subnet=default \
@@ -109,28 +99,54 @@ STARTUP_SCRIPT
       log "[nfs-vm] VM created in ${ZONE}."
       break
     else
-      log "[nfs-vm] Zone ${ZONE} full, trying next..."
+      log "[nfs-vm] Zone ${ZONE} unavailable, trying next..."
     fi
   done
   [ -z "${CREATED_ZONE}" ] && { log "[nfs-vm] ERROR: all zones exhausted"; return 1; }
 }
 
+NFS_VM_PID=""
 if gsutil ls "${READY_FLAG}" >/dev/null 2>&1; then
   log "[nfs-vm] NFS VM already ready (flag exists), skipping creation."
-  NFS_VM_PID=""
 else
   create_nfs_vm &
   NFS_VM_PID=$!
 fi
 
-kubectl apply -f "${SCRIPT_DIR}/${PD_JOB}.yaml"
-log "PD 1P1D job submitted. DWS may take minutes to hours to provision."
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd-prefill.yaml"
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd-decode.yaml"
+log "PD prefill + decode jobs submitted (each has its own PR, count=1)."
 
-# ── Step 3: Wait for NFS VM ──────────────────────────────────────────────────
+# ── Step 3: Wait for DWS (PD) + NFS VM ───────────────────────────────────────
 
-log "=== Step 3: Waiting for NFS VM ==="
-log "Waiting for NFS VM to be ready..."
-[ -n "${NFS_VM_PID}" ] && wait "${NFS_VM_PID}" && log "NFS VM create call returned"
+wait_dws() {
+  local PR_NAME="$1"
+  for i in $(seq 1 720); do
+    STATUS=$(kubectl get provisioningrequest "${PR_NAME}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Provisioned")].status}' 2>/dev/null || echo "")
+    [ "${STATUS}" = "True" ] && { log "DWS ${PR_NAME} provisioned after $((i*30))s"; return 0; }
+    FAILED=$(kubectl get provisioningrequest "${PR_NAME}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "")
+    if [ "${FAILED}" = "True" ]; then
+      MSG=$(kubectl get provisioningrequest "${PR_NAME}" \
+        -o jsonpath='{.status.conditions[?(@.type=="Failed")].message}' 2>/dev/null || echo "")
+      log "ERROR: DWS ${PR_NAME} failed: ${MSG}"
+      return 1
+    fi
+    [ $((i % 4)) -eq 0 ] && log "DWS ${PR_NAME} queuing... $((i*30))s"
+    sleep 30
+  done
+  log "WARNING: DWS ${PR_NAME} timed out after 6h"
+}
+
+log "=== Step 3: Waiting for PD DWS provisioning (both PRs) ==="
+wait_dws "mimo-v2-flash-2node-pd-prefill" &
+WAIT_P=$!
+wait_dws "mimo-v2-flash-2node-pd-decode" &
+WAIT_D=$!
+
+log "Waiting for NFS VM..."
+[ -n "${NFS_VM_PID}" ] && wait "${NFS_VM_PID}" && log "NFS VM create returned"
 log "Polling GCS for NFS ready flag (up to 30 min)..."
 for i in $(seq 1 360); do
   if gsutil ls "${READY_FLAG}" >/dev/null 2>&1; then
@@ -141,41 +157,51 @@ for i in $(seq 1 360); do
   sleep 5
 done
 
-# ── Step 4: Wait for PD 1P1D job ─────────────────────────────────────────────
+wait "${WAIT_P}" || log "WARNING: prefill DWS provisioning failed"
+wait "${WAIT_D}" || log "WARNING: decode DWS provisioning failed"
 
-log "=== Step 4: Waiting for PD 1P1D job completion (up to 4 h) ==="
-kubectl wait --for=condition=complete "job/${PD_JOB}" --timeout=14400s \
-  || { log "PD job timed out or failed"; kubectl get pods -l "job-name=${PD_JOB}" -o wide; }
-log "PD job final: $(kubectl get job ${PD_JOB} \
-  -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)"
+# ── Step 4: Wait for PD jobs ──────────────────────────────────────────────────
 
-log "PD results: gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/"
+log "=== Step 4: Waiting for PD decode job (bench runs here) ==="
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-pd-decode" --timeout=14400s \
+  || { log "PD decode job failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-pd-decode" -o wide; }
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-pd-prefill" --timeout=3600s \
+  || log "WARNING: prefill job didn't complete cleanly"
+
+log "PD results:"
 for bsz in 64 128; do
-  log "  bs${bsz}/bench.log:"
   gsutil cat "gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/bs${bsz}/bench.log" \
     2>/dev/null | grep -E "Output token throughput|Total token throughput|Mean ITL|Mean TTFT" || true
 done
 
-# ── Step 5: Submit Non-PD job ─────────────────────────────────────────────────
+# ── Step 5: Submit Non-PD jobs ────────────────────────────────────────────────
 
-log "=== Step 5: Submitting Non-PD job ==="
+log "=== Step 5: Submitting Non-PD jobs ==="
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod0-ip" 2>/dev/null || true
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod1-done" 2>/dev/null || true
 
-kubectl apply -f "${SCRIPT_DIR}/${NONPD_JOB}.yaml"
-log "Non-PD job submitted."
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd-a.yaml"
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd-b.yaml"
+log "Non-PD pod-a + pod-b jobs submitted."
 
-# ── Step 6: Wait for Non-PD job ───────────────────────────────────────────────
+log "=== Step 5b: Waiting for Non-PD DWS provisioning ==="
+wait_dws "mimo-v2-flash-2node-nonpd-a" &
+WAIT_A=$!
+wait_dws "mimo-v2-flash-2node-nonpd-b" &
+WAIT_B=$!
+wait "${WAIT_A}" || log "WARNING: nonpd-a DWS failed"
+wait "${WAIT_B}" || log "WARNING: nonpd-b DWS failed"
 
-log "=== Step 6: Waiting for Non-PD job completion (up to 4 h) ==="
-kubectl wait --for=condition=complete "job/${NONPD_JOB}" --timeout=14400s \
-  || { log "Non-PD job timed out or failed"; kubectl get pods -l "job-name=${NONPD_JOB}" -o wide; }
-log "Non-PD job final: $(kubectl get job ${NONPD_JOB} \
-  -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)"
+# ── Step 6: Wait for Non-PD jobs ─────────────────────────────────────────────
 
-log "Non-PD results: gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/"
+log "=== Step 6: Waiting for Non-PD bench job (pod-b) ==="
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-nonpd-b" --timeout=14400s \
+  || { log "Non-PD pod-b failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-nonpd-b" -o wide; }
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-nonpd-a" --timeout=3600s \
+  || log "WARNING: nonpd-a job didn't complete cleanly"
+
+log "Non-PD results:"
 for bsz in 64 128; do
-  log "  bs${bsz}/bench.log:"
   gsutil cat "gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/bs${bsz}/bench.log" \
     2>/dev/null | grep -E "Output token throughput|Total token throughput|Mean ITL|Mean TTFT" || true
 done
@@ -183,21 +209,17 @@ done
 # ── Step 7: Destroy NFS VM ────────────────────────────────────────────────────
 
 log "=== Step 7: Destroying NFS VM ==="
-NFS_ZONE=$(gcloud compute instances list \
-  --project="${PROJECT}" --filter="name=${VM_NAME}" \
-  --format='get(zone)' | sed 's|.*/||' 2>/dev/null || echo "")
-if [ -n "${NFS_ZONE}" ]; then
+while IFS= read -r ZONE_PATH; do
+  ZONE="${ZONE_PATH##*/}"
+  [ -n "${ZONE}" ] || continue
   gcloud compute instances delete "${VM_NAME}" \
-    --project="${PROJECT}" --zone="${NFS_ZONE}" --quiet
-  log "VM ${VM_NAME} deleted from ${NFS_ZONE}"
-else
-  log "VM ${VM_NAME} not found (may have already been deleted)"
-fi
+    --project="${PROJECT}" --zone="${ZONE}" --quiet 2>/dev/null \
+    && log "VM deleted from ${ZONE}" || true
+done < <(gcloud compute instances list \
+  --project="${PROJECT}" --filter="name=${VM_NAME}" --format='get(zone)')
 gsutil rm "${READY_FLAG}" "${NFS_IP_FLAG}" 2>/dev/null || true
-
-# ── Summary ───────────────────────────────────────────────────────────────────
 
 log ""
 log "=== Flash 2-node benchmark complete ==="
-log "  PD 1P1D results: gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/"
-log "  Non-PD results:  gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/"
+log "  PD 1P1D: gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/"
+log "  Non-PD:  gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/"
