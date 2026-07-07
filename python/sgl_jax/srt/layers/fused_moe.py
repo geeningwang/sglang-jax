@@ -1,10 +1,15 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import logging
+import time
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+
+logger = logging.getLogger(__name__)
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
@@ -537,7 +542,12 @@ class FusedEPMoEV2(FusedEPMoE):
 
     Inherits weight init and quantization from FusedEPMoE. Overrides __call__
     to dispatch to fused_ep_moe_v2 with v2-specific flags.
+
+    Set log_mfu = True on an instance to enable wall-clock MFU logging.
+    This forces block_until_ready after the kernel, so only enable it for profiling.
     """
+
+    log_mfu: bool = False
 
     def __call__(
         self,
@@ -599,6 +609,8 @@ class FusedEPMoEV2(FusedEPMoE):
 
         direct_scaled_dot = w1_scale is not None
 
+        _t0 = time.perf_counter() if self.log_mfu else None
+
         output = fused_ep_moe_v2(
             self.mesh,
             hidden_states,
@@ -631,6 +643,24 @@ class FusedEPMoEV2(FusedEPMoE):
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
+
+        if self.log_mfu:
+            jax.block_until_ready(output)
+            elapsed = time.perf_counter() - _t0
+            # Routed-expert FLOPs: top_k × (gate + up + down) matmuls per token.
+            # Each matmul costs 2 × T × H × I FLOPs (multiply-add); 3 matmuls = 6×.
+            # Shared-expert FLOPs are not counted here (adds ~same order of magnitude).
+            num_tokens = hidden_states.shape[0]
+            routed_flops = num_tokens * self.num_experts_per_tok * 6 * self.hidden_size * self.intermediate_dim
+            num_chips = jax.local_device_count()
+            achieved_tflops = routed_flops / elapsed / 1e12
+            mfu = routed_flops / (elapsed * num_chips * 918e12)
+            logger.info(
+                "FusedEPMoEV2 MFU: tokens=%d top_k=%d elapsed=%.2fms "
+                "achieved=%.1f TFLOPS mfu=%.1f%% (%d chips × 918 TFLOPS, routed only)",
+                num_tokens, self.num_experts_per_tok, elapsed * 1e3,
+                achieved_tflops, mfu * 100, num_chips,
+            )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
         # parallelism out_sharding carries the SP-aware reduce_sharding
