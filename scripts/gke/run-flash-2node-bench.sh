@@ -114,8 +114,13 @@ STARTUP_SCRIPT
   [ -z "${CREATED_ZONE}" ] && { log "[nfs-vm] ERROR: all zones exhausted"; return 1; }
 }
 
-create_nfs_vm &
-NFS_VM_PID=$!
+if gsutil ls "${READY_FLAG}" >/dev/null 2>&1; then
+  log "[nfs-vm] NFS VM already ready (flag exists), skipping creation."
+  NFS_VM_PID=""
+else
+  create_nfs_vm &
+  NFS_VM_PID=$!
+fi
 
 kubectl apply -f "${SCRIPT_DIR}/${PD_JOB}.yaml"
 log "PD 1P1D job submitted. DWS may take minutes to hours to provision."
@@ -124,7 +129,7 @@ log "PD 1P1D job submitted. DWS may take minutes to hours to provision."
 
 log "=== Step 3: Waiting for NFS VM ==="
 log "Waiting for NFS VM to be ready..."
-wait "${NFS_VM_PID}" && log "NFS VM create call returned"
+[ -n "${NFS_VM_PID}" ] && wait "${NFS_VM_PID}" && log "NFS VM create call returned"
 log "Polling GCS for NFS ready flag (up to 30 min)..."
 for i in $(seq 1 360); do
   if gsutil ls "${READY_FLAG}" >/dev/null 2>&1; then
