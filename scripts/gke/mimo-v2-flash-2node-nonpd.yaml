@@ -170,6 +170,7 @@ spec:
             --dp-schedule-policy round_robin \
             --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
             --precompile-token-paddings 4096 \
+            --log-mfu \
             >> "${SLOG}" 2>&1 &
           SRV_PID=$!
 

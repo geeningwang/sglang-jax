@@ -160,6 +160,7 @@ class ServerArgs:
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
+    log_mfu: bool = False
 
     grammar_backend: str | None = None
 
@@ -1117,6 +1118,16 @@ class ServerArgs:
                 "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
                 "fall back to the Pallas DMA-based allgather. "
                 "Default uses JAX path (recommended)."
+            ),
+        )
+
+        parser.add_argument(
+            "--log-mfu",
+            action="store_true",
+            default=ServerArgs.log_mfu,
+            help=(
+                "Enable wall-clock MFU logging for FusedEPMoEV2 MoE layers. "
+                "Forces block_until_ready after each kernel; use only for profiling."
             ),
         )
 

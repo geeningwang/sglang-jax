@@ -365,6 +365,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     )
             else:
                 logger.info("Static quantization detected. Skipping online requantization.")
+
+        if self.server_args.log_mfu:
+            from flax import nnx
+            from sgl_jax.srt.layers.fused_moe import FusedEPMoEV2
+
+            count = 0
+            for _, module in nnx.iter_graph(self.model):
+                if isinstance(module, FusedEPMoEV2):
+                    module.log_mfu = True
+                    count += 1
+            logger.info("MFU logging enabled on %d FusedEPMoEV2 layer(s).", count)
+
         # Parse other args
         self.sliding_window_size = self.model_config.sliding_window
         self.dtype = self.model_config.dtype
