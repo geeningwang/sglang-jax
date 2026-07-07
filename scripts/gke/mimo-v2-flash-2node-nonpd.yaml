@@ -1,15 +1,59 @@
 # §9a MiMo-V2-Flash 2-pod Non-PD serve-level DP comparison
-# 2 × TPU v7x 4-chip (jingnw-dws-tpu7-4ch), each running the full server
-# (tp=8, dp=2, ep=8, moe-backend=fused_v2).  Pod 1 also runs a round-robin
-# proxy on port 30000 and drives bench_serving (bsz=64 and bsz=128).
+# 2 × TPU v7x 4-chip (jingnw-dws-tpu7-8ch, 2x2x2 multi-host, gang size=2),
+# each running the full server (tp=8, dp=2, ep=8, moe-backend=fused_v2).
+# Pod 1 also runs a round-robin proxy on port 30000 and drives bench_serving.
 #
-# No DWS ProvisioningRequest: single-host TPU topology (2x2x1) has gang size=1,
-# so count=2 is rejected. Regular cluster autoscaler provisions both nodes.
+# DWS: count=1 provisions the full 2-VM multi-host slice atomically.
+# IndexedJob (2 pods) shares the same PR; each pod lands on one VM.
 #
 # Repo:   https://github.com/geeningwang/sglang-jax.git
 # Branch: mimo-tpu7-stage2
 # Model:  /tmp/flash-model  (NFS-served from tmpfs, same as stage1/stage2)
 # Out:    gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-nonpd/
+---
+apiVersion: v1
+kind: PodTemplate
+metadata:
+  name: mimo-v2-flash-2node-nonpd-template
+  namespace: default
+template:
+  spec:
+    restartPolicy: Never
+    nodeSelector:
+      cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x2
+    tolerations:
+    - key: google.com/tpu
+      operator: Equal
+      value: present
+      effect: NoSchedule
+    containers:
+    - name: mimo-v2-flash-2node-nonpd
+      image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+      resources:
+        requests:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+        limits:
+          cpu: "220"
+          memory: "900Gi"
+          google.com/tpu: "4"
+---
+apiVersion: autoscaling.x-k8s.io/v1
+kind: ProvisioningRequest
+metadata:
+  name: mimo-v2-flash-2node-nonpd
+  namespace: default
+spec:
+  provisioningClassName: queued-provisioning.gke.io
+  parameters:
+    maxRunDurationSeconds: "21600"
+  podSets:
+  - count: 1
+    podTemplateRef:
+      name: mimo-v2-flash-2node-nonpd-template
 ---
 apiVersion: batch/v1
 kind: Job
@@ -22,12 +66,17 @@ spec:
   completions: 2
   parallelism: 2
   template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/consume-provisioning-request: mimo-v2-flash-2node-nonpd
+        cluster-autoscaler.kubernetes.io/provisioning-class-name: queued-provisioning.gke.io
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
     spec:
       restartPolicy: Never
       nodeSelector:
-        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-4ch
+        cloud.google.com/gke-nodepool: jingnw-dws-tpu7-8ch
         cloud.google.com/gke-tpu-accelerator: tpu7x
-        cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-tpu-topology: 2x2x2
       tolerations:
       - key: google.com/tpu
         operator: Equal

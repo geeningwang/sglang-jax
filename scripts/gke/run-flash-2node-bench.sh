@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # run-flash-2node-bench.sh — MiMo-V2-Flash 2-pod PD 1P1D + Non-PD bench
 #
-# DWS on this cluster has gang size=1 for 2x2x1 TPU; count=2 PRs are rejected.
-# Each pod therefore gets its own ProvisioningRequest (count=1) and single-pod Job.
+# Pool: jingnw-dws-tpu7-8ch (2x2x2 multi-host, gang size=2).
+# One DWS PR (count=1) provisions the full 2-VM slice atomically.
+# Each test uses a 2-pod IndexedJob sharing that single PR.
 #
 # Order:
-#   1. PD 1P1D:  prefill job + decode job (submitted together, PRs provision in parallel)
-#   2. Non-PD:   pod-a job + pod-b job (submitted together after PD completes)
+#   1. PD 1P1D:  1 PR + 1 IndexedJob (pod0=prefill+bootstrap, pod1=decode+bench)
+#   2. Non-PD:   1 PR + 1 IndexedJob (pod0=server, pod1=server+proxy+bench)
 #   3. Tear down NFS VM
 #
 # NFS VM:
-#   - Created in background during DWS wait for PD jobs (skipped if already ready)
-#   - Serves Flash weights to all 4 pods via NFS
+#   - Created in background during DWS wait for PD job (skipped if already ready)
+#   - Serves Flash weights to all pods via NFS
 #
 # Results:
 #   gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-2node-pd1p1d/
@@ -113,9 +114,8 @@ else
   NFS_VM_PID=$!
 fi
 
-kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd-prefill.yaml"
-kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd-decode.yaml"
-log "PD prefill + decode jobs submitted (each has its own PR, count=1)."
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-pd1p1d.yaml"
+log "PD 1P1D job submitted (1 PR count=1, 2-pod IndexedJob)."
 
 # ── Step 3: Wait for DWS (PD) + NFS VM ───────────────────────────────────────
 
@@ -139,11 +139,9 @@ wait_dws() {
   log "WARNING: DWS ${PR_NAME} timed out after 6h"
 }
 
-log "=== Step 3: Waiting for PD DWS provisioning (both PRs) ==="
-wait_dws "mimo-v2-flash-2node-pd-prefill" &
+log "=== Step 3: Waiting for PD DWS provisioning ==="
+wait_dws "mimo-v2-flash-2node-pd1p1d" &
 WAIT_P=$!
-wait_dws "mimo-v2-flash-2node-pd-decode" &
-WAIT_D=$!
 
 log "Waiting for NFS VM..."
 [ -n "${NFS_VM_PID}" ] && wait "${NFS_VM_PID}" && log "NFS VM create returned"
@@ -157,16 +155,13 @@ for i in $(seq 1 360); do
   sleep 5
 done
 
-wait "${WAIT_P}" || log "WARNING: prefill DWS provisioning failed"
-wait "${WAIT_D}" || log "WARNING: decode DWS provisioning failed"
+wait "${WAIT_P}" || log "WARNING: PD DWS provisioning failed"
 
 # ── Step 4: Wait for PD jobs ──────────────────────────────────────────────────
 
-log "=== Step 4: Waiting for PD decode job (bench runs here) ==="
-kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-pd-decode" --timeout=14400s \
-  || { log "PD decode job failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-pd-decode" -o wide; }
-kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-pd-prefill" --timeout=3600s \
-  || log "WARNING: prefill job didn't complete cleanly"
+log "=== Step 4: Waiting for PD 1P1D job ==="
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-pd1p1d" --timeout=14400s \
+  || { log "PD job failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-pd1p1d" -o wide; }
 
 log "PD results:"
 for bsz in 64 128; do
@@ -176,29 +171,23 @@ done
 
 # ── Step 5: Submit Non-PD jobs ────────────────────────────────────────────────
 
-log "=== Step 5: Submitting Non-PD jobs ==="
+log "=== Step 5: Submitting Non-PD job ==="
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod0-ip" 2>/dev/null || true
 gsutil rm "gs://jingnw-mimo-v2-flash-us-central1/nonpd-pod1-done" 2>/dev/null || true
 
-kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd-a.yaml"
-kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd-b.yaml"
-log "Non-PD pod-a + pod-b jobs submitted."
+kubectl apply -f "${SCRIPT_DIR}/mimo-v2-flash-2node-nonpd.yaml"
+log "Non-PD job submitted (1 PR count=1, 2-pod IndexedJob)."
 
 log "=== Step 5b: Waiting for Non-PD DWS provisioning ==="
-wait_dws "mimo-v2-flash-2node-nonpd-a" &
-WAIT_A=$!
-wait_dws "mimo-v2-flash-2node-nonpd-b" &
-WAIT_B=$!
-wait "${WAIT_A}" || log "WARNING: nonpd-a DWS failed"
-wait "${WAIT_B}" || log "WARNING: nonpd-b DWS failed"
+wait_dws "mimo-v2-flash-2node-nonpd" &
+WAIT_N=$!
+wait "${WAIT_N}" || log "WARNING: nonpd DWS failed"
 
 # ── Step 6: Wait for Non-PD jobs ─────────────────────────────────────────────
 
-log "=== Step 6: Waiting for Non-PD bench job (pod-b) ==="
-kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-nonpd-b" --timeout=14400s \
-  || { log "Non-PD pod-b failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-nonpd-b" -o wide; }
-kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-nonpd-a" --timeout=3600s \
-  || log "WARNING: nonpd-a job didn't complete cleanly"
+log "=== Step 6: Waiting for Non-PD bench job ==="
+kubectl wait --for=condition=complete "job/mimo-v2-flash-2node-nonpd" --timeout=14400s \
+  || { log "Non-PD job failed/timed out"; kubectl get pods -l "job-name=mimo-v2-flash-2node-nonpd" -o wide; }
 
 log "Non-PD results:"
 for bsz in 64 128; do
