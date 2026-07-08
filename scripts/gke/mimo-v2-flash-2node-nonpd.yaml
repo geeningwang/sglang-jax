@@ -49,7 +49,7 @@ metadata:
 spec:
   provisioningClassName: queued-provisioning.gke.io
   parameters:
-    maxRunDurationSeconds: "21600"
+    maxRunDurationSeconds: "36000"
   podSets:
   - count: 2
     podTemplateRef:
@@ -202,7 +202,7 @@ spec:
               if curl -sf http://localhost:${SERVER_PORT}/health >/dev/null 2>&1; then
                 echo "$(ts) [pod1] Local server ready after $((i*5))s"; break
               fi
-              kill -0 "${SRV_PID}" 2>/dev/null || { echo "ERROR: local server exited"; tail -30 "${SLOG}"; exit 1; }
+              kill -0 "${SRV_PID}" 2>/dev/null || { echo "ERROR: local server exited"; gsutil cp "${SLOG}" "${RESULTS_DIR}/server-pod1-crash.log" || true; tail -30 "${SLOG}"; exit 1; }
               [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting... $((i*5))s"
               sleep 5
             done
