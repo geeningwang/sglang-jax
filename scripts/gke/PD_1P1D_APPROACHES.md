@@ -80,9 +80,9 @@ under heavy pressure.
 
 ---
 
-## Attempt 4 — 2x2x2 IndexedJob with env var override (CURRENT, PENDING)
+## Attempt 4 — 2x2x2 IndexedJob with env var override (ABANDONED, untested)
 
-**File**: `pd1p1d.yaml` (current, with override)  
+**File**: `pd1p1d.yaml` (superseded by Attempt 5)  
 **Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)  
 **Change**: Added before each `launch_server` call:
 
@@ -95,15 +95,47 @@ export TPU_WORKER_HOSTNAMES=$(hostname)
 This should bypass "Expected 2 worker addresses, got 1" and initialize each pod as an
 independent single-host system with 4 chips (8 JAX devices).
 
+**Status**: ❌ Abandoned before testing — replaced by Attempt 5 (simultaneous barrier).
+
+**Why abandoned**: If env vars are respected and each pod inits as a truly independent
+single-host JAX process, the two pods are not synchronized with each other at the libtpu
+level. Whether they collide at the hardware level (chip ICI mesh, driver state) is unknown.
+More importantly, even if this passes libtpu init, there is no guarantee the JAX XLA
+compiler correctly limits each pod to its local 8 devices without the standard
+multi-host initialization path. Attempt 5 uses the proper multi-host path instead.
+
+---
+
+## Attempt 5 — 2x2x2 IndexedJob with simultaneous-start barrier (CURRENT, PENDING)
+
+**File**: `pd1p1d.yaml` (current)  
+**Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)
+
+**Idea**: libtpu requires all VMs in a 2x2x2 gang to call into the driver at the same
+time. Previous attempts failed because pod 1 waited for pod 0's IP before starting its
+server — so pod 0 started JAX init before pod 1 was ready. Option E fixes this with a
+GCS barrier:
+
+1. Pod 0: starts bootstrap server (no JAX) → writes its IP → **waits for pod1 IP flag**
+2. Pod 1: **writes its IP immediately** → waits for pod0 IP → starts decode server
+3. Pod 0: sees pod1 IP → starts prefill server
+4. Both servers call into libtpu within seconds of each other → handshake succeeds
+
+New GCS flag: `pd1p1d-pod1-ip` (pod 1 writes this as its barrier signal to pod 0).
+
 **Status**: ⏳ Waiting for DWS provisioning (~6h). Not yet validated.
 
-**Risk**: Unknown whether libtpu respects these env vars as the sole source of topology
-truth when the physical hardware is a 2x2x2 gang slice. Possible failure modes:
-1. libtpu discovers slice topology from hardware/kernel driver, ignoring env vars → same error
-2. libtpu accepts single-worker init but XLA mesh config breaks at compile time
-3. `--tp-size 8` fails because XLA sees only 4 chips after single-worker init
-   (4 chips × 2 TensorCores = 8 JAX devices — this should actually match tp-size 8)
-4. The two pods interfere at the chip level because they share the same physical 2x2x2 silicon
+**Known risk**: After successful 2x2x2 libtpu init, both JAX processes are part of the
+SAME distributed JAX program (SPMD). Each process will see:
+- `jax.device_count()` = 16 (all 8 chips × 2 TensorCores across both VMs)
+- `jax.local_device_count()` = 8 (local 4 chips × 2 TensorCores)
+
+sgl_jax is launched with `--nnodes 1 --node-rank 0` on both pods, which assumes single-host.
+In SPMD JAX, both processes must execute the SAME JAX ops simultaneously — they cannot
+run independent server logic. If sgl_jax doesn't account for `jax.process_count() == 2`,
+the two server processes will deadlock waiting for each other to issue matching JAX ops.
+
+**If this fails**: The only clean solution is Option A (two separate DWS node pools).
 
 ---
 

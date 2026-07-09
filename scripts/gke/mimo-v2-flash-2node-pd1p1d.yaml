@@ -100,6 +100,7 @@ spec:
           RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-2node-pd1p1d"
           NFS_IP_FLAG="${RESULTS_BUCKET}/nfs-flash-2node-ip"
           POD0_IP_FLAG="${RESULTS_BUCKET}/pd1p1d-pod0-ip"
+          POD1_IP_FLAG="${RESULTS_BUCKET}/pd1p1d-pod1-ip"
           DONE_FLAG="${RESULTS_BUCKET}/pd1p1d-pod1-done"
           BOOTSTRAP_PORT=8998
           PREFILL_PORT=10000
@@ -206,9 +207,17 @@ spec:
             echo "${MY_IP}" | gsutil cp - "${POD0_IP_FLAG}"
             echo "$(ts) [pod0] IP ${MY_IP} written to GCS."
 
+            echo "$(ts) [pod0] Waiting for pod1 IP (barrier: both pods must start JAX init together)..."
+            for i in $(seq 1 120); do
+              if gsutil ls "${POD1_IP_FLAG}" >/dev/null 2>&1; then
+                echo "$(ts) [pod0] pod1 ready (${i}×5s)"; break
+              fi
+              [ $((i % 12)) -eq 0 ] && echo "$(ts) [pod0] still waiting for pod1... (${i}×5s)"
+              sleep 5
+            done
+            gsutil ls "${POD1_IP_FLAG}" >/dev/null 2>&1 || { echo "$(ts) ERROR: pod1 IP never appeared"; exit 1; }
+
             echo "$(ts) [pod0] Starting prefill server on port ${PREFILL_PORT}..."
-            export CLOUD_TPU_TASK_ID=0
-            export TPU_WORKER_HOSTNAMES=$(hostname)
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
             python3 -m sgl_jax.launch_server \
               "${COMMON_ARGS[@]}" \
@@ -236,6 +245,9 @@ spec:
 
           else
             # ────────────────────────────── Pod 1: DECODE ────────────────────────
+            echo "${MY_IP}" | gsutil cp - "${POD1_IP_FLAG}"
+            echo "$(ts) [pod1] IP ${MY_IP} written to GCS (barrier signal to pod0)."
+
             echo "$(ts) [pod1] Waiting for pod0 (prefill) IP..."
             POD0_IP=""
             for i in $(seq 1 120); do
@@ -248,8 +260,6 @@ spec:
 
             DLOG="/tmp/server_decode.log"
             echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."
-            export CLOUD_TPU_TASK_ID=0
-            export TPU_WORKER_HOSTNAMES=$(hostname)
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
             python3 -m sgl_jax.launch_server \
               "${COMMON_ARGS[@]}" \
