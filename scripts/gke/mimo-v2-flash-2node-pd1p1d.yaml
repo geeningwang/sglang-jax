@@ -207,6 +207,8 @@ spec:
             echo "$(ts) [pod0] IP ${MY_IP} written to GCS."
 
             echo "$(ts) [pod0] Starting prefill server on port ${PREFILL_PORT}..."
+            export CLOUD_TPU_TASK_ID=0
+            export TPU_WORKER_HOSTNAMES=$(hostname)
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
             python3 -m sgl_jax.launch_server \
               "${COMMON_ARGS[@]}" \
@@ -246,6 +248,8 @@ spec:
 
             DLOG="/tmp/server_decode.log"
             echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."
+            export CLOUD_TPU_TASK_ID=0
+            export TPU_WORKER_HOSTNAMES=$(hostname)
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
             python3 -m sgl_jax.launch_server \
               "${COMMON_ARGS[@]}" \
