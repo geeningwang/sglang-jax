@@ -105,6 +105,9 @@ spec:
           PREFILL_PORT=10000
           DECODE_PORT=10001
           ts() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"; }
+          STARTUP_LOG="/tmp/startup_pod${IDX}.log"
+          exec > >(tee -a "${STARTUP_LOG}") 2>&1
+          trap 'gsutil cp "${STARTUP_LOG}" "${RESULTS_DIR}/startup_pod${IDX}.log" 2>/dev/null || true' EXIT
 
           # ── 1. Clone + install ────────────────────────────────────────────────
           echo "$(ts) === [pod${IDX}] Clone geeningwang/sglang-jax branch mimo-tpu7-stage2 ==="
@@ -178,7 +181,6 @@ spec:
           # ── 5. Pod-specific logic ─────────────────────────────────────────────
           if [ "${IDX}" = "0" ]; then
             # ────────────────────────────── Pod 0: PREFILL ───────────────────────
-            # 5a. Start standalone bootstrap server
             BLOG="/tmp/bootstrap.log"
             PLOG="/tmp/server_prefill.log"
             echo "$(ts) [pod0] Starting bootstrap server on port ${BOOTSTRAP_PORT}..."
@@ -187,20 +189,23 @@ spec:
               --port "${BOOTSTRAP_PORT}" \
               >> "${BLOG}" 2>&1 &
             BOOTSTRAP_PID=$!
-            # Wait for bootstrap to become reachable
             for i in $(seq 1 30); do
               if curl -sf http://localhost:${BOOTSTRAP_PORT}/health >/dev/null 2>&1 || \
                  curl -sf http://localhost:${BOOTSTRAP_PORT}/ >/dev/null 2>&1 || \
                  ss -tlnp 2>/dev/null | grep -q ":${BOOTSTRAP_PORT} "; then
                 echo "$(ts) [pod0] Bootstrap ready after $((i*2))s"; break
               fi
+              kill -0 "${BOOTSTRAP_PID}" 2>/dev/null || {
+                echo "$(ts) ERROR: bootstrap server exited"
+                gsutil cp "${BLOG}" "${RESULTS_DIR}/bootstrap-crash.log" || true
+                tail -30 "${BLOG}"
+                exit 1
+              }
               sleep 2
             done
-            # Publish IP so decode pod can find the bootstrap URL
             echo "${MY_IP}" | gsutil cp - "${POD0_IP_FLAG}"
             echo "$(ts) [pod0] IP ${MY_IP} written to GCS."
 
-            # 5b. Start prefill server
             echo "$(ts) [pod0] Starting prefill server on port ${PREFILL_PORT}..."
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
             python3 -m sgl_jax.launch_server \
@@ -211,9 +216,16 @@ spec:
               >> "${PLOG}" 2>&1 &
             PREFILL_PID=$!
 
-            # 5c. Wait for done signal from decode pod
             echo "$(ts) [pod0] Waiting for pod1 done signal..."
-            until gsutil ls "${DONE_FLAG}" >/dev/null 2>&1; do sleep 10; done
+            until gsutil ls "${DONE_FLAG}" >/dev/null 2>&1; do
+              kill -0 "${PREFILL_PID}" 2>/dev/null || {
+                echo "$(ts) ERROR: prefill server exited early"
+                gsutil cp "${PLOG}" "${RESULTS_DIR}/server-prefill-crash.log" || true
+                tail -50 "${PLOG}"
+                exit 1
+              }
+              sleep 10
+            done
             echo "$(ts) [pod0] Done. Uploading logs."
             gsutil cp "${BLOG}" "${RESULTS_DIR}/bootstrap.log"     || true
             gsutil cp "${PLOG}" "${RESULTS_DIR}/server-prefill.log" || true
@@ -222,7 +234,6 @@ spec:
 
           else
             # ────────────────────────────── Pod 1: DECODE ────────────────────────
-            # 5a. Wait for prefill pod's IP
             echo "$(ts) [pod1] Waiting for pod0 (prefill) IP..."
             POD0_IP=""
             for i in $(seq 1 120); do
@@ -233,7 +244,6 @@ spec:
             done
             [ -z "${POD0_IP}" ] && { echo "$(ts) ERROR: pod0 IP never appeared"; exit 1; }
 
-            # 5b. Start decode server
             DLOG="/tmp/server_decode.log"
             echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
@@ -245,18 +255,21 @@ spec:
               >> "${DLOG}" 2>&1 &
             DECODE_PID=$!
 
-            # 5c. Wait for decode server healthy
             echo "$(ts) [pod1] Waiting for decode server /health..."
             for i in $(seq 1 1440); do
               if curl -sf http://localhost:${DECODE_PORT}/health >/dev/null 2>&1; then
                 echo "$(ts) [pod1] Decode server ready after $((i*5))s"; break
               fi
-              kill -0 "${DECODE_PID}" 2>/dev/null || { echo "ERROR: decode server exited"; gsutil cp "${DLOG}" "${RESULTS_DIR}/server-decode-crash.log" || true; tail -50 "${DLOG}"; exit 1; }
+              kill -0 "${DECODE_PID}" 2>/dev/null || {
+                echo "$(ts) ERROR: decode server exited"
+                gsutil cp "${DLOG}" "${RESULTS_DIR}/server-decode-crash.log" || true
+                tail -50 "${DLOG}"
+                exit 1
+              }
               [ $((i % 60)) -eq 0 ] && echo "$(ts) still waiting... $((i*5))s"
               sleep 5
             done
 
-            # 5d. Benchmark
             BENCH_URL="http://127.0.0.1:${DECODE_PORT}"
             echo "$(ts) === [pod1] bench_serving: bsz 64 128 ==="
             for bsz in 64 128; do
