@@ -216,6 +216,10 @@ spec:
               sleep 5
             done
             gsutil ls "${POD1_IP_FLAG}" >/dev/null 2>&1 || { echo "$(ts) ERROR: pod1 IP never appeared"; exit 1; }
+            POD1_IP=$(gsutil cat "${POD1_IP_FLAG}")
+            export CLOUD_TPU_TASK_ID=0
+            export TPU_WORKER_HOSTNAMES="${MY_IP},${POD1_IP}"
+            echo "$(ts) [pod0] TPU env: TASK_ID=${CLOUD_TPU_TASK_ID} WORKER_HOSTNAMES=${TPU_WORKER_HOSTNAMES}"
 
             echo "$(ts) [pod0] Starting prefill server on port ${PREFILL_PORT}..."
             JAX_COMPILATION_CACHE_DIR="${RESULTS_BUCKET}/jax-compilation-cache" \
@@ -257,6 +261,9 @@ spec:
               sleep 5
             done
             [ -z "${POD0_IP}" ] && { echo "$(ts) ERROR: pod0 IP never appeared"; exit 1; }
+            export CLOUD_TPU_TASK_ID=1
+            export TPU_WORKER_HOSTNAMES="${POD0_IP},${MY_IP}"
+            echo "$(ts) [pod1] TPU env: TASK_ID=${CLOUD_TPU_TASK_ID} WORKER_HOSTNAMES=${TPU_WORKER_HOSTNAMES}"
 
             DLOG="/tmp/server_decode.log"
             echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."

@@ -24,7 +24,7 @@ def create_device_mesh(
 ) -> jax.sharding.Mesh:
     """Create a device mesh"""
     if devices is None:
-        devices = jax.devices()
+        devices = jax.local_devices()
 
     offset = get_device_id_offset(devices)
 
@@ -42,7 +42,7 @@ def create_device_mesh(
             allow_split_physical_axes=allow_split_physical_axes,
         )
     else:
-        all_devices = jax.devices()
+        all_devices = jax.local_devices()
         is_subset = len(devices) < len(all_devices)
         if is_subset:
             # JAX's create_device_mesh infers the full physical TPU topology

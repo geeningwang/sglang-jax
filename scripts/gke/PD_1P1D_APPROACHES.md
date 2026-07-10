@@ -123,19 +123,43 @@ GCS barrier:
 
 New GCS flag: `pd1p1d-pod1-ip` (pod 1 writes this as its barrier signal to pod 0).
 
+**Status**: ❌ Failed — same "Expected 2 worker addresses, got 1" error despite simultaneous start.
+
+**Root cause confirmed**: GKE's indexed job only sets `TPU_WORKER_HOSTNAMES` to each pod's
+OWN IP, not the full 2-worker list. The physical 2x2x2 slice always requires 2 worker
+addresses; providing only 1 causes the error regardless of timing.
+
+---
+
+## Attempt 6 — Explicit multi-host env vars + local device mesh (CURRENT, PENDING)
+
+**Files**: `pd1p1d.yaml` + `mesh_utils.py`  
+**Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)
+
+**Two-part fix**:
+
+**Part 1 — Script**: After IP exchange via GCS (barrier already in place), each pod
+explicitly sets the correct multi-host env vars before launching its server:
+- Both pods: `TPU_WORKER_HOSTNAMES=<pod0-ip>,<pod1-ip>` (full 2-worker list)
+- Pod 0: `CLOUD_TPU_TASK_ID=0`
+- Pod 1: `CLOUD_TPU_TASK_ID=1`
+
+This gives libtpu the 2 worker addresses it needs. Both pods start simultaneously
+(barrier ensures this) → handshake succeeds.
+
+**Part 2 — Code**: In `mesh_utils.py`, changed `jax.devices()` → `jax.local_devices()`
+at two call sites (lines 27, 45). After 2x2x2 init, each process sees 16 total devices,
+but the mesh is built from only the 8 local devices. Each pod runs its server on its
+own 4 chips (8 JAX devices) with `--tp-size 8`.
+
 **Status**: ⏳ Waiting for DWS provisioning (~6h). Not yet validated.
 
-**Known risk**: After successful 2x2x2 libtpu init, both JAX processes are part of the
-SAME distributed JAX program (SPMD). Each process will see:
-- `jax.device_count()` = 16 (all 8 chips × 2 TensorCores across both VMs)
-- `jax.local_device_count()` = 8 (local 4 chips × 2 TensorCores)
+**Known risk**: After full 2x2x2 libtpu init, both pods are part of the same distributed
+JAX runtime. sgl_jax with `--nnodes 1 --node-rank 0` does not issue cross-process JAX
+collectives, so each server's tensor-parallel allreduces should stay within the local
+8-device mesh. If any collective accidentally spans both processes, both servers deadlock.
 
-sgl_jax is launched with `--nnodes 1 --node-rank 0` on both pods, which assumes single-host.
-In SPMD JAX, both processes must execute the SAME JAX ops simultaneously — they cannot
-run independent server logic. If sgl_jax doesn't account for `jax.process_count() == 2`,
-the two server processes will deadlock waiting for each other to issue matching JAX ops.
-
-**If this fails**: The only clean solution is Option A (two separate DWS node pools).
+**If this fails**: Option A (two separate DWS node pools) is the definitive fix.
 
 ---
 
