@@ -106,7 +106,7 @@ multi-host initialization path. Attempt 5 uses the proper multi-host path instea
 
 ---
 
-## Attempt 5 — 2x2x2 IndexedJob with simultaneous-start barrier (CURRENT, PENDING)
+## Attempt 5 — 2x2x2 IndexedJob with simultaneous-start barrier
 
 **File**: `pd1p1d.yaml` (current)  
 **Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)
@@ -123,6 +123,8 @@ GCS barrier:
 
 New GCS flag: `pd1p1d-pod1-ip` (pod 1 writes this as its barrier signal to pod 0).
 
+**DWS queue time**: ~5h 46min (submitted Jul 9 10:04 UTC, started ~Jul 9 15:50 UTC)
+
 **Status**: ❌ Failed — same "Expected 2 worker addresses, got 1" error despite simultaneous start.
 
 **Root cause confirmed**: GKE's indexed job only sets `TPU_WORKER_HOSTNAMES` to each pod's
@@ -131,10 +133,11 @@ addresses; providing only 1 causes the error regardless of timing.
 
 ---
 
-## Attempt 6 — Explicit multi-host env vars + local device mesh (CURRENT, PENDING)
+## Attempt 6 — Explicit multi-host env vars + local device mesh
 
 **Files**: `pd1p1d.yaml` + `mesh_utils.py`  
-**Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)
+**Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)  
+**DWS queue time**: ~17h 9min (submitted Jul 10 06:17 UTC, started Jul 10 23:26 UTC)
 
 **Two-part fix**:
 
@@ -144,20 +147,42 @@ explicitly sets the correct multi-host env vars before launching its server:
 - Pod 0: `CLOUD_TPU_TASK_ID=0`
 - Pod 1: `CLOUD_TPU_TASK_ID=1`
 
-This gives libtpu the 2 worker addresses it needs. Both pods start simultaneously
-(barrier ensures this) → handshake succeeds.
-
 **Part 2 — Code**: In `mesh_utils.py`, changed `jax.devices()` → `jax.local_devices()`
 at two call sites (lines 27, 45). After 2x2x2 init, each process sees 16 total devices,
 but the mesh is built from only the 8 local devices. Each pod runs its server on its
 own 4 chips (8 JAX devices) with `--tp-size 8`.
 
-**Status**: ⏳ Waiting for DWS provisioning (~6h). Not yet validated.
+**Status**: ❌ Failed — same "Expected 2 worker addresses, got 1" error, but for pod1 only.
 
-**Known risk**: After full 2x2x2 libtpu init, both pods are part of the same distributed
-JAX runtime. sgl_jax with `--nnodes 1 --node-rank 0` does not issue cross-process JAX
-collectives, so each server's tensor-parallel allreduces should stay within the local
-8-device mesh. If any collective accidentally spans both processes, both servers deadlock.
+**Root cause confirmed**: The env var override worked for pod0 (it entered JAX init
+successfully at `23:26:48`). Pod1 started its JAX init 21 seconds later at `23:27:09`
+and immediately failed. The libtpu 2-worker handshake timed out while pod0 waited those
+21 seconds with no response from pod1. When pod1 then tried to join, pod0's handshake
+state was already broken so pod1 reported only 1 reachable worker. The barrier in
+Attempt 6 released pod0 as soon as pod1 wrote its IP, but pod1 had additional script
+operations (logging, gsutil copy overhead) that added the 21-second delay before
+its server launch.
+
+---
+
+## Attempt 7 — Tightened simultaneous-start barrier (CURRENT, IN QUEUE)
+
+**File**: `pd1p1d.yaml`  
+**Pool**: `jingnw-dws-tpu7-8ch` (2x2x2, gang size=2)  
+**Submitted**: Jul 13 00:55 UTC
+
+**Change**: Reordered pod1's barrier so that it:
+1. Reads pod0 IP (with sleep-poll)
+2. Sets env vars (`CLOUD_TPU_TASK_ID=1`, `TPU_WORKER_HOSTNAMES=pod0-ip,pod1-ip`)
+3. Writes pod1 IP to GCS → **this is what releases pod0**
+4. Immediately starts decode server (no additional waits)
+
+Pod0 starts within one poll interval (0–5s) of seeing pod1's flag. Pod1 starts
+within <1s of writing the flag. Expected JAX init gap: <5s.
+
+**Expected outcome**: Both pods enter libtpu's 2-worker handshake within <5s of each
+other — well within any reasonable timeout — handshake succeeds, both servers initialize
+against the same 2x2x2 slice but each uses only their local 8 JAX devices.
 
 **If this fails**: Option A (two separate DWS node pools) is the definitive fix.
 
