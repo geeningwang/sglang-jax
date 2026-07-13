@@ -795,6 +795,45 @@ class SWAKVPool(KVCache):
         self.swa_kv_pool.replace_buffer(swa_kv_buffer)
         self.full_kv_pool.replace_buffer(full_kv_buffer)
 
+    # ── Disaggregation-compatibility properties ───────────────────────────────
+    # prefill.py and decode.py access these on whatever get_kvcache() returns.
+    # MHATokenToKVPool has them as instance attributes; SWAKVPool must proxy.
+
+    @property
+    def layer_num(self) -> int:
+        return self.swa_layer_nums + self.full_layer_nums
+
+    @property
+    def start_layer(self) -> int:
+        return min(self.layers_mapping.keys()) if self.layers_mapping else 0
+
+    @property
+    def kv_sharding(self):
+        """Representative sharding — assumes full and SWA layers share the same TP spec."""
+        return self.full_kv_pool.kv_sharding
+
+    @property
+    def dtype(self):
+        return self.full_kv_pool.dtype
+
+    def scatter_kv_pages(
+        self, layer_id: int, page_ids: "jax.Array", kv_data: "jax.Array"
+    ) -> None:
+        """Scatter a fused KV slice into the correct sub-pool at page_ids.
+
+        Used by the disaggregation decode path (_write_kv_to_pool) instead of
+        direct kv_buffer[layer_idx] = ... which only works on MHATokenToKVPool.
+        """
+        layer_id_pool, is_swa = self.layers_mapping[layer_id]
+        sub_pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        sub_pool.kv_buffer[layer_id_pool] = (
+            sub_pool.kv_buffer[layer_id_pool]
+            .at[page_ids]
+            .set(kv_data, out_sharding=sub_pool.kv_sharding)
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
         Remap cache locations from the full-attention token space to the SWA

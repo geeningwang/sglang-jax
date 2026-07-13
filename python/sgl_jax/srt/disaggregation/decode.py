@@ -309,7 +309,10 @@ class SchedulerDisaggregationDecodeMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
-        per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+        # Use get_kv_buffer() so this works for both MHATokenToKVPool (.kv_buffer
+        # list) and SWAKVPool (which has no .kv_buffer attribute but does implement
+        # get_kv_buffer()).
+        per_layer_tail = kv_pool.get_kv_buffer(kv_pool.start_layer).shape[1:]
         shape = (kv_pool.layer_num, padded_pages) + per_layer_tail
         base_spec = kv_pool.kv_sharding.spec
         stacked_spec = PartitionSpec(None, *base_spec)
@@ -378,12 +381,17 @@ class SchedulerDisaggregationDecodeMixin:
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
-            layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = (
-                kv_pool.kv_buffer[layer_idx]
-                .at[page_ids_jax]
-                .set(kv[i], out_sharding=kv_pool.kv_sharding)
-            )
+            if hasattr(kv_pool, "scatter_kv_pages"):
+                # SWAKVPool: dispatches to the correct sub-pool (full or SWA)
+                # based on layers_mapping, since kv_buffer is split across two pools.
+                kv_pool.scatter_kv_pages(layer_id, page_ids_jax, kv[i])
+            else:
+                layer_idx = layer_id - kv_pool.start_layer
+                kv_pool.kv_buffer[layer_idx] = (
+                    kv_pool.kv_buffer[layer_idx]
+                    .at[page_ids_jax]
+                    .set(kv[i], out_sharding=kv_pool.kv_sharding)
+                )
         # Set prefix_indices to all-but-last so extend_input_len=1.
         valid_slots = kv_indices_np[:seqlen]
         if len(valid_slots) >= 1:
