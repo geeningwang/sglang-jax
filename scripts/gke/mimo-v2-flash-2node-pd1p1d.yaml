@@ -249,9 +249,9 @@ spec:
 
           else
             # ────────────────────────────── Pod 1: DECODE ────────────────────────
-            echo "${MY_IP}" | gsutil cp - "${POD1_IP_FLAG}"
-            echo "$(ts) [pod1] IP ${MY_IP} written to GCS (barrier signal to pod0)."
-
+            # Read pod0 IP FIRST, then signal pod0 (write pod1 IP). This ensures
+            # pod0's barrier unlocks only when pod1 is about to start its server,
+            # so both servers start within ~1s of each other for the libtpu handshake.
             echo "$(ts) [pod1] Waiting for pod0 (prefill) IP..."
             POD0_IP=""
             for i in $(seq 1 120); do
@@ -264,6 +264,8 @@ spec:
             export CLOUD_TPU_TASK_ID=1
             export TPU_WORKER_HOSTNAMES="${POD0_IP},${MY_IP}"
             echo "$(ts) [pod1] TPU env: TASK_ID=${CLOUD_TPU_TASK_ID} WORKER_HOSTNAMES=${TPU_WORKER_HOSTNAMES}"
+            echo "${MY_IP}" | gsutil cp - "${POD1_IP_FLAG}"
+            echo "$(ts) [pod1] IP ${MY_IP} written to GCS (pod0 barrier now released)."
 
             DLOG="/tmp/server_decode.log"
             echo "$(ts) [pod1] Starting decode server on port ${DECODE_PORT}..."
