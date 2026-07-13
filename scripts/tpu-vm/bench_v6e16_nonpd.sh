@@ -63,6 +63,7 @@ uv pip install --system "orbax-checkpoint>=0.12.0" aiohttp -q
 
 # ── 2. Mount NFS model weights ────────────────────────────────────
 echo "$(ts) [w${WORKER_ID}] Installing nfs-common..."
+sudo apt-get update -qq
 sudo apt-get install -y -qq nfs-common
 
 mkdir -p "${MODEL_PATH}"
