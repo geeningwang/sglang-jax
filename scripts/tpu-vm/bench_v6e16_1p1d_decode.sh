@@ -136,7 +136,6 @@ python3.12 -m sgl_jax.launch_server \
   --dp-schedule-policy round_robin \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
-  --log-mfu \
   --disaggregation-mode decode \
   --disaggregation-bootstrap-url "http://${PREFILL_W0_IP}:${BOOTSTRAP_PORT}" \
   >> "${SLOG}" 2>&1 &

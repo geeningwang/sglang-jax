@@ -132,7 +132,6 @@ python3.12 -m sgl_jax.launch_server \
   --dp-schedule-policy round_robin \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
-  --log-mfu \
   >> "${SLOG}" 2>&1 &
 SRV_PID=$!
 echo "$(ts) [w${WORKER_ID}] Server launched (PID=${SRV_PID})"
