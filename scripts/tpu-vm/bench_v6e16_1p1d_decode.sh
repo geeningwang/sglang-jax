@@ -166,6 +166,28 @@ if [ "${WORKER_ID}" = "0" ]; then
     sleep 5
   done
 
+  # ── 6a. Start PD router (fans out to prefill + decode) ──────────────
+  ROUTER_PORT=30000
+  RLOG="/tmp/router.log"
+  echo "$(ts) [d-w0] Starting PD router on port ${ROUTER_PORT}..."
+  python3.12 "${WORKDIR}/scripts/tpu-vm/simple_pd_router.py" \
+    --prefill-url "http://${PREFILL_W0_IP}:10000" \
+    --decode-url "http://127.0.0.1:${SERVER_PORT}" \
+    --bootstrap-host "${PREFILL_W0_IP}" \
+    --bootstrap-port "${BOOTSTRAP_PORT}" \
+    --port "${ROUTER_PORT}" \
+    >> "${RLOG}" 2>&1 &
+  ROUTER_PID=$!
+  echo "$(ts) [d-w0] Router launched (PID=${ROUTER_PID})"
+
+  # Wait for router health (it proxies /health to decode)
+  for i in $(seq 1 60); do
+    if curl -sf "http://localhost:${ROUTER_PORT}/health" >/dev/null 2>&1; then
+      echo "$(ts) [d-w0] Router healthy"; break
+    fi
+    sleep 2
+  done
+
   echo "$(ts) [d-w0] === bench_serving 1P1D: bsz 32 64 128 ==="
   for bs in 32 64 128; do
     np=$((bs * 3))
@@ -174,7 +196,7 @@ if [ "${WORKER_ID}" = "0" ]; then
     echo "$(ts) [d-w0] bsz=${bs} num_prompts=${np}"
     python3.12 -m sgl_jax.bench_serving \
       --backend sgl-jax \
-      --base-url "http://127.0.0.1:${SERVER_PORT}" \
+      --base-url "http://127.0.0.1:${ROUTER_PORT}" \
       --model "${MODEL_PATH}" \
       --dataset-name random \
       --random-input-len 16384 \
@@ -190,10 +212,12 @@ if [ "${WORKER_ID}" = "0" ]; then
     gsutil cp "${BL}" "${RESULTS_DIR}/bs${bs}/bench.log"   || true
   done
 
-  echo "$(ts) [d-w0] Uploading decode server log..."
+  echo "$(ts) [d-w0] Uploading decode server + router logs..."
   gsutil cp "${SLOG}" "${RESULTS_DIR}/server-decode-w0.log" || true
+  gsutil cp "${RLOG}" "${RESULTS_DIR}/router.log" || true
   echo "$(ts) [d-w0] Signalling done."
   echo "done" | gsutil cp - "${DONE_FLAG}"
+  kill "${ROUTER_PID}" 2>/dev/null || true
   kill "${SRV_PID}" 2>/dev/null || true
 
 else
