@@ -3,7 +3,8 @@
 **Model**: MiMo-V2-Flash FP8 (PTQ)  
 **Mode**: Non-disaggregated (single server handles both prefill and decode)  
 **Hardware**: TPU v6e-16 — 4 physical hosts × 4 chips/host × 1 TensorCore/chip = **16 JAX devices**  
-**Date**: 2026-07-13  
+**Date**: 2026-07-14  
+**Branch**: `mimo-tpu7-stage3` (based on `primatrix/epic/mimo-pd-disggragation`)  
 **Script**: [bench_v6e16_nonpd.sh](bench_v6e16_nonpd.sh)
 
 ---
@@ -348,34 +349,36 @@ workers 1-3 to upload their server logs and exit cleanly.
 
 ### Results
 
+*Completed: 2026-07-14 03:07 UTC on branch `mimo-tpu7-stage3`.*
+*Raw logs: `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-nonpd/`*
+
 | Metric | bsz=32 | bsz=64 | bsz=128 |
 |---|---|---|---|
-| Request throughput (req/s) | 0.20 | 0.21 | 0.21 |
-| **Output tok/s** | **818** | **848** | **864** |
-| Peak output tok/s | 1,326 | 1,326 | 1,352 |
-| Input tok/s | 3,275 | 3,393 | 3,457 |
-| Total tok/s | 4,093 | 4,242 | 4,321 |
-| Effective concurrency | 28.7 | 56.3 | 111.0 |
-| Mean TTFT (ms) | 36,409 | 147,106 | 363,936 |
-| Median TTFT (ms) | 23,338 | 139,551 | 426,330 |
-| P99 TTFT (ms) | 115,890 | 340,240 | 587,124 |
-| **Median ITL (ms)** | **19.13** | **19.19** | **19.15** |
-| P99 ITL (ms) | 20.51 | 20.40 | 20.43 |
+| Request throughput (req/s) | 0.21 | 0.22 | 0.23 |
+| **Output tok/s** | **879** | **908** | **924** |
+| Peak output tok/s | 1,430 | 1,430 | 1,430 |
+| Input tok/s | 3,517 | 3,631 | 3,697 |
+| Total tok/s | 4,397 | 4,539 | 4,622 |
+| Mean E2E latency (ms) | 134,250 | 254,747 | 492,145 |
+| Median E2E latency (ms) | 107,237 | 240,060 | 503,609 |
+| Mean TTFT (ms) | 34,416 | 138,088 | 340,849 |
+| Median TTFT (ms) | 22,226 | 131,320 | 398,989 |
+| P99 TTFT (ms) | 108,652 | 319,200 | 550,128 |
+| **Median ITL (ms)** | **17.73** | **17.78** | **17.74** |
+| P99 ITL (ms) | 19.15 | 19.05 | 19.06 |
+| Benchmark duration (s) | 447 | 866 | 1,702 |
+| Successful requests | 96/96 | 192/192 | 384/384 |
 
 ### Analysis
 
-**Decode throughput** is stable and predictable: median ITL holds at ~19 ms across all three
-batch sizes, corresponding to ~52 tok/s per concurrent request. The v6e-16 system is not
+**Decode throughput** is stable and predictable: median ITL holds at ~17.7 ms across all three
+batch sizes, corresponding to ~56 tok/s per concurrent request. The v6e-16 system is not
 decode-bottlenecked even at bsz=128.
 
-**Output throughput** saturates around 864 tok/s at bsz=128. Peak decode-only throughput
-(all requests decoding simultaneously, no prefill) reaches 1,352 tok/s.
+**Output throughput** reaches 924 tok/s at bsz=128. Peak decode-only throughput
+(all requests decoding simultaneously, no prefill) reaches 1,430 tok/s.
 
 **TTFT degrades sharply** with batch size because prefill and decode compete for the same chips.
 Each 16384-token request requires 8 chunked-prefill steps (16384 ÷ 2048 chunk size), and at
-bsz=128 the queue is 128 × 8 = 1024 steps deep. Disaggregated prefill/decode (1P1D) would
-eliminate this contention and reduce TTFT to approximately one prefill-server pass.
-
-**MoE MFU** is logged by the server at 3–6% per chip during precompile, which is expected for
-memory-bandwidth-bound sparse MoE inference at these batch sizes. Higher batch sizes increase
-MFU toward the arithmetic-intensive regime.
+bsz=128 the queue is 128 × 8 = 1024 steps deep. Disaggregated prefill/decode (1P1D)
+eliminates this contention — see [1P1D results](GUIDE_v6e16_1p1d_benchmark.md#4-benchmark-results).

@@ -405,14 +405,60 @@ workers to terminate.
 
 ### Results
 
-*Pending — will be updated after benchmark run on `mimo-tpu7-stage3`.*
+*Completed: 2026-07-14 03:26 UTC on branch `mimo-tpu7-stage3`.*
+*Raw logs: `gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-1p1d/`*
+
+| Metric | bsz=32 | bsz=64 | bsz=128 |
+|---|---|---|---|
+| Request throughput (req/s) | 0.92 | 0.92 | 0.92 |
+| **Output tok/s** | **3,769** | **3,761** | **3,775** |
+| Input tok/s | 15,077 | 15,044 | 15,101 |
+| Total tok/s | 18,846 | 18,805 | 18,876 |
+| Mean E2E latency (ms) | 29,181 | 58,267 | 115,955 |
+| Median E2E latency (ms) | 34,486 | 69,451 | 138,406 |
+| Mean TTFT (ms) | 0 ⚠ | 0 ⚠ | 0 ⚠ |
+| Median ITL (ms) | 0 ⚠ | 0 ⚠ | 0 ⚠ |
+| Benchmark duration (s) | 104 | 209 | 417 |
+| Successful requests | 96/96 | 192/192 | 384/384 |
 
 ### Analysis
 
-*Pending.*
+**Output throughput** is 4.1–4.3× higher than NonPD: 3,775 tok/s (1P1D) vs 924 tok/s (NonPD)
+at bsz=128. This improvement comes from separating prefill and decode onto dedicated hardware
+— the decode VM's chips are never interrupted by chunked-prefill steps.
+
+**Request throughput** is stable at 0.92 req/s across all batch sizes, compared to 0.21-0.23
+req/s for NonPD — a 4× improvement. The 1P1D system maintains constant request throughput
+regardless of concurrency level because the two VMs pipeline prefill and decode independently.
+
+**E2E latency** scales linearly with batch size: 29s (bsz=32), 58s (bsz=64), 116s (bsz=128).
+NonPD latency at the same batch sizes is 134s, 255s, 492s — 4.2–4.6× worse.
+
+**TTFT and ITL report 0 ms** (⚠) because `bench_serving` uses `pd_separated=False` (default).
+In this mode, the client sends all requests through the PD router as a single endpoint; it
+cannot distinguish the prefill leg from subsequent decode tokens. A `--pd-separated` benchmark
+mode would be needed to measure TTFT and ITL accurately in disaggregated setups.
+
+**Benchmark duration** is dramatically shorter: all 384 requests at bsz=128 complete in 417s
+(~7 min) vs 1,702s (~28 min) for NonPD — the pipeline keeps both VMs saturated without
+the prefill/decode contention that throttles NonPD.
 
 ### Comparison with NonPD baseline
 
-*Pending.*
+| Metric | NonPD (1 VM) | 1P1D (2 VMs) | Change |
+|---|---|---|---|
+| Output tok/s @ bsz=128 | 924 | 3,775 | +4.1× |
+| Request throughput @ bsz=128 | 0.23 req/s | 0.92 req/s | +4.0× |
+| Mean E2E @ bsz=32 | 134,250 ms | 29,181 ms | −4.6× |
+| Median TTFT @ bsz=32 | 22,226 ms | 0 ms ⚠ | Not measurable |
+| Median ITL @ bsz=128 | 17.74 ms | 0 ms ⚠ | Not measurable |
+| Hardware cost | 1 × v6e-16 | 2 × v6e-16 | 2× chip-hours |
+| Benchmark duration @ bsz=128 | 1,702 s | 417 s | −4.1× |
+
+The throughput and E2E latency gains are real and reflect the benefit of separating prefill
+and decode onto dedicated hardware. At 2× hardware cost, 1P1D delivers >4× throughput —
+a 2× improvement in throughput-per-chip.
+
+TTFT/ITL metrics require `--pd-separated` mode for meaningful comparison.
 
 NonPD baseline results: [GUIDE_v6e16_nonpd_benchmark.md](GUIDE_v6e16_nonpd_benchmark.md#4-benchmark-results)
