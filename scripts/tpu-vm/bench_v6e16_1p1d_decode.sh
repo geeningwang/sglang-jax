@@ -170,12 +170,15 @@ if [ "${WORKER_ID}" = "0" ]; then
   ROUTER_PORT=30000
   RLOG="/tmp/router.log"
   echo "$(ts) [d-w0] Starting PD router on port ${ROUTER_PORT}..."
-  python3.12 "${WORKDIR}/scripts/tpu-vm/simple_pd_router.py" \
-    --prefill-url "http://${PREFILL_W0_IP}:10000" \
-    --decode-url "http://127.0.0.1:${SERVER_PORT}" \
-    --bootstrap-host "${PREFILL_W0_IP}" \
-    --bootstrap-port "${BOOTSTRAP_PORT}" \
-    --port "${ROUTER_PORT}" \
+  python3.12 -m sgl_jax.srt.disaggregation.launch_router \
+    --pd-disaggregation --mini-lb \
+    --prefill "http://${PREFILL_W0_IP}:10000" "${BOOTSTRAP_PORT}" \
+    --decode "http://127.0.0.1:${SERVER_PORT}" \
+    --prefill-bootstrap-host "${PREFILL_W0_IP}" \
+    --max-concurrent-requests 256 \
+    --pd-prefill-max-inflight-requests 4 \
+    --pd-router-admission-poll-ms 50 \
+    --host 0.0.0.0 --port "${ROUTER_PORT}" \
     >> "${RLOG}" 2>&1 &
   ROUTER_PID=$!
   echo "$(ts) [d-w0] Router launched (PID=${ROUTER_PID})"
