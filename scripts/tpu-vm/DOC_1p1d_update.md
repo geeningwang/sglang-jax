@@ -22,11 +22,17 @@
 
 **Commit:** 56bfad02
 
-## 3. SPMD race in overlap decode event loop (deployment workaround)
+## 3. SPMD race in overlap decode event loop
 
 **Problem:** The overlap disagg decode event loop (`event_loop_overlap_disagg_decode`) calls `process_allgather` (an SPMD collective) in `process_decode_queue()` while the forward thread is still executing `jit_jitted_sampler` (a different SPMD collective). On multi-host TPU, thread scheduling differences across hosts cause mismatched SPMD program order, and the TPU halts with E0200. On single-host, all devices share the same thread scheduler, so the race is unlikely to trigger.
 
-**Workaround:** Add `--disable-overlap-schedule` to the decode server command. This uses the non-overlap event loop which runs all operations synchronously in a single thread. This is not a code change, just a deployment flag. It may reduce decode throughput due to loss of CPU/TPU pipelining.
+**Fix:** Reorder the overlap decode event loop to drain the forward thread (`process_batch_result` → `output_queue.get()`) BEFORE calling `process_decode_queue`, and remove the second `process_decode_queue` call after `run_batch`. This ensures the forward thread is idle when `process_allgather` runs. Signal `sampling_info_done` directly after `run_batch` to preserve the grammar/guided-decoding pipeline. `--disable-overlap-schedule` is no longer needed.
+
+**Performance:** A/B tested against `--disable-overlap-schedule`. No degradation — both configurations produce ~71–73 token/s decode throughput on single-request workloads. The fix retains CPU/TPU pipeline overlap that the synchronous workaround sacrificed.
+
+**Commit:** 3c301255
+
+**Analysis:** See [DOC_spmd_race_analysis.md](DOC_spmd_race_analysis.md) for the full race mechanism, related code pieces, and alternative fix options considered.
 
 ---
 

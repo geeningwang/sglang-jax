@@ -1,6 +1,6 @@
 # SPMD Race in Overlap Disagg Decode Event Loop
 
-**Status:** Open — currently worked around with `--disable-overlap-schedule`
+**Status:** Fixed in commit 3c301255 (Fix A applied)
 **Affects:** Multi-host TPU only (multiple JAX processes per pod, e.g. v6e-16 with 4 workers)
 **Does NOT affect:** Single-host TPU (v7x 2x2x2, single JAX process per pod)
 

@@ -144,13 +144,12 @@ nohup python3.12 -m sgl_jax.launch_server \
   --max-running-requests 256 --dp-schedule-policy round_robin \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
-  --disable-overlap-schedule \
   --disaggregation-mode decode \
   --disaggregation-bootstrap-url http://10.202.0.68:8998 \
   </dev/null >/tmp/decode_server.log 2>&1 &
 ```
 
-**Note:** `--disable-overlap-schedule` is required for disagg decode on multi-host TPU. The overlap event loop has an SPMD race condition between the forward thread (`jit_jitted_sampler`) and `process_allgather` in `synced_terminal_rooms`.
+**Note:** `--disable-overlap-schedule` is no longer needed. The SPMD race in the overlap decode event loop was fixed in commit 3c301255 by reordering the loop to drain the forward thread before `process_allgather`.
 
 ### Router (jingnw-node w0 only)
 
@@ -198,8 +197,8 @@ Using `kill -9` on JAX processes can corrupt TPU state, causing `E0200: RuntimeU
 ### Missing gcsfs causes E0200 SPMD desync
 Without `gcsfs`, the GCS-backed XLA compilation cache (`JAX_COMPILATION_CACHE_DIR`) silently fails to read. Each worker recompiles from scratch, and non-deterministic XLA compilation produces different programs on different workers → `E0200: RuntimeUnexpectedCoreHalt` with "unexpected peer in launch group with different launch id." Fix: `uv pip install --system gcsfs`.
 
-### Overlap schedule causes E0200 in disagg decode (multi-host)
-The overlap disagg decode event loop (`event_loop_overlap_disagg_decode`) has an SPMD race condition: `process_decode_queue()` calls `process_allgather` (an SPMD collective) while the forward thread is executing `jit_jitted_sampler` (a different SPMD collective). The TPU detects mismatched programs across workers and halts with E0200. Fix: add `--disable-overlap-schedule` to the decode command. The non-overlap event loop runs all operations synchronously in a single thread.
+### ~~Overlap schedule causes E0200 in disagg decode (multi-host)~~ — FIXED
+The overlap disagg decode event loop had an SPMD race condition: `process_decode_queue()` called `process_allgather` while the forward thread was executing `jit_jitted_sampler`. Fixed in commit 3c301255 by reordering the loop to drain the forward thread before any SPMD collective. `--disable-overlap-schedule` is no longer needed.
 
 ### process_allgather int64→int32 truncation
 `jax_enable_x64` is off by default on TPU. `multihost_utils.process_allgather()` silently truncates int64 arrays to int32 (see JAX issue #18385). Fix: `generate_bootstrap_room()` now returns `[0, 2^31-1]` and `multihost_sync.py` uses `np.int32` dtype, avoiding truncation entirely.
