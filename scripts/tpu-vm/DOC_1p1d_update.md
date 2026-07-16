@@ -30,4 +30,4 @@
 
 ---
 
-All three issues are specific to **multi-host TPU** (v6e-16 with 4 workers). The upstream benchmarks on single-host v7x (4 chips, 1 process) did not hit any of them.
+Issue 1 (SWAKVPool) affects any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had this fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod), so intra-pod multi-host coordination was never invoked — PD cross-pod transfer itself worked fine in both setups.
