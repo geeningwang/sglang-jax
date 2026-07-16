@@ -10,8 +10,8 @@
 
 | Role    | TPU VM          | Zone        | Type   | Workers | IPs (internal)                                      |
 |---------|-----------------|-------------|--------|---------|-----------------------------------------------------|
-| Prefill | jingnw-node     | us-east5-b  | v6e-16 | 4       | w0: 10.202.0.29, w1: 10.202.15.197, w2: 10.202.15.194, w3: 10.202.15.202 |
-| Decode  | jingnw-node2    | us-east5-b  | v6e-16 | 4       | w0: 10.202.15.227, w1: 10.202.15.230, w2: 10.202.15.229, w3: 10.202.15.228 |
+| Prefill | jingnw-node     | us-east5-b  | v6e-16 | 4       | w0: 10.202.0.68, w1: 10.202.0.26, w2: 10.202.0.12, w3: 10.202.0.43 |
+| Decode  | jingnw-node2    | us-east5-b  | v6e-16 | 4       | w0: 10.202.0.116, w1: 10.202.15.208, w2: 10.202.0.185, w3: 10.202.0.168 |
 
 Each v6e-16 has 4 hosts × 4 chips × 1 TensorCore = 16 JAX devices.
 
@@ -68,7 +68,7 @@ The model is served from an NFS filestore:
 ### Mount command
 
 ```bash
-sudo apt-get install -y -qq nfs-common
+sudo apt-get update -qq && sudo apt-get install -y nfs-common
 mkdir -p /tmp/flash-model
 sudo mount -t nfs \
   -o nfsvers=3,nolock,rsize=1048576,wsize=1048576,hard,intr,timeo=600 \
@@ -116,7 +116,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
   --enable-sequence-parallel --tp-size 16 --dp-size 1 --ep-size 16 \
   --moe-backend fused_v2 --nnodes 4 --node-rank $WORKER_ID \
-  --dist-init-addr 10.202.0.29:8088 --host 0.0.0.0 --port 10000 \
+  --dist-init-addr 10.202.0.68:8088 --host 0.0.0.0 --port 10000 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
@@ -125,7 +125,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
   --disaggregation-mode prefill \
-  --disaggregation-bootstrap-url http://10.202.0.29:8998 \
+  --disaggregation-bootstrap-url http://10.202.0.68:8998 \
   </dev/null >/tmp/prefill_server.log 2>&1 &
 ```
 
@@ -136,7 +136,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
   --enable-sequence-parallel --tp-size 16 --dp-size 1 --ep-size 16 \
   --moe-backend fused_v2 --nnodes 4 --node-rank $WORKER_ID \
-  --dist-init-addr 10.202.15.227:8088 --host 0.0.0.0 --port 10001 \
+  --dist-init-addr 10.202.0.116:8088 --host 0.0.0.0 --port 10001 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
@@ -146,19 +146,19 @@ nohup python3.12 -m sgl_jax.launch_server \
   --precompile-token-paddings 4096 \
   --disable-overlap-schedule \
   --disaggregation-mode decode \
-  --disaggregation-bootstrap-url http://10.202.0.29:8998 \
+  --disaggregation-bootstrap-url http://10.202.0.68:8998 \
   </dev/null >/tmp/decode_server.log 2>&1 &
 ```
 
-**Note:** `--disable-overlap-schedule` is required for disagg decode on multi-host TPU. The overlap event loop has an SPMD race condition between the forward thread (`jit_jitted_sampler`) and `process_allgather` in `synced_terminal_rooms`. See `DOC_1p1d_hang_investigation.md` Phase 4.
+**Note:** `--disable-overlap-schedule` is required for disagg decode on multi-host TPU. The overlap event loop has an SPMD race condition between the forward thread (`jit_jitted_sampler`) and `process_allgather` in `synced_terminal_rooms`.
 
 ### Router (jingnw-node w0 only)
 
 ```bash
 nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   --pd-disaggregation --mini-lb \
-  --prefill http://10.202.0.29:10000 8998 \
-  --decode http://10.202.15.227:10001 \
+  --prefill http://10.202.0.68:10000 8998 \
+  --decode http://10.202.0.116:10001 \
   --host 0.0.0.0 --port 30000 \
   </dev/null >/tmp/router.log 2>&1 &
 ```
@@ -213,9 +213,8 @@ curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMeta
 ### Process index mapping
 JAX assigns `process_index` independently per cluster. GCE worker 0 is NOT necessarily `jax.process_index() == 0`. The mapping depends on which worker reaches the coordinator first.
 
-### Bootstrap registered process indices (observed 2026-07-16)
-Prefill (jingnw-node): w0(10.202.0.29)→pidx=1, w1(10.202.15.197)→pidx=3, w2(10.202.15.194)→pidx=2, w3(10.202.15.202)→pidx=0
-Decode (jingnw-node2): w0(10.202.15.227)→pidx=2, w1(10.202.15.230)→pidx=0, w2(10.202.15.229)→pidx=1, w3(10.202.15.228)→pidx=3
+### Bootstrap registered process indices
+Observed mapping depends on worker startup order and changes across VM recreations. Use server logs to determine the current mapping.
 
 ### (Latent) KV sharding mismatch with dp_size > 1
 In the single-host direct-HBM path (no D2H staging), prefill uses `P(None, *pool_pspec[1:])` while decode uses `kv_pool.kv_sharding` = `P("data", None, "tensor", None, None)`. With `dp_size=1` these are equivalent (size-1 axis), but with `dp_size>1` the per-device buffer sizes differ and the pull could hang or fail. Not triggered in our setup (dp_size=1).
