@@ -199,7 +199,7 @@ Using `kill -9` on JAX processes can corrupt TPU state, causing `E0200: RuntimeU
 Without `gcsfs`, the GCS-backed XLA compilation cache (`JAX_COMPILATION_CACHE_DIR`) silently fails to read. Each worker recompiles from scratch, and non-deterministic XLA compilation produces different programs on different workers → `E0200: RuntimeUnexpectedCoreHalt` with "unexpected peer in launch group with different launch id." Fix: `uv pip install --system gcsfs`.
 
 ### Overlap schedule causes E0200 in disagg decode (multi-host)
-The overlap disagg decode event loop (`event_loop_overlap_disagg_decode`) has an SPMD race condition: `process_decode_queue()` calls `process_allgather` (an SPMD collective) while the forward thread is executing `jit_jitted_sampler` (a different SPMD collective). The TPU detects mismatched programs across workers and halts with E0200. Fix: add `--disable-overlap-schedule` to the decode command. The non-overlap event loop runs all operations synchronously in a single thread. See `DOC_1p1d_hang_investigation.md` Phase 4 for details.
+The overlap disagg decode event loop (`event_loop_overlap_disagg_decode`) has an SPMD race condition: `process_decode_queue()` calls `process_allgather` (an SPMD collective) while the forward thread is executing `jit_jitted_sampler` (a different SPMD collective). The TPU detects mismatched programs across workers and halts with E0200. Fix: add `--disable-overlap-schedule` to the decode command. The non-overlap event loop runs all operations synchronously in a single thread.
 
 ### process_allgather int64→int32 truncation
 `jax_enable_x64` is off by default on TPU. `multihost_utils.process_allgather()` silently truncates int64 arrays to int32 (see JAX issue #18385). Fix: `generate_bootstrap_room()` now returns `[0, 2^31-1]` and `multihost_sync.py` uses `np.int32` dtype, avoiding truncation entirely.
@@ -216,3 +216,12 @@ JAX assigns `process_index` independently per cluster. GCE worker 0 is NOT neces
 ### Bootstrap registered process indices (observed 2026-07-16)
 Prefill (jingnw-node): w0(10.202.0.29)→pidx=1, w1(10.202.15.197)→pidx=3, w2(10.202.15.194)→pidx=2, w3(10.202.15.202)→pidx=0
 Decode (jingnw-node2): w0(10.202.15.227)→pidx=2, w1(10.202.15.230)→pidx=0, w2(10.202.15.229)→pidx=1, w3(10.202.15.228)→pidx=3
+
+### (Latent) KV sharding mismatch with dp_size > 1
+In the single-host direct-HBM path (no D2H staging), prefill uses `P(None, *pool_pspec[1:])` while decode uses `kv_pool.kv_sharding` = `P("data", None, "tensor", None, None)`. With `dp_size=1` these are equivalent (size-1 axis), but with `dp_size>1` the per-device buffer sizes differ and the pull could hang or fail. Not triggered in our setup (dp_size=1).
+
+### (Latent) No native timeout on `link.pull()`
+`link.pull()` (`wrapper.py`) has no timeout parameter. If the prefill crashes after bootstrap publish but before `await_pull`, the pull blocks forever. The reaper (30s default) flips a state flag but cannot interrupt the native C call, permanently sticking the worker thread. With `pull_worker_count` workers (default 4), 4 stuck pulls exhaust the pool and all subsequent pulls queue indefinitely.
+
+### (Latent) Link caching with no reconnection
+`wrapper.py` caches one link per `remote_addr`. If a link becomes stale (prefill restarts, network partition), all subsequent pulls to that address hang. There is no reconnection logic.
