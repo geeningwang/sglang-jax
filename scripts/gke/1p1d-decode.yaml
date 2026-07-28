@@ -1,0 +1,252 @@
+# MiMo-V2.5 1P1D DECODE — v6e-16 (4x4) on GKE, node pool tpu-v6e-slice-1.
+#
+# Pairs with 1p1d-prefill.yaml. Pod 0 additionally runs the PD router and drives
+# the bench_serving sweep, then writes the done flag that releases both jobs.
+# This is the side that carries the issue-323 instrumentation:
+# --disaggregation-decode-loop-profile-seconds emits PD-DECODE-LOOP-PROFILE.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mimo-d-svc
+  namespace: mimo
+spec:
+  clusterIP: None
+  selector:
+    job-name: mimo-d
+  ports:
+  - name: dist-init
+    port: 5000
+  - name: tpu-process
+    port: 8471
+  - name: http
+    port: 10000
+  - name: router
+    port: 30000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mimo-d
+  namespace: mimo
+spec:
+  backoffLimit: 0
+  completionMode: Indexed
+  parallelism: 4
+  completions: 4
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+        gke-gcsfuse/cpu-limit: "0"
+        gke-gcsfuse/memory-limit: "0"
+        gke-gcsfuse/ephemeral-storage-limit: "0"
+    spec:
+      subdomain: mimo-d-svc
+      restartPolicy: Never
+      serviceAccountName: mimo-sa
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v6e-slice-1
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 4x4
+      containers:
+      - name: decode
+        image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1
+        command: ["bash", "-lc"]
+        args:
+        - |
+          set -euxo pipefail
+          WID="${JOB_COMPLETION_INDEX}"
+          ts() { echo "[$(date -u '+%FT%TZ')] [d-w${WID}]"; }
+
+          BRANCH="${BRANCH:-perf/issue-323-scheduler-overlap}"
+          RUN_TAG="${RUN_TAG:-baseline}"
+          PROFILE_SECONDS="${LOOP_PROFILE_SECONDS:-10}"
+          OUT="/gcs-out/perf-results/gke-v6e16-1p1d/${RUN_TAG}"
+          DONE_FLAG="/gcs-out/coord/gke-v6e16-1p1d-done"
+
+          git clone https://github.com/geeningwang/sglang-jax.git /tmp/sglang-jax
+          cd /tmp/sglang-jax
+          git checkout "${BRANCH}"
+          echo "$(ts) HEAD $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
+          # [all] pins jax 0.10.2 + libtpu 0.0.42.1 and installs over the
+          # image's jax 0.8.1. This is the pairing the v6e-16 1P1D tpu-vm runs
+          # were validated on; the image only supplies the base layer.
+          pip install -e "python[all]"
+          pip install "orbax-checkpoint>=0.12.0" aiohttp
+
+          # The bootstrap server must answer before decode can register.
+          echo "$(ts) waiting for prefill bootstrap..."
+          for i in $(seq 1 900); do
+            curl -sf "http://mimo-p-0.mimo-p-svc:8998/health" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -sf "http://mimo-p-0.mimo-p-svc:8998/health" >/dev/null 2>&1 \
+            || { echo "$(ts) FATAL: bootstrap never came up"; exit 1; }
+          echo "$(ts) bootstrap reachable"
+
+          SLOG="/tmp/server_decode_w${WID}.log"
+          JAX_COMPILATION_CACHE_DIR=/gcs-out/jit-cache/decode \
+          LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7" \
+          PYTHONUNBUFFERED=1 \
+          python -m sgl_jax.launch_server \
+            --model-path /gcs-model/MiMo-V2.5 \
+            --trust-remote-code \
+            --enable-sequence-parallel \
+            --tp-size 16 --dp-size 1 --ep-size 16 \
+            --moe-backend fused_v2 \
+            --nnodes 4 --node-rank "${WID}" \
+            --dist-init-addr mimo-d-0.mimo-d-svc:5000 \
+            --host 0.0.0.0 --port 10000 \
+            --page-size 256 \
+            --context-length 262144 \
+            --disable-radix-cache \
+            --chunked-prefill-size 2048 \
+            --max-prefill-tokens 16384 \
+            --dtype bfloat16 \
+            --mem-fraction-static 0.84 \
+            --swa-full-tokens-ratio 0.2 \
+            --skip-server-warmup \
+            --log-level info \
+            --decode-log-interval 1 \
+            --max-running-requests 256 \
+            --dp-schedule-policy round_robin \
+            --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
+            --precompile-token-paddings 4096 \
+            --disaggregation-mode decode \
+            --disaggregation-bootstrap-url "http://mimo-p-0.mimo-p-svc:8998" \
+            --enable-request-time-stats-logging \
+            --disaggregation-decode-loop-profile-seconds "${PROFILE_SECONDS}" \
+            >> "${SLOG}" 2>&1 &
+          SRV=$!
+          echo "$(ts) server launched pid=${SRV}"
+
+          if [ "${WID}" != "0" ]; then
+            while true; do
+              [ -f "${DONE_FLAG}" ] && break
+              kill -0 "${SRV}" 2>/dev/null || { echo "$(ts) SERVER EXITED"; break; }
+              sleep 10
+            done
+            mkdir -p "${OUT}"
+            cp "${SLOG}" "${OUT}/server-decode-w${WID}.log" || true
+            kill "${SRV}" 2>/dev/null || true
+            echo "$(ts) complete"
+            exit 0
+          fi
+
+          # ---- pod 0 only: router + bench sweep ----
+          echo "$(ts) waiting for local decode server..."
+          for i in $(seq 1 900); do
+            curl -sf "http://127.0.0.1:10000/health" >/dev/null 2>&1 && break
+            kill -0 "${SRV}" 2>/dev/null || { echo "$(ts) FATAL: server died"; \
+              mkdir -p "${OUT}"; cp "${SLOG}" "${OUT}/server-decode-w0-crash.log" || true; exit 1; }
+            sleep 5
+          done
+
+          RLOG=/tmp/router.log
+          python -m sgl_jax.srt.disaggregation.launch_router \
+            --pd-disaggregation --mini-lb \
+            --prefill "http://mimo-p-0.mimo-p-svc:10000" 8998 \
+            --decode "http://127.0.0.1:10000" \
+            --prefill-bootstrap-host mimo-p-0.mimo-p-svc \
+            --max-concurrent-requests 256 \
+            --pd-prefill-max-inflight-requests 4 \
+            --pd-router-admission-poll-ms 50 \
+            --host 0.0.0.0 --port 30000 >> "${RLOG}" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf "http://127.0.0.1:30000/health" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "$(ts) router healthy"
+
+          mkdir -p "${OUT}"
+          for bs in 32 64 128; do
+            np=$((bs * 3))
+            echo "$(ts) === bsz=${bs} num_prompts=${np} ==="
+            mkdir -p "${OUT}/bs${bs}"
+            python -m sgl_jax.bench_serving \
+              --backend sgl-jax \
+              --base-url "http://127.0.0.1:30000" \
+              --model /gcs-model/MiMo-V2.5 \
+              --dataset-name random \
+              --random-input-len 16384 \
+              --random-output-len 4096 \
+              --random-range-ratio 1 \
+              --max-concurrency "${bs}" \
+              --num-prompts "${np}" \
+              --warmup-requests 0 \
+              --seed 12345 \
+              --output-file "/tmp/bs${bs}.jsonl" \
+              2>&1 | tee "/tmp/bs${bs}.log" || true
+            cp "/tmp/bs${bs}.jsonl" "${OUT}/bs${bs}/result.jsonl" || true
+            cp "/tmp/bs${bs}.log"   "${OUT}/bs${bs}/bench.log"   || true
+          done
+
+          cp "${SLOG}" "${OUT}/server-decode-w0.log" || true
+          cp "${RLOG}" "${OUT}/router.log" || true
+          # Extract the issue-323 signal into its own file for quick comparison.
+          grep -h "PD-DECODE-LOOP-PROFILE" "${SLOG}" > "${OUT}/loop-profile.log" || true
+          grep -h "PD-TIME-STATS" "${SLOG}" > "${OUT}/time-stats-decode.log" || true
+
+          mkdir -p "$(dirname "${DONE_FLAG}")"
+          date -u +%FT%TZ > "${DONE_FLAG}"
+          echo "$(ts) sweep complete -> ${OUT}"
+          kill "${SRV}" 2>/dev/null || true
+        env:
+        - name: JOB_COMPLETION_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+        - name: TPU_WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['batch.kubernetes.io/job-completion-index']
+        - name: TPU_WORKER_HOSTNAMES
+          value: "mimo-d-0.mimo-d-svc,mimo-d-1.mimo-d-svc,mimo-d-2.mimo-d-svc,mimo-d-3.mimo-d-svc"
+        - name: TPU_PROCESS_ADDRESSES
+          value: "mimo-d-0.mimo-d-svc:8471,mimo-d-1.mimo-d-svc:8471,mimo-d-2.mimo-d-svc:8471,mimo-d-3.mimo-d-svc:8471"
+        - name: TPU_PROCESS_PORT
+          value: "8471"
+        - name: BRANCH
+          value: "perf/issue-323-scheduler-overlap"
+        - name: RUN_TAG
+          value: "baseline"
+        - name: LOOP_PROFILE_SECONDS
+          value: "10"
+        ports:
+        - containerPort: 10000
+          name: http
+        - containerPort: 30000
+          name: router
+        - containerPort: 5000
+          name: dist-init
+        resources:
+          requests:
+            google.com/tpu: "4"
+          limits:
+            google.com/tpu: "4"
+        volumeMounts:
+        - mountPath: /gcs-model
+          name: model
+          readOnly: true
+        - mountPath: /gcs-out
+          name: out
+        - mountPath: /dev/shm
+          name: dev-shm
+      volumes:
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+      - name: model
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          readOnly: true
+          volumeAttributes:
+            bucketName: 0-mimo-25
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:-1,file-cache:enable-parallel-downloads:true"
+      - name: out
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: 0-mimo-25
+            mountOptions: "implicit-dirs"
