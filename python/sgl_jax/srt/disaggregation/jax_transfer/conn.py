@@ -1215,6 +1215,14 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     spec,
                     remote_addr=self._metadata.remote_addr,
                 )
+            # Force the pulled buffers to be materialized on-device before the
+            # receiver reports SUCCESS. ``pull`` returns as soon as the transfer
+            # is issued, so without this the decode loop can start reading KV
+            # that has not landed yet and hang waiting on it.
+            for _result in results.values():
+                for leaf in jax.tree.leaves(_result):
+                    if not leaf.is_ready():
+                        leaf.block_until_ready()
         except Exception:
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:

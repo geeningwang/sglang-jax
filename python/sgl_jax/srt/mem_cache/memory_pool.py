@@ -649,6 +649,31 @@ class MHATokenToKVPool(KVCache):
         )
 
 
+class _SWAKVBufferProxy:
+    """Indexable view over :class:`SWAKVPool`'s two sub-pools.
+
+    The PD transfer protocol addresses KV by flat layer id against a single
+    ``kv_buffer``. ``SWAKVPool`` instead holds a full-attention pool and an SWA
+    pool, so this proxy translates a flat layer id to ``(sub-pool, index)`` via
+    ``layers_mapping`` and forwards the read or write.
+    """
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool):
+        self._pool = pool
+
+    def __getitem__(self, layer_id):
+        pool_idx, is_swa = self._pool.layers_mapping[layer_id]
+        sub = self._pool.swa_kv_pool if is_swa else self._pool.full_kv_pool
+        return sub.kv_buffer[pool_idx]
+
+    def __setitem__(self, layer_id, value):
+        pool_idx, is_swa = self._pool.layers_mapping[layer_id]
+        sub = self._pool.swa_kv_pool if is_swa else self._pool.full_kv_pool
+        sub.kv_buffer[pool_idx] = value
+
+
 @register_pytree_node_class
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
@@ -752,6 +777,36 @@ class SWAKVPool(KVCache):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
         return k_size + k_size_swa, v_size + v_size_swa
+
+    # --- PD disaggregation compat ---
+    # The PD transfer path was written against MHATokenToKVPool and reads these
+    # attributes directly. Both sub-pools share a per-layer shape (kv_heads are
+    # replicated to tp-size before pool creation), so delegating to the
+    # full-attention pool is well-defined and every layer can move in one
+    # transfer rather than being split per sub-pool.
+    @property
+    def layer_num(self):
+        return self.swa_layer_nums + self.full_layer_nums
+
+    @property
+    def start_layer(self):
+        return 0
+
+    @property
+    def dtype(self):
+        return self.full_kv_pool.dtype
+
+    @property
+    def kv_sharding(self):
+        return self.full_kv_pool.kv_sharding
+
+    @property
+    def attention_data_partition_axis(self):
+        return self.full_kv_pool.attention_data_partition_axis
+
+    @property
+    def kv_buffer(self):
+        return _SWAKVBufferProxy(self)
 
     def get_kv_buffer(self, layer_id: int):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
