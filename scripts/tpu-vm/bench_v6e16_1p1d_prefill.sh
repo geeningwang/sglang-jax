@@ -9,8 +9,13 @@
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 
+# Branch under test and a tag that keeps runs from overwriting each other.
+# Must match the values used by bench_v6e16_1p1d_decode.sh for the same run.
+BRANCH="${BRANCH:-mimo-tpu7-stage3}"
+RUN_TAG="${RUN_TAG:-default}"
+
 RESULTS_BUCKET="gs://jingnw-mimo-v2-flash-us-central1"
-RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-v6e16-1p1d"
+RESULTS_DIR="${RESULTS_BUCKET}/perf-results/flash-v6e16-1p1d/${RUN_TAG}"
 P_BARRIER_PREFIX="${RESULTS_BUCKET}/v6e16-1p1d-p-barrier"
 BOOTSTRAP_READY_FLAG="${RESULTS_BUCKET}/v6e16-1p1d-bootstrap-ready"
 DONE_FLAG="${RESULTS_BUCKET}/v6e16-1p1d-done"
@@ -33,11 +38,11 @@ echo "$(ts) === [p-w${WORKER_ID}] MiMo-V2-Flash v6e-16 1P1D PREFILL starting ===
 
 # ── 1. Clone + install ────────────────────────────────────────────────
 WORKDIR="/tmp/workspace"
-echo "$(ts) [p-w${WORKER_ID}] Cloning geeningwang/sglang-jax branch mimo-tpu7-stage3..."
+echo "$(ts) [p-w${WORKER_ID}] Cloning geeningwang/sglang-jax branch ${BRANCH}..."
 rm -rf "${WORKDIR}"
 git clone https://github.com/geeningwang/sglang-jax.git "${WORKDIR}" 2>&1 | tail -3
 cd "${WORKDIR}"
-git checkout mimo-tpu7-stage3
+git checkout "${BRANCH}"
 echo "$(ts) [p-w${WORKER_ID}] HEAD: $(git rev-parse --short HEAD) — $(git log -1 --pretty=%s)"
 
 echo "$(ts) [p-w${WORKER_ID}] Installing Python 3.12 via Miniconda..."
@@ -147,6 +152,7 @@ python3.12 -m sgl_jax.launch_server \
   --precompile-token-paddings 4096 \
   --disaggregation-mode prefill \
   --disaggregation-bootstrap-url "http://${PREFILL_W0_IP}:${BOOTSTRAP_PORT}" \
+  --enable-request-time-stats-logging \
   >> "${SLOG}" 2>&1 &
 SRV_PID=$!
 echo "$(ts) [p-w${WORKER_ID}] Prefill server launched (PID=${SRV_PID})"

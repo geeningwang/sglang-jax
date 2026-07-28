@@ -92,7 +92,7 @@ The scripts use GCS for inter-VM coordination and result storage:
 | `gs://<bucket>/v6e16-1p1d-d-barrier-w{0..3}` | 4-worker readiness barrier for decode VM |
 | `gs://<bucket>/v6e16-1p1d-bootstrap-ready` | Signal from prefill worker 0 → decode: bootstrap is up |
 | `gs://<bucket>/v6e16-1p1d-done` | Signal from decode worker 0 → prefill: benchmark complete |
-| `gs://<bucket>/perf-results/flash-v6e16-1p1d/` | Benchmark output (persistent) |
+| `gs://<bucket>/perf-results/flash-v6e16-1p1d/<RUN_TAG>/` | Benchmark output (persistent, one subdir per run — see Step 2b) |
 | `gs://<bucket>/jax-compilation-cache/` | XLA compilation cache (shared with NonPD run) |
 
 ### 1.5 Script configuration
@@ -146,27 +146,70 @@ gsutil -m rm -f \
   gs://jingnw-mimo-v2-flash-us-central1/v6e16-1p1d-done
 ```
 
+### Step 2b — Choose the branch, run tag, and profiling level
+
+Both scripts read three environment variables, each with a default that reproduces the
+historical behaviour:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BRANCH` | `mimo-tpu7-stage3` | Branch of `geeningwang/sglang-jax` checked out on all 8 workers |
+| `RUN_TAG` | `default` | Result subdirectory — `perf-results/flash-v6e16-1p1d/<RUN_TAG>/` |
+| `LOOP_PROFILE_SECONDS` | `10` | Decode only: seconds between `PD-DECODE-LOOP-PROFILE` lines; `0` disables |
+
+**`RUN_TAG` must be set for any comparison run.** Results previously landed in one fixed
+directory, so a second run silently overwrote the first — fatal for before/after work. Use
+the same `RUN_TAG` on both VMs for a given run, and a different one for each run you want to
+keep (e.g. `323-baseline` then `323-after`).
+
+The GCS coordination flags (barriers, `bootstrap-ready`, `done`) are deliberately **not**
+tagged — they are per-run state, cleared by Step 2, not artefacts.
+
+Both servers now also run with `--enable-request-time-stats-logging`, which emits the
+per-request `PD-TIME-STATS` phase breakdown into the server logs.
+
 ### Step 3 — Create launcher scripts
 
+The launchers pass `BRANCH` / `RUN_TAG` / `LOOP_PROFILE_SECONDS` through to the bench
+scripts. `gcloud ... ssh --command` does not forward the local environment, so the values
+are baked into the launcher at creation time by the outer heredoc — note the **unquoted**
+`EOF`, which is what makes `${BRANCH}` expand here rather than on the VM.
+
 ```bash
-cat > /tmp/p_launcher.sh << 'EOF'
+# Set these before generating the launchers; they are frozen into the uploaded files.
+BRANCH="${BRANCH:-mimo-tpu7-stage3}"
+RUN_TAG="${RUN_TAG:-default}"
+LOOP_PROFILE_SECONDS="${LOOP_PROFILE_SECONDS:-10}"
+
+cat > /tmp/p_launcher.sh << EOF
 #!/bin/bash
+export BRANCH="${BRANCH}"
+export RUN_TAG="${RUN_TAG}"
 gsutil cp gs://jingnw-mimo-v2-flash-us-central1/scripts/bench_v6e16_1p1d_prefill.sh /tmp/bench_prefill.sh
-WID=$(grep "^WORKER_ID:" /tmp/tpu-env | awk -F"'" '{print $2}')
-nohup bash /tmp/bench_prefill.sh > /tmp/bench_p_w${WID}.log 2>&1 &
-echo "prefill-w${WID} started PID=$! at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+WID=\$(grep "^WORKER_ID:" /tmp/tpu-env | awk -F"'" '{print \$2}')
+nohup bash /tmp/bench_prefill.sh > /tmp/bench_p_w\${WID}.log 2>&1 &
+echo "prefill-w\${WID} started PID=\$! at \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
 
-cat > /tmp/d_launcher.sh << 'EOF'
+cat > /tmp/d_launcher.sh << EOF
 #!/bin/bash
+export BRANCH="${BRANCH}"
+export RUN_TAG="${RUN_TAG}"
+export LOOP_PROFILE_SECONDS="${LOOP_PROFILE_SECONDS}"
 gsutil cp gs://jingnw-mimo-v2-flash-us-central1/scripts/bench_v6e16_1p1d_decode.sh /tmp/bench_decode.sh
-WID=$(grep "^WORKER_ID:" /tmp/tpu-env | awk -F"'" '{print $2}')
-nohup bash /tmp/bench_decode.sh > /tmp/bench_d_w${WID}.log 2>&1 &
-echo "decode-w${WID} started PID=$! at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+WID=\$(grep "^WORKER_ID:" /tmp/tpu-env | awk -F"'" '{print \$2}')
+nohup bash /tmp/bench_decode.sh > /tmp/bench_d_w\${WID}.log 2>&1 &
+echo "decode-w\${WID} started PID=\$! at \$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
 
 gsutil cp /tmp/p_launcher.sh gs://jingnw-mimo-v2-flash-us-central1/scripts/p_launcher.sh
 gsutil cp /tmp/d_launcher.sh gs://jingnw-mimo-v2-flash-us-central1/scripts/d_launcher.sh
+```
+
+Sanity-check before launching — the uploaded launchers must show the branch you intend:
+
+```bash
+grep -H 'export ' /tmp/p_launcher.sh /tmp/d_launcher.sh
 ```
 
 ### Step 4 — Launch on both VMs simultaneously
@@ -229,7 +272,17 @@ gcloud compute tpus tpu-vm ssh jingnw-node2 --zone=us-east5-b --worker=0 \
 Check GCS for completed result files:
 
 ```bash
-gsutil ls gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-1p1d/
+gsutil ls -r "gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-1p1d/${RUN_TAG}/"
+```
+
+Pull the decode-loop segment profile and the per-request phase breakdown out of the
+decode server log once the run finishes:
+
+```bash
+gsutil cat "gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-1p1d/${RUN_TAG}/server-decode-w0.log" \
+  | grep -E 'PD-DECODE-LOOP-PROFILE|PD-DECODE-WATCHDOG' | tail -50
+gsutil cat "gs://jingnw-mimo-v2-flash-us-central1/perf-results/flash-v6e16-1p1d/${RUN_TAG}/server-decode-w0.log" \
+  | grep 'PD-TIME-STATS' | tail -50
 ```
 
 ---
@@ -245,7 +298,7 @@ the rank is local to each VM, not global.
 
 Each of the 8 workers independently:
 
-1. Clones `geeningwang/sglang-jax` branch `mimo-tpu7-stage3` into `/tmp/workspace`
+1. Clones `geeningwang/sglang-jax` branch `${BRANCH}` into `/tmp/workspace`
 2. Runs `sudo apt-get update && sudo apt-get install -y nfs-common`
 3. Installs Miniconda (if not cached in `/tmp/miniconda3`)
 4. Installs `sglang-jax` and dependencies via `uv pip install --system -e "python[all]"`
