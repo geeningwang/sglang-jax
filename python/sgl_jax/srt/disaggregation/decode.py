@@ -239,8 +239,9 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 continue
 
-            wd.beat("process_decode_queue")
-            self.process_decode_queue()
+            wd.beat("admit_prealloc")
+            self._admit_decode_prealloc()
+            self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
 
             wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
@@ -284,7 +285,7 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             # Drain the forward thread BEFORE any SPMD collective so that
-            # process_allgather in process_decode_queue never races with
+            # process_allgather in _reap_completed_transfers never races with
             # jit_jitted_sampler on the forward thread.
             if self.last_batch:
                 wd.beat("process_batch_result")
@@ -292,8 +293,9 @@ class SchedulerDisaggregationDecodeMixin:
                 tmp_batch.next_batch_sampling_info = None
                 self.process_batch_result(tmp_batch, tmp_result, None)
 
-            wd.beat("process_decode_queue")
-            self.process_decode_queue()
+            wd.beat("admit_prealloc")
+            self._admit_decode_prealloc()
+            self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
 
             wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
@@ -487,11 +489,37 @@ class SchedulerDisaggregationDecodeMixin:
         return out
 
     def process_decode_queue(self: Scheduler) -> None:
-        """Drive prealloc -> transfer -> ready transitions."""
+        """Drive prealloc -> transfer -> ready transitions.
+
+        A thin wrapper over two halves that differ in a way the event loop
+        cares about: :meth:`_admit_decode_prealloc` is collective-free, while
+        :meth:`_reap_completed_transfers` runs cross-host SPMD collectives
+        and may only execute while the forward thread is drained. Callers
+        that overlap host work with the forward pass should invoke the two
+        halves separately rather than going through this wrapper.
+        """
 
         self._admit_decode_prealloc()
+        self._reap_completed_transfers()
 
-        for entry in self._drain_transfer_queue_synced():
+    def _reap_completed_transfers(self: Scheduler) -> None:
+        """Install KV for completed transfers and enqueue them for decode.
+
+        **Runs cross-host collectives.** :meth:`_drain_transfer_queue_synced`
+        allgathers per-NP terminal state and :meth:`_write_kv_to_pool`
+        scatters through a cross-host jit. The caller must guarantee the
+        forward thread is idle: a collective running concurrently there
+        desyncs SPMD program order across hosts (E0200).
+        """
+
+        wd = getattr(self, "disagg_decode_watchdog", None)
+        if wd is not None:
+            wd.beat("reap_allgather")
+        drained = self._drain_transfer_queue_synced()
+        if wd is not None:
+            wd.beat("reap_writeback")
+
+        for entry in drained:
             assert entry.receiver is not None
             state = entry.synced_state
             if state is None:
@@ -899,7 +927,8 @@ class SchedulerDisaggregationDecodeMixin:
         entry.receiver = receiver
         entry.started = True
         # raiden lands the KV straight into D's device pool blocks, so the
-        # post-transfer Pallas write-back is skipped (see process_decode_queue).
+        # post-transfer Pallas write-back is skipped (see
+        # _reap_completed_transfers).
         # Set the decode bookkeeping (prefix_indices / fill_ids) now so the req
         # is ready to enqueue on SUCCESS.
         self._raiden_set_decode_bookkeeping(req, kv_indices)

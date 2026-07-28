@@ -262,6 +262,9 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         scheduler.disagg_transfer_queue = DecodeTransferQueue()
         scheduler.disagg_decode_watchdog = EventLoopWatchdog(
             stall_threshold_s=server_args.disaggregation_decode_watchdog_seconds,
+            profile_interval_s=getattr(
+                server_args, "disaggregation_decode_loop_profile_seconds", 0.0
+            ),
             snapshot_provider=scheduler._decode_backlog_snapshot,
         )
 

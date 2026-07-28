@@ -266,6 +266,12 @@ class ServerArgs:
     # single loop tick exceeds this many seconds. 0 disables it. Opt-in
     # for stress runs; off by default in production.
     disaggregation_decode_watchdog_seconds: float = 0.0
+    # Diagnostic: if > 0, the decode event loop logs a per-phase segment
+    # cost breakdown (PD-DECODE-LOOP-PROFILE) every this many seconds.
+    # Answers "where does a decode tick actually go" -- specifically how
+    # much of it is serialized behind the forward-thread drain. 0 disables
+    # it. Independent of the stall watchdog above.
+    disaggregation_decode_loop_profile_seconds: float = 0.0
     # Decode-side admission headroom: per in-flight/running request, this
     # many KV tokens are held back when admitting a queued PD request, so a
     # running decode step can always alloc its next token even when every
@@ -1455,6 +1461,16 @@ class ServerArgs:
             "event-loop phase + backlog snapshot + main-thread "
             "traceback when one loop tick exceeds this many seconds. "
             "0 disables it (default). Opt-in for stress debugging.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-loop-profile-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_decode_loop_profile_seconds,
+            help="Diagnostic: if > 0, log a per-phase segment cost breakdown "
+            "of the decode event loop (PD-DECODE-LOOP-PROFILE) every this "
+            "many seconds, showing how much of a tick is serialized behind "
+            "the forward-thread drain. 0 disables it (default). Independent "
+            "of --disaggregation-decode-watchdog-seconds.",
         )
         parser.add_argument(
             "--disaggregation-num-reserved-decode-tokens",
