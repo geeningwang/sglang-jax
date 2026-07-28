@@ -43,6 +43,42 @@ def _req_dp_rank(req) -> int:
     return int(getattr(req, "dp_rank", 0) or 0)
 
 
+def _iter_batch_reqs(batch):
+    """Yield the individual reqs held by a ScheduleBatch (DP-aware)."""
+    if batch is None:
+        return
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        yield from getattr(batch, "reqs", ()) or ()
+        return
+    for info in reqs_info:
+        yield from info.reqs or ()
+
+
+def _remaining_output_tokens(req) -> int:
+    """Worst-case tokens ``req`` may still generate."""
+    sampling_params = getattr(req, "sampling_params", None)
+    max_new = (
+        int(getattr(sampling_params, "max_new_tokens", 0) or 0)
+        if sampling_params is not None
+        else 0
+    )
+    return max(0, max_new - len(getattr(req, "output_ids", ()) or ()))
+
+
+def _decode_out_reserve(req, page_size: int, floor: int) -> int:
+    """Page-aligned decode-time KV headroom to hold back for one live req.
+
+    Its worst-case remaining output, floored at ``floor`` tokens. With the
+    default ``floor`` of 512 against a 256-token page this equals ``floor``
+    for any req generating 512 tokens or fewer, so short-output workloads
+    reserve exactly what the flat per-req budget used to reserve.
+    """
+    return (
+        (max(_remaining_output_tokens(req), floor) + page_size - 1) // page_size
+    ) * page_size
+
+
 def _raiden_endpoint_for_dp(
     *,
     p_host: str,
@@ -694,9 +730,27 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
-        n_running = _batch_req_count(self.running_batch)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
+
+        # Hold back the worst-case remaining output of everything already
+        # committed, so a running or mid-transfer req can always alloc its next
+        # token. A flat per-req reserve understates this once a req generates
+        # more than the floor, which let the pool saturate mid-generation and
+        # deadlocked the multi-host decode loop at long output lengths.
+        #
+        # Derived from max_new_tokens and output_ids, both replicated across
+        # processes, so every host computes the same budget and admission stays
+        # in lockstep -- it must, or the hosts disagree on which reqs exist and
+        # the next collective desyncs.
+        base_reserved = 0
+        for req in _iter_batch_reqs(self.running_batch):
+            base_reserved += _decode_out_reserve(req, page_size, reserved_per)
+        with self.disagg_transfer_queue._lock:
+            transferring = [e.req for e in self.disagg_transfer_queue._entries.values()]
+        for req in transferring:
+            base_reserved += _decode_out_reserve(req, page_size, reserved_per)
+        admitted_out_reserved = 0
 
         for entry in self.disagg_prealloc_queue.items_fifo():
             dp_rank = _req_dp_rank(entry.req)
@@ -710,8 +764,12 @@ class SchedulerDisaggregationDecodeMixin:
                 break
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-            reserved = reserved_per * (n_running + n_transfer + admitted)
-            if page_aligned + reserved > allocator.available_size(dp_rank=dp_rank):
+            # Gate on this req's whole lifetime footprint: the prompt it
+            # allocates now, its own worst-case output, and the reserve already
+            # owed to committed reqs and to reqs admitted earlier this tick.
+            this_out = _decode_out_reserve(entry.req, page_size, reserved_per)
+            need = page_aligned + this_out + base_reserved + admitted_out_reserved
+            if need > allocator.available_size(dp_rank=dp_rank):
                 # Insufficient capacity: defer this and all later (FIFO) reqs.
                 break
 
@@ -734,6 +792,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # helper; move on.
                     continue
                 admitted += 1
+                admitted_out_reserved += this_out
                 continue
 
             try:
@@ -771,6 +830,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
             admitted += 1
+            admitted_out_reserved += this_out
 
     def _admit_one_raiden(self: Scheduler, entry, kv_indices, page_size: int):
         """raiden admission for a single prealloc entry.
