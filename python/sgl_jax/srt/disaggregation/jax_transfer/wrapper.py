@@ -565,6 +565,26 @@ class RaidenTransferWrapper:
             failed_r_any = sorted(self._failed_recving_full | self._failed_recving_swa)
         return done_s_both, done_r_both, failed_r_any
 
+    def pre_connect(self, remote_endpoint: Any) -> bool:
+        """Pre-warm a TCP connection to a remote raiden endpoint.
+
+        Requires tpu-raiden fork with ``KVCacheManager.pre_connect()`` support.
+        Falls back to a no-op if the method is unavailable.
+        """
+
+        if not self._started:
+            return False
+        engine = self._engine_full or self._engine
+        fn = getattr(engine, "pre_connect", None)
+        if fn is None:
+            return False
+        try:
+            fn(remote_endpoint)
+            return True
+        except Exception:
+            logger.debug("pre_connect failed for %s", remote_endpoint, exc_info=True)
+            return False
+
 
 def get_or_create_raiden_wrapper(
     host_ip: str,

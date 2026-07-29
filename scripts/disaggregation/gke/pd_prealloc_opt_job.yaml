@@ -1,0 +1,345 @@
+# PD prealloc overhead profiling job on GKE.
+# DeepSeek-R1-Distill-Qwen-1.5B, TP=1 per role on a6e-wangez (single chip/host).
+# Pod 0 runs bootstrap + prefill; pod 1 runs decode + router + driver.
+# Driver runs GSM8K (correctness) then serial TTFT sweep + multi-concurrency
+# sweep for prealloc overhead profiling.
+# Rendered by deploy_prealloc_opt.sh, which injects <JOB_NAME>/<SSH_KEY_B64>/<GH_ORG>/<BRANCH>.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <JOB_NAME>-headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: <JOB_NAME>
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <JOB_NAME>
+spec:
+  completionMode: Indexed
+  parallelism: 2
+  completions: 2
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      subdomain: <JOB_NAME>-headless-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: tpu-nodepool-wangez
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      serviceAccountName: gcs-account
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        securityContext:
+          privileged: true
+        env:
+        - name: P_HOST
+          value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: BRANCH
+          value: "<BRANCH>"
+        - name: CAP
+          value: "8"
+        - name: CONCURRENCY
+          value: "64"
+        - name: NUM_PROMPTS
+          value: "64"
+        - name: INPUT_LEN
+          value: "4096"
+        - name: OUTPUT_LEN
+          value: "1024"
+        - name: GSM_Q
+          value: "200"
+        - name: GSM_PAR
+          value: "16"
+        - name: GSM_MAXTOK
+          value: "512"
+        - name: TTFT_INPUTS
+          value: "512 1024 2048 4096"
+        - name: TTFT_CONCURRENCIES
+          value: "1 4 16 32"
+        - name: SGLANG_JAX_USE_RAIDEN
+          value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "0"
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          pip install -U --pre jax jaxlib libtpu requests aiohttp tqdm numpy py-spy \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          mkdir -p ~/.ssh
+          echo "<SSH_KEY_B64>" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          apt-get update && apt-get install -y iproute2 tmux vim build-essential
+
+          export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
+          export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
+          export TMPDIR="/tmp/tpu_logs"
+          mkdir -p "$TMPDIR"
+          pip install uv && uv venv /tmp/tpu_logs/venv && source /tmp/tpu_logs/venv/bin/activate
+          uv pip install pip py-spy
+          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch "${BRANCH}"
+          cd sglang-jax && uv pip install -e python[all] && uv pip install datasets
+
+          # Download model if not present in GCS bucket
+          if [ ! -d "${MODEL_PATH}" ]; then
+            echo "=== Model not found at ${MODEL_PATH}, downloading from HuggingFace ==="
+            uv pip install huggingface_hub[cli]
+            python -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B',
+              local_dir='${MODEL_PATH}',
+              local_dir_use_symlinks=False,
+          )
+          print('Model downloaded successfully')
+          "
+          fi
+
+          echo "=== Installing tpu-raiden (JAX data plane) ==="
+          RAIDEN_OK=0
+          RAIDEN_CACHE="/models/raiden/tpu-raiden-jax-0.10.2.tgz"
+          # Option A: /models cache hit (fast path, ~1-2min).
+          if [ -f "$RAIDEN_CACHE" ]; then
+            echo "raiden cache found at $RAIDEN_CACHE; extracting"
+            mkdir -p /tmp/tpu-raiden
+            if tar xzf "$RAIDEN_CACHE" -C /tmp && \
+               uv pip install -r /tmp/tpu-raiden/requirements.txt >/dev/null 2>&1; then
+              export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+              python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null && \
+                RAIDEN_OK=1 && echo "tpu-raiden loaded from /models cache"
+            fi
+            [ "$RAIDEN_OK" = "1" ] || echo "cache present but unusable; falling back to build"
+          fi
+          # Option B: prebuilt GAR wheel.
+          if [ "$RAIDEN_OK" != "1" ]; then
+            if pip install keyrings.google-artifactregistry-auth >/dev/null 2>&1 && \
+               uv pip install tpu-raiden-jax \
+                 --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/ >/dev/null 2>&1 && \
+               python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null; then
+              RAIDEN_OK=1
+              echo "tpu-raiden installed from GAR wheel"
+            fi
+          fi
+          # Option C: build from source with Bazel.
+          if [ "$RAIDEN_OK" != "1" ]; then
+            echo "cache/wheel unavailable; building tpu-raiden from source"
+            git clone --depth 1 https://github.com/DigitalWNZ/tpu-raiden.git /tmp/tpu-raiden
+            ( cd /tmp/tpu-raiden && \
+              BAZEL_OUTPUT_BASE=/tmp/tpu_logs/raiden_bazel_out \
+              BAZEL_CACHE_DIR=/tmp/tpu_logs/raiden_bazel_cache \
+              HERMETIC_PYTHON_VERSION=3.12 ./build.sh jax )
+            export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+            if python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax"; then
+              RAIDEN_OK=1
+              echo "saving raiden build to $RAIDEN_CACHE (best-effort)"
+              mkdir -p /models/raiden
+              TMP_TGZ="/models/raiden/.build-${JOB_COMPLETION_INDEX:-0}.tgz"
+              tar czf "$TMP_TGZ" -C /tmp \
+                --exclude='tpu-raiden/bazel-*' --exclude='tpu-raiden/.git' tpu-raiden \
+                && mv -f "$TMP_TGZ" "$RAIDEN_CACHE" \
+                && echo "raiden build cached to /models" \
+                || echo "WARN: failed to write raiden cache (non-fatal)"
+            fi
+          fi
+          [ "$RAIDEN_OK" = "1" ] || { echo "FATAL: tpu-raiden not importable"; exit 1; }
+          echo "tpu-raiden ready (PYTHONPATH=${PYTHONPATH:-<site-packages>})"
+
+          INDEX=${JOB_COMPLETION_INDEX}
+          echo "=== Pod index: $INDEX BRANCH=${BRANCH} (single-host PD, DeepSeek-1.5B TP=1) ==="
+
+          if [ "$INDEX" = "0" ]; then
+            python -m sgl_jax.srt.disaggregation.run_bootstrap \
+              --host 0.0.0.0 --port 8998 &
+            sleep 3
+
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10000 \
+              --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              --chunked-prefill-size 16384 \
+              --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
+              --enable-metrics \
+              2>&1 | tee /tmp/prefill_server.log &
+
+            echo "Waiting for prefill server to be ready..."
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10000/health && break
+              sleep 2
+            done
+            echo "Prefill ready. Staying up (bounded) for the whole bench..."
+            sleep 7200
+            echo "pod0 bounded sleep done, exiting to free node."
+
+          else
+            echo "Waiting for bootstrap at ${P_HOST}:8998..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:8998/health" && break
+              sleep 2
+            done
+            echo "Waiting for prefill at ${P_HOST}:10000..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:10000/health" && break
+              sleep 2
+            done
+
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10001 \
+              --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              --chunked-prefill-size 16384 \
+              --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
+              --disaggregation-max-inflight-transfers ${CAP} \
+              --mem-fraction-static 0.80 \
+              --enable-metrics \
+              2>&1 | tee /tmp/decode_server.log &
+
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10001/health && break
+              sleep 2
+            done
+
+            python -m sgl_jax.srt.disaggregation.launch_router \
+              --pd-disaggregation --mini-lb \
+              --prefill "http://${P_HOST}:10000" 8998 \
+              --decode http://localhost:10001 \
+              --prefill-bootstrap-host "${P_HOST}" \
+              --max-concurrent-requests 64 \
+              --host 0.0.0.0 --port 30000 \
+              2>&1 | tee /tmp/router.log &
+
+            for i in $(seq 1 60); do
+              curl -sf http://localhost:30000/health && break
+              sleep 2
+            done
+
+            echo "=========================================="
+            echo "GSM8K (PRIMARY correctness) BRANCH=${BRANCH} q=${GSM_Q} par=${GSM_PAR} maxtok=${GSM_MAXTOK}"
+            echo "=========================================="
+            set +e
+            timeout 1800 python benchmark/gsm8k/bench_sglang_jax.py \
+              --base-url http://localhost:30000 \
+              --num-questions ${GSM_Q} \
+              --num-shots 5 \
+              --max-new-tokens ${GSM_MAXTOK} \
+              --parallel ${GSM_PAR} \
+              --result-file /tmp/gsm8k_result.jsonl \
+              --output-file /tmp/gsm8k_outputs.txt
+            GSM_RC=$?
+            set -e
+            echo "--- GSM8K summary (BRANCH=${BRANCH}) ---"
+            cat /tmp/gsm8k_result.jsonl 2>/dev/null || echo "(no gsm8k result, rc=${GSM_RC})"
+
+            echo "=========================================="
+            echo "TTFT sweep: inputs=${TTFT_INPUTS} concurrencies=${TTFT_CONCURRENCIES}"
+            echo "Profiling prealloc overhead sub-phases"
+            echo "=========================================="
+            set +e
+            for C in ${TTFT_CONCURRENCIES}; do
+              for L in ${TTFT_INPUTS}; do
+                NP=$((3 + 10))
+                if [ "$C" -gt 1 ]; then NP=$((3 + 20)); fi
+                echo "--- TTFT input_len=${L} conc=${C} (warmup=3 measure, np=${NP}) ---"
+                timeout 900 python -m sgl_jax.bench_serving \
+                  --backend sgl-jax \
+                  --base-url http://localhost:30000 \
+                  --model "$MODEL_PATH" \
+                  --dataset-name random \
+                  --random-input-len ${L} \
+                  --random-output-len 1 \
+                  --random-range-ratio 1.0 \
+                  --num-prompts ${NP} \
+                  --max-concurrency ${C} \
+                  --warmup-requests 3 \
+                  --output-file /tmp/ttft_c${C}_${L}.jsonl
+                echo "--- ttft result input_len=${L} conc=${C} (BRANCH=${BRANCH}) ---"
+                cat /tmp/ttft_c${C}_${L}.jsonl 2>/dev/null || echo "(no result)"
+              done
+            done
+            set -e
+
+            echo "=========================================="
+            echo "PD-TIME-STATS (all decode entries)"
+            echo "=========================================="
+            grep -E "PD-TIME-STATS" /tmp/decode_server.log 2>/dev/null | tee /tmp/pd_time_stats.log || echo "(no PD-TIME-STATS)"
+
+            echo "=========================================="
+            echo "PD-TIME-STATS (all prefill entries)"
+            echo "=========================================="
+            grep -E "PD-TIME-STATS" /tmp/prefill_server.log 2>/dev/null || echo "(no prefill PD-TIME-STATS)"
+
+            echo "=========================================="
+            echo "Running prealloc profiling aggregation"
+            echo "=========================================="
+            python scripts/disaggregation/profile_prealloc.py \
+              --log-file /tmp/pd_time_stats.log \
+              --output-json /tmp/prealloc_profile.json \
+              2>&1 || echo "(profiling script failed or not found)"
+            cat /tmp/prealloc_profile.json 2>/dev/null || echo "(no profile output)"
+
+            echo "=========================================="
+            echo "OOM/abort markers (decode): "
+            grep -cE "RESOURCE_EXHAUSTED|failed to extract KV|aborting|Traceback" /tmp/decode_server.log || echo "(decode: none)"
+            echo "OOM/abort markers (prefill): "
+            grep -cE "RESOURCE_EXHAUSTED|failed to extract KV|aborting|Traceback" /tmp/prefill_server.log || echo "(prefill: none)"
+
+            echo "=========================================="
+            echo "Driver done. Sleeping (bounded) so logs can be pulled."
+            echo "=========================================="
+            sleep 3600
+          fi
+        resources:
+          requests:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+          limits:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: 0-wangez
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:512,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:5120,file-cache:cache-file-for-range-read:true,file-system:kernel-list-cache-ttl-secs:-1,file-cache:enable-parallel-downloads:true,file-cache:parallel-downloads-per-file:32"
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi

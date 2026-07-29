@@ -215,6 +215,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             if batch:
                 batch_reqs = _batch_reqs(batch)
+                if self.disagg_kv_manager.use_raiden:
+                    self._raiden_pre_publish_batch(batch_reqs)
                 for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
@@ -266,6 +268,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             if batch:
                 batch_reqs = _batch_reqs(batch)
+                if self.disagg_kv_manager.use_raiden:
+                    self._raiden_pre_publish_batch(batch_reqs)
                 for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
@@ -596,6 +600,59 @@ class SchedulerDisaggregationPrefillMixin:
 
         local_swa_page_ids = sorted(set(swa_page_ids))
         return local_swa_page_ids
+
+    def _raiden_pre_publish_batch(self: Scheduler, batch_reqs: list[Req]) -> None:
+        """Pre-publish block metadata for PD requests before the forward pass.
+
+        Decode can discover metadata and begin local setup (KV page alloc,
+        receiver init) while prefill is still computing the forward pass.
+        The actual raiden register_read + raiden_ready=True confirmation
+        happens later in _raiden_handoff_chunk after forward completes.
+        """
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+
+        for req in batch_reqs:
+            if req.bootstrap_room is None:
+                continue
+            req_id = req.rid
+            chunk_index = getattr(req, "_pd_chunk_index", 0)
+            sender = getattr(req, "_pd_sender", None)
+            try:
+                start = len(req.prefix_indices)
+                end = start + req.extend_input_len
+                page_offset = start // page_size
+                block_ids = self._extract_req_block_ids_range(req, start, end)
+                swa_block_ids = self._extract_swa_block_ids_for_chunk(
+                    req,
+                    start,
+                    end,
+                    page_size,
+                    getattr(self, "sliding_window_size", None) or 0,
+                )
+                if sender is None:
+                    sender = self.disagg_kv_manager.create_sender(req_id)
+                    sender.init(
+                        kv_indices=None,
+                        transfer_id=req.disagg_transfer_id or req_id,
+                    )
+                    req._pd_sender = sender
+                sender.pre_publish_chunk(
+                    chunk_index,
+                    block_ids,
+                    bootstrap_room=req.bootstrap_room,
+                    chunk_page_offset=page_offset,
+                    swa_block_ids=swa_block_ids or None,
+                )
+            except Exception:
+                logger.debug(
+                    "raiden pre-publish failed for req_id=%s chunk=%s; "
+                    "will fall back to normal publish path",
+                    req_id,
+                    chunk_index,
+                    exc_info=True,
+                )
 
     def _raiden_handoff_chunk(self: Scheduler, req: Req, req_id: str, *, is_final: bool) -> None:
         """raiden per-chunk handoff: publish THIS chunk's device page subset to D

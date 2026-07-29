@@ -446,8 +446,49 @@ class JaxTransferKVManager(CommonKVManager):
                     if endpoints_swa is not None
                     else ""
                 ),
+                raiden_ready=True,
             )
         return needed
+
+    def producer_pre_publish(
+        self,
+        uuid: str,
+        block_ids: list[int],
+        *,
+        bootstrap_room: int | None = None,
+        transfer_id: str | None = None,
+        chunk_index: int = 0,
+        chunk_page_offset: int = 0,
+        swa_block_ids: list[int] | None = None,
+    ) -> None:
+        """Pre-publish block metadata to bootstrap with raiden_ready=False.
+
+        Called BEFORE the forward pass so D can discover metadata and start
+        local setup (KV page alloc, page mapping) while P is still computing.
+        Does NOT call raiden's register_read — the blocks are not readable yet.
+        """
+
+        if self._bootstrap_client is None or bootstrap_room is None:
+            return
+
+        import json as _json
+
+        endpoints = self._raiden_wrapper.endpoints if self._raiden_wrapper else None
+        endpoints_swa = self._raiden_wrapper.endpoints_swa if self._raiden_wrapper else None
+        self._bootstrap_client.register_transfer(
+            bootstrap_room,
+            transfer_id or uuid,
+            block_ids,
+            raiden_endpoints_json=_json.dumps(endpoints) if endpoints is not None else "",
+            chunk_index=chunk_index,
+            num_chunks=0,
+            chunk_page_offset=chunk_page_offset,
+            swa_block_ids=swa_block_ids or [],
+            swa_raiden_endpoints_json=(
+                _json.dumps(endpoints_swa) if endpoints_swa is not None else ""
+            ),
+            raiden_ready=False,
+        )
 
     # ------------------------------------------------------------------
     # ABC — factory methods
@@ -572,6 +613,33 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 import time as _time
 
                 self._transfer_started_at = _time.monotonic()
+
+    def pre_publish_chunk(
+        self,
+        chunk_index: int,
+        block_ids: list[int],
+        *,
+        bootstrap_room: int | None,
+        chunk_page_offset: int = 0,
+        swa_block_ids: list[int] | None = None,
+    ) -> None:
+        """Pre-publish chunk metadata to bootstrap with raiden_ready=False.
+
+        Called BEFORE the forward pass so D can discover metadata and start
+        local setup while P is computing. Does NOT register with raiden."""
+
+        with self._state_lock:
+            self._bootstrap_room = bootstrap_room
+            cu = f"{self.uuid}#c{chunk_index}"
+            self._mgr.producer_pre_publish(
+                cu,
+                block_ids,
+                bootstrap_room=bootstrap_room,
+                transfer_id=cu,
+                chunk_index=chunk_index,
+                chunk_page_offset=chunk_page_offset,
+                swa_block_ids=swa_block_ids,
+            )
 
     def send(self) -> None:
         if self._use_raiden:
@@ -1047,6 +1115,8 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 if chunk_index in self._started_chunks:
                     continue
             chunk_info = chunks[chunk_index]
+            if not chunk_info.get("raiden_ready", True):
+                continue
             remote_block_ids = [int(b) for b in chunk_info.get("remote_block_ids", ())]
             page_offset = int(chunk_info.get("chunk_page_offset", 0) or 0)
             n = len(remote_block_ids)

@@ -197,6 +197,11 @@ class RegisterTransferRequest(BaseModel):
     # SWA hybrid-attention fields (empty for non-SWA models).
     swa_block_ids: list[int] = []
     swa_raiden_endpoints_json: str = ""
+    # Two-phase publish: P pre-publishes metadata before the forward pass
+    # with raiden_ready=false, then confirms after register_read completes.
+    # D can discover metadata and allocate local pages early, but must wait
+    # for raiden_ready=true before calling start_read.
+    raiden_ready: bool = True
 
 
 class HeartbeatRequest(BaseModel):
@@ -290,7 +295,11 @@ class _Registry:
         with self.lock:
             room = int(info["bootstrap_room"])
             chunk_index = int(info.get("chunk_index", 0) or 0)
-            self.transfers.setdefault(room, {})[chunk_index] = info
+            existing = self.transfers.setdefault(room, {}).get(chunk_index)
+            if existing is not None and info.get("raiden_ready") is True:
+                existing.update(info)
+            else:
+                self.transfers[room][chunk_index] = info
             num_chunks = int(info.get("num_chunks", 0) or 0)
             if num_chunks > 0:
                 self.transfer_num_chunks[room] = num_chunks
@@ -314,6 +323,24 @@ class _Registry:
                 "chunks": dict(chunks),
                 "num_chunks": self.transfer_num_chunks.get(room, 0),
             }
+
+    def batch_get_transfer_chunks(
+        self, rooms: list[int]
+    ) -> dict[int, dict[str, object] | None]:
+        """Batch variant of get_transfer_chunks. Returns {room: info_or_None}."""
+        result: dict[int, dict[str, object] | None] = {}
+        with self.lock:
+            for room in rooms:
+                room = int(room)
+                chunks = self.transfers.get(room)
+                if not chunks:
+                    result[room] = None
+                else:
+                    result[room] = {
+                        "chunks": dict(chunks),
+                        "num_chunks": self.transfer_num_chunks.get(room, 0),
+                    }
+        return result
 
     def pop_room(self, bootstrap_room: int) -> None:
         """Drop all chunk metadata for ``bootstrap_room`` (D calls this on
@@ -417,6 +444,11 @@ def build_app(
                 detail=f"no transfer info for bootstrap_room={bootstrap_room}",
             )
         return info
+
+    @app.post("/batch_get_transfer_info")
+    def batch_get_transfer_info(rooms: list[int]) -> dict[str, object]:
+        results = registry.batch_get_transfer_chunks(rooms)
+        return {str(room): info for room, info in results.items()}
 
     @app.post("/pop_transfer")
     def pop_transfer(bootstrap_room: int) -> dict[str, str]:
@@ -688,6 +720,7 @@ class BootstrapClient:
         chunk_page_offset: int = 0,
         swa_block_ids: list[int] | None = None,
         swa_raiden_endpoints_json: str = "",
+        raiden_ready: bool = True,
     ) -> None:
         """P: publish per-chunk block metadata for raiden pull (keyed by room +
         chunk_index). Best-effort with the shared client timeout; the caller
@@ -695,7 +728,11 @@ class BootstrapClient:
         is set to N only on the final chunk (0 means more chunks coming).
 
         For hybrid SWA models, ``swa_block_ids`` and ``swa_raiden_endpoints_json``
-        carry the SWA-pool counterpart metadata."""
+        carry the SWA-pool counterpart metadata.
+
+        Two-phase publish: call with ``raiden_ready=False`` to pre-publish
+        metadata before the forward pass, then call again with
+        ``raiden_ready=True`` after ``register_read`` completes."""
 
         payload = {
             "bootstrap_room": bootstrap_room,
@@ -708,6 +745,7 @@ class BootstrapClient:
             "chunk_page_offset": chunk_page_offset,
             "swa_block_ids": list(swa_block_ids or []),
             "swa_raiden_endpoints_json": swa_raiden_endpoints_json,
+            "raiden_ready": raiden_ready,
         }
         r = self._client.post(
             f"{self._base_url}/register_transfer",
@@ -737,6 +775,39 @@ class BootstrapClient:
         raw_chunks = body.get("chunks", {}) or {}
         chunks = {int(k): v for k, v in raw_chunks.items()}
         return {"chunks": chunks, "num_chunks": int(body.get("num_chunks", 0) or 0)}
+
+    def batch_get_transfer_info(
+        self, rooms: list[int]
+    ) -> dict[int, dict[str, object] | None]:
+        """D: batch-fetch chunk metadata for multiple rooms in one HTTP call.
+
+        Returns ``{room: info_or_None}``. Rooms without any published chunks
+        are mapped to ``None``. JSON chunk-index keys are normalized back to int.
+        """
+
+        if not rooms:
+            return {}
+        r = self._client.post(
+            f"{self._base_url}/batch_get_transfer_info",
+            json=rooms,
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+        body = r.json()
+        result: dict[int, dict[str, object] | None] = {}
+        for room_str, info in body.items():
+            room = int(room_str)
+            if info is None:
+                result[room] = None
+            else:
+                raw_chunks = info.get("chunks", {}) or {}
+                chunks = {int(k): v for k, v in raw_chunks.items()}
+                result[room] = {
+                    "chunks": chunks,
+                    "num_chunks": int(info.get("num_chunks", 0) or 0),
+                }
+        return result
 
     def pop_transfer(self, bootstrap_room: int) -> None:
         """D: drop the room's chunk metadata once the whole transfer is done

@@ -36,9 +36,9 @@ _PHASE_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "decode": (
         ("bootstrap_start", "bootstrap_done", "bootstrap"),
+        ("prealloc_entry", "kv_alloc_done", "kv_alloc"),
         ("prealloc_entry", "metadata_ready", "metadata_wait"),
-        ("metadata_ready", "kv_alloc_done", "kv_alloc"),
-        ("kv_alloc_done", "receiver_init_done", "receiver_init"),
+        ("metadata_ready", "receiver_init_done", "receiver_init"),
         ("receiver_init_done", "transfer_entry", "transfer_setup"),
         ("prealloc_entry", "transfer_entry", "prealloc_wait"),
         ("transfer_entry", "first_chunk_start_read", "first_chunk_wait"),

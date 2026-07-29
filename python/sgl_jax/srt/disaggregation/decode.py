@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -125,6 +126,9 @@ class DecodeBookkeeping:
     # Prefill-side info from bootstrap, stashed at intake so KV alloc +
     # receiver setup can be deferred to the capacity-gated admission step.
     p_info: dict | None = None
+    # Speculative preallocation: timestamp when KV pages were allocated
+    # (before metadata arrives). Used for TTL-based cleanup.
+    kv_alloc_time: float | None = None
 
 
 class DecodePreallocQueue:
@@ -657,6 +661,12 @@ class SchedulerDisaggregationDecodeMixin:
         (transfer-queue reqs cannot be retracted). KV indices are allocated
         here, not at intake. Reqs that don't fit stay queued and retry next
         tick — deferral, never abort.
+
+        For the raiden path, speculative preallocation persists KV page
+        allocations across deferred ticks: if metadata is not yet available
+        (bootstrap 404), the allocated pages are kept on the entry rather
+        than freed and re-allocated each tick. A TTL guard (5s) prevents
+        leaked pages if metadata never arrives.
         """
 
         allocator = self.token_to_kv_pool_allocator
@@ -669,42 +679,97 @@ class SchedulerDisaggregationDecodeMixin:
         n_running = _batch_req_count(self.running_batch)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
+        use_raiden = getattr(self.disagg_kv_manager, "use_raiden", False)
+        speculative_prealloc_ttl = 5.0
+
+        # Count entries that already hold speculatively allocated pages
+        # so the capacity budget accounts for them.
+        n_speculative = sum(
+            1 for e in self.disagg_prealloc_queue.items_fifo()
+            if e.kv_indices is not None
+        ) if use_raiden else 0
+
+        # Batch-fetch bootstrap metadata for all pending entries in one HTTP
+        # call instead of N sequential GETs.
+        prefetched_metadata: dict[int, dict[str, object] | None] = {}
+        if use_raiden:
+            rooms = [
+                e.req.bootstrap_room
+                for e in self.disagg_prealloc_queue.items_fifo()
+                if e.req.bootstrap_room is not None and not e.started
+            ]
+            if rooms:
+                try:
+                    prefetched_metadata = (
+                        self.disagg_bootstrap_client.batch_get_transfer_info(rooms)
+                    )
+                except Exception:
+                    logger.debug("batch_get_transfer_info failed; falling back to per-entry fetch", exc_info=True)
 
         for entry in self.disagg_prealloc_queue.items_fifo():
             dp_rank = _req_dp_rank(entry.req)
-            # In-flight transfer cap: each admitted transfer holds a pulled KV
-            # destination buffer on decode HBM (untracked by the paged-pool
-            # budget below) until it is scattered. Stop admitting once the cap
-            # is reached so a burst of concurrent requests cannot allocate that
-            # many transient buffers at once and OOM. Excess reqs stay queued
-            # and retry next tick (deferral, never abort).
-            if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
+
+            # TTL guard: free speculatively allocated pages if metadata
+            # has not arrived within the TTL window.
+            if (
+                use_raiden
+                and entry.kv_indices is not None
+                and entry.kv_alloc_time is not None
+                and (time.perf_counter() - entry.kv_alloc_time) > speculative_prealloc_ttl
+            ):
+                logger.warning(
+                    "speculative prealloc TTL expired for req_id=%s "
+                    "(%.1fs without metadata); freeing pages",
+                    entry.req_id,
+                    time.perf_counter() - entry.kv_alloc_time,
+                )
+                self._release_decode_kv_indices(entry.kv_indices, dp_rank=dp_rank)
+                entry.kv_indices = None
+                entry.kv_alloc_time = None
+                n_speculative -= 1
+
+            # Raiden path: if this entry already has speculatively allocated
+            # pages from a previous tick, skip capacity check and allocation
+            # — go straight to the metadata query.
+            if use_raiden and entry.kv_indices is not None:
+                admitted_raiden = self._admit_one_raiden(entry, entry.kv_indices, page_size, prefetched_metadata)
+                if admitted_raiden is None:
+                    # Still no metadata — keep pages, retry next tick.
+                    continue
+                if admitted_raiden is False:
+                    # Setup failed, request aborted inside helper.
+                    continue
+                n_speculative -= 1
+                admitted += 1
+                continue
+
+            # In-flight transfer cap.
+            if max_inflight > 0 and (n_transfer + admitted + n_speculative) >= max_inflight:
                 break
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-            reserved = reserved_per * (n_running + n_transfer + admitted)
+            reserved = reserved_per * (n_running + n_transfer + admitted + n_speculative)
             if page_aligned + reserved > allocator.available_size(dp_rank=dp_rank):
                 # Insufficient capacity: defer this and all later (FIFO) reqs.
                 break
 
             kv_indices = allocator.alloc(page_aligned, dp_rank=dp_rank)
             if kv_indices is None:
-                # Budget check should prevent this; treat a surprise shortfall
-                # as transient and retry next tick rather than abort.
                 break
 
-            if getattr(self.disagg_kv_manager, "use_raiden", False):
-                admitted_raiden = self._admit_one_raiden(entry, kv_indices, page_size)
+            if use_raiden:
+                self._pd_mark_time(entry.req, "kv_alloc_done")
+                entry.kv_indices = kv_indices
+                entry.kv_alloc_time = time.perf_counter()
+                n_speculative += 1
+                admitted_raiden = self._admit_one_raiden(entry, kv_indices, page_size, prefetched_metadata)
                 if admitted_raiden is None:
-                    # P hasn't published this req's block metadata yet (bootstrap
-                    # 404). Free the slot we just allocated and leave the entry in
-                    # the prealloc queue to retry next tick (deferral, not abort).
-                    self._release_decode_kv_indices(kv_indices, dp_rank=dp_rank)
+                    # Metadata not available yet — pages are kept on the entry
+                    # for the next tick (speculative preallocation).
                     continue
                 if admitted_raiden is False:
-                    # Setup failed and the request was already aborted inside the
-                    # helper; move on.
                     continue
+                n_speculative -= 1
                 admitted += 1
                 continue
 
@@ -744,29 +809,40 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_transfer_queue.add(entry)
             admitted += 1
 
-    def _admit_one_raiden(self: Scheduler, entry, kv_indices, page_size: int):
+    def _admit_one_raiden(
+        self: Scheduler,
+        entry,
+        kv_indices,
+        page_size: int,
+        prefetched_metadata: dict[int, dict[str, object] | None] | None = None,
+    ):
         """raiden admission for a single prealloc entry.
 
         Returns:
           * ``True``  -- admitted to the transfer queue.
           * ``None``  -- P's per-request block metadata not yet published
-            (bootstrap 404); caller should defer (free kv_indices, retry).
+            (bootstrap 404); caller should defer. With speculative
+            preallocation, the caller retains kv_indices on the entry
+            rather than freeing them.
           * ``False`` -- setup failed and the request was aborted here.
         """
 
         import numpy as np
 
         req = entry.req
-        try:
-            info = self.disagg_bootstrap_client.get_transfer_info(req.bootstrap_room)
-        except Exception:
-            logger.exception(
-                "raiden get_transfer_info raised for room=%s",
-                req.bootstrap_room,
-            )
-            return None
+        room = req.bootstrap_room
+        if prefetched_metadata and room in prefetched_metadata:
+            info = prefetched_metadata[room]
+        else:
+            try:
+                info = self.disagg_bootstrap_client.get_transfer_info(room)
+            except Exception:
+                logger.exception(
+                    "raiden get_transfer_info raised for room=%s",
+                    room,
+                )
+                return None
         if info is None:
-            # Not published yet -> defer.
             return None
 
         try:
@@ -865,6 +941,14 @@ class SchedulerDisaggregationDecodeMixin:
                         dp_rank=int(getattr(req, "dp_rank", 0) or 0),
                         dp_size=int(getattr(self, "dp_size", 1) or 1),
                     )
+
+            ep_key = (str(p_host), base_port)
+            preconnected = getattr(self, "_raiden_preconnected", None)
+            if preconnected is None:
+                self._raiden_preconnected = preconnected = set()
+            if ep_key not in preconnected:
+                self.disagg_kv_manager.raiden_wrapper.pre_connect(remote_endpoint)
+                preconnected.add(ep_key)
 
             receiver = self.disagg_kv_manager.create_receiver(req.rid)
             receiver.init(

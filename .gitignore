@@ -245,6 +245,7 @@ lmms-eval
 CLAUDE.md
 
 debug_outputs/
+_scratch/
 
 #gemini code
 .gemini-clipboard
