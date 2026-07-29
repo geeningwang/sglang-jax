@@ -38,9 +38,12 @@ spec:
     metadata:
       annotations:
         gke-gcsfuse/volumes: "true"
+        # CPU/memory unlimited: the sidecar defaults throttle a 293 GiB weight load.
         gke-gcsfuse/cpu-limit: "0"
         gke-gcsfuse/memory-limit: "0"
-        gke-gcsfuse/ephemeral-storage-limit: "0"
+        # Ephemeral storage is NOT unlimited. Node allocatable is only ~43 GiB
+        # against a 293 GiB model; an unbounded sidecar evicts the whole pod.
+        gke-gcsfuse/ephemeral-storage-limit: "12Gi"
     spec:
       subdomain: mimo-d-svc
       restartPolicy: Never
@@ -72,8 +75,10 @@ spec:
           # [all] pins jax 0.10.2 + libtpu 0.0.42.1 and installs over the
           # image's jax 0.8.1. This is the pairing the v6e-16 1P1D tpu-vm runs
           # were validated on; the image only supplies the base layer.
-          pip install -e "python[all]"
-          pip install "orbax-checkpoint>=0.12.0" aiohttp
+          # --no-cache-dir: the wheel cache is several GiB of node ephemeral storage
+          # that is never read again, and disk here is the binding constraint.
+          pip install --no-cache-dir -e "python[all]"
+          pip install --no-cache-dir "orbax-checkpoint>=0.12.0" aiohttp
 
           # The bootstrap server must answer before decode can register.
           echo "$(ts) waiting for prefill bootstrap..."
@@ -104,7 +109,7 @@ spec:
             --chunked-prefill-size 2048 \
             --max-prefill-tokens 16384 \
             --dtype bfloat16 \
-            --mem-fraction-static 0.84 \
+            --mem-fraction-static "${MEM_FRACTION_STATIC:-0.84}" \
             --swa-full-tokens-ratio 0.2 \
             --skip-server-warmup \
             --log-level info \
@@ -127,7 +132,7 @@ spec:
               kill -0 "${SRV}" 2>/dev/null || { echo "$(ts) SERVER EXITED"; break; }
               sleep 10
             done
-            mkdir -p "${OUT}"
+            mkdir -p "${OUT}" 2>/dev/null || true
             cp "${SLOG}" "${OUT}/server-decode-w${WID}.log" || true
             kill "${SRV}" 2>/dev/null || true
             echo "$(ts) complete"
@@ -142,6 +147,20 @@ spec:
               mkdir -p "${OUT}"; cp "${SLOG}" "${OUT}/server-decode-w0-crash.log" || true; exit 1; }
             sleep 5
           done
+
+          # Gate on prefill's INFERENCE server, not just the bootstrap server.
+          # Pod 0 starts bootstrap (:8998) before launching the model server, so
+          # bootstrap answers ~1 min before prefill can serve /generate. Gating only
+          # on :8998 let the whole sweep fire early and every request died with
+          # ClientPayloadError while the router got ConnectionRefused on :10000.
+          echo "$(ts) waiting for prefill inference server..."
+          for i in $(seq 1 900); do
+            curl -sf "http://mimo-p-0.mimo-p-svc:10000/health" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          curl -sf "http://mimo-p-0.mimo-p-svc:10000/health" >/dev/null 2>&1 \
+            || { echo "$(ts) FATAL: prefill server never served /health"; exit 1; }
+          echo "$(ts) prefill inference server ready"
 
           RLOG=/tmp/router.log
           python -m sgl_jax.srt.disaggregation.launch_router \
@@ -159,7 +178,18 @@ spec:
           done
           echo "$(ts) router healthy"
 
-          mkdir -p "${OUT}"
+          # Results dir must never be able to abort the run. A bad bucket ACL once
+          # killed a fully-healthy stack right after router-up (set -e on mkdir),
+          # throwing away the whole weight-load + precompile cycle. Fall back to
+          # local disk and keep going; the sweep is the expensive part.
+          if mkdir -p "${OUT}" 2>/dev/null && touch "${OUT}/.wtest" 2>/dev/null; then
+            rm -f "${OUT}/.wtest"
+            echo "$(ts) results -> ${OUT}"
+          else
+            OUT="/tmp/perf-results"
+            mkdir -p "${OUT}" 2>/dev/null || true
+            echo "$(ts) WARNING: /gcs-out not writable; results -> ${OUT} (pod-local)"
+          fi
           for bs in 32 64 128; do
             np=$((bs * 3))
             echo "$(ts) === bsz=${bs} num_prompts=${np} ==="
@@ -180,6 +210,12 @@ spec:
               2>&1 | tee "/tmp/bs${bs}.log" || true
             cp "/tmp/bs${bs}.jsonl" "${OUT}/bs${bs}/result.jsonl" || true
             cp "/tmp/bs${bs}.log"   "${OUT}/bs${bs}/bench.log"   || true
+            # An all-failed sweep still exits 0 and still writes a profile, but that
+            # profile is of an IDLE loop and is worthless as a baseline. Say so.
+            if grep -q "All requests failed" "/tmp/bs${bs}.log" 2>/dev/null; then
+              echo "$(ts) FATAL: bs=${bs} had zero successful requests — profile is idle-loop noise, not a baseline"
+              exit 1
+            fi
           done
 
           cp "${SLOG}" "${OUT}/server-decode-w0.log" || true
@@ -188,8 +224,10 @@ spec:
           grep -h "PD-DECODE-LOOP-PROFILE" "${SLOG}" > "${OUT}/loop-profile.log" || true
           grep -h "PD-TIME-STATS" "${SLOG}" > "${OUT}/time-stats-decode.log" || true
 
-          mkdir -p "$(dirname "${DONE_FLAG}")"
-          date -u +%FT%TZ > "${DONE_FLAG}"
+          # Must not be skipped or prefill holds its slice forever.
+          mkdir -p "$(dirname "${DONE_FLAG}")" 2>/dev/null || true
+          date -u +%FT%TZ > "${DONE_FLAG}" 2>/dev/null \
+            || echo "$(ts) WARNING: could not write done flag; delete prefill job by hand"
           echo "$(ts) sweep complete -> ${OUT}"
           kill "${SRV}" 2>/dev/null || true
         env:
@@ -211,6 +249,10 @@ spec:
           value: "perf/issue-323-scheduler-overlap"
         - name: RUN_TAG
           value: "baseline"
+          # Decode keeps 0.84: unlike prefill it genuinely uses the pool
+          # (observed full-token usage 0.95) and does no big transient KV stack.
+        - name: MEM_FRACTION_STATIC
+          value: "0.84"
         - name: LOOP_PROFILE_SECONDS
           value: "10"
         ports:
@@ -221,10 +263,16 @@ spec:
         - containerPort: 5000
           name: dist-init
         resources:
+          # ephemeral-storage was unset before, so the container was unaccounted at
+          # scheduling time and was the one kubelet picked to evict under disk
+          # pressure. Budget it explicitly: ~24Gi here + 12Gi sidecar sits under the
+          # node's ~43Gi allocatable.
           requests:
             google.com/tpu: "4"
+            ephemeral-storage: 10Gi
           limits:
             google.com/tpu: "4"
+            ephemeral-storage: 24Gi
         volumeMounts:
         - mountPath: /gcs-model
           name: model
@@ -243,7 +291,13 @@ spec:
           readOnly: true
           volumeAttributes:
             bucketName: 0-mimo-25
-            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:-1,file-cache:enable-parallel-downloads:true"
+            # file-cache DISABLED (max-size-mb:0). The metadata caches are RAM and
+            # stay unbounded, but the file cache is node ephemeral storage: at -1
+            # gcsfuse stages each shard to local disk before serving it, which is a
+            # 293 GiB write onto a ~43 GiB allocatable disk -> kubelet evicts the pod.
+            # It also buys nothing here, since weight load reads each shard exactly
+            # once. (enable-parallel-downloads requires the file cache, so it goes too.)
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:0"
       - name: out
         csi:
           driver: gcsfuse.csi.storage.gke.io

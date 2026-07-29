@@ -39,10 +39,12 @@ spec:
     metadata:
       annotations:
         gke-gcsfuse/volumes: "true"
-        # Unlimited: the sidecar defaults throttle a 293 GiB weight load.
+        # CPU/memory unlimited: the sidecar defaults throttle a 293 GiB weight load.
         gke-gcsfuse/cpu-limit: "0"
         gke-gcsfuse/memory-limit: "0"
-        gke-gcsfuse/ephemeral-storage-limit: "0"
+        # Ephemeral storage is NOT unlimited. Node allocatable is only ~43 GiB
+        # against a 293 GiB model; an unbounded sidecar evicts the whole pod.
+        gke-gcsfuse/ephemeral-storage-limit: "12Gi"
     spec:
       subdomain: mimo-p-svc
       restartPolicy: Never
@@ -73,8 +75,10 @@ spec:
           # [all] pins jax 0.10.2 + libtpu 0.0.42.1 and installs over the
           # image's jax 0.8.1. This is the pairing the v6e-16 1P1D tpu-vm runs
           # were validated on; the image only supplies the base layer.
-          pip install -e "python[all]"
-          pip install "orbax-checkpoint>=0.12.0" aiohttp
+          # --no-cache-dir: the wheel cache is several GiB of node ephemeral storage
+          # that is never read again, and disk here is the binding constraint.
+          pip install --no-cache-dir -e "python[all]"
+          pip install --no-cache-dir "orbax-checkpoint>=0.12.0" aiohttp
 
           # Pod 0 owns the bootstrap server that decode dials.
           if [ "${WID}" = "0" ]; then
@@ -106,7 +110,7 @@ spec:
             --chunked-prefill-size 2048 \
             --max-prefill-tokens 16384 \
             --dtype bfloat16 \
-            --mem-fraction-static 0.84 \
+            --mem-fraction-static "${MEM_FRACTION_STATIC:-0.75}" \
             --swa-full-tokens-ratio 0.2 \
             --skip-server-warmup \
             --log-level info \
@@ -129,7 +133,7 @@ spec:
             sleep 10
           done
 
-          mkdir -p "${OUT}"
+          mkdir -p "${OUT}" 2>/dev/null || true
           cp "${SLOG}" "${OUT}/server-prefill-w${WID}.log" || true
           [ "${WID}" = "0" ] && cp /tmp/bootstrap.log "${OUT}/bootstrap.log" || true
           kill "${SRV}" 2>/dev/null || true
@@ -153,6 +157,21 @@ spec:
           value: "perf/issue-323-scheduler-overlap"
         - name: RUN_TAG
           value: "baseline"
+          # 0.75, not decode's 0.84. Prefill hands KV off immediately and never
+          # accumulates a pool (observed full-token usage 0.00-0.03), but
+          # _extract_req_kv stacks one req's KV across all 48 layers into a single
+          # ~768MB transient buffer. At 0.84 only 387MB was free and prefill died with
+          # RESOURCE_EXHAUSTED E0100 RuntimeBufferAllocationFailure, taking the mesh
+          # (and the decode job) down with it.
+          #
+          # Sizing, from the 0.84 run's own profile line (available_kv_cache=7.1GB on
+          # a 32GiB v6e chip): weights are ~19.8GiB ~= 0.62 of HBM, so anything at or
+          # below that has no room left for KV at all -- 0.60 duly failed startup with
+          # "Not enough memory. Please try to increase --mem-fraction-static." 0.75
+          # leaves a 4.2GB KV pool (prefill peak use was ~0.2GB) and hands 2.88GiB back
+          # to runtime buffers, ~7x the 381MB that was missing at the crash.
+        - name: MEM_FRACTION_STATIC
+          value: "0.75"
         ports:
         - containerPort: 10000
           name: http
@@ -161,10 +180,16 @@ spec:
         - containerPort: 5000
           name: dist-init
         resources:
+          # ephemeral-storage was unset before, so the container was unaccounted at
+          # scheduling time and was the one kubelet picked to evict under disk
+          # pressure. Budget it explicitly: ~24Gi here + 12Gi sidecar sits under the
+          # node's ~43Gi allocatable.
           requests:
             google.com/tpu: "4"
+            ephemeral-storage: 10Gi
           limits:
             google.com/tpu: "4"
+            ephemeral-storage: 24Gi
         volumeMounts:
         - mountPath: /gcs-model
           name: model
@@ -183,7 +208,13 @@ spec:
           readOnly: true
           volumeAttributes:
             bucketName: 0-mimo-25
-            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:-1,file-cache:enable-parallel-downloads:true"
+            # file-cache DISABLED (max-size-mb:0). The metadata caches are RAM and
+            # stay unbounded, but the file cache is node ephemeral storage: at -1
+            # gcsfuse stages each shard to local disk before serving it, which is a
+            # 293 GiB write onto a ~43 GiB allocatable disk -> kubelet evicts the pod.
+            # It also buys nothing here, since weight load reads each shard exactly
+            # once. (enable-parallel-downloads requires the file cache, so it goes too.)
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1,file-cache:max-size-mb:0"
       - name: out
         csi:
           driver: gcsfuse.csi.storage.gke.io

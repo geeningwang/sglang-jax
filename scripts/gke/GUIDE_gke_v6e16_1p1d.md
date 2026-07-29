@@ -123,8 +123,18 @@ bs 32/64/128 sweep is the pass condition. A hang surfaces as
 
 - `backoffLimit: 0` on both jobs, deliberately. A silent retry costs a full weight load and
   can leave the peer job waiting on a bootstrap that moved. Failures should be visible.
-- gcsfuse sidecar limits are set to `"0"` (unlimited); the defaults throttle a
-  293 GiB weight load badly.
+- gcsfuse sidecar CPU/memory are `"0"` (unlimited) — the defaults throttle a 293 GiB
+  weight load badly. **Ephemeral storage is deliberately not unlimited.** Nodes in these
+  pools have a 100 GB boot disk, ~43 GiB allocatable. The first attempt ran with
+  `file-cache:max-size-mb:-1` and `ephemeral-storage-limit: "0"`, so gcsfuse began staging
+  the model to local disk and kubelet evicted 4/4 prefill and 4/4 decode pods
+  (`The node was low on resource: ephemeral-storage`). The file cache is now off: weight
+  load reads each shard exactly once, so a read cache buys nothing and costs the node its
+  disk. If you re-enable it, cap it well under allocatable and set a matching
+  `ephemeral-storage-limit`.
+- Both containers declare explicit `ephemeral-storage` requests/limits (10Gi/24Gi). An
+  unset request is what made the server container the eviction victim rather than a
+  scheduling failure — leave them set.
 - The bench sweep uses `--random-output-len 4096`. That is well past the 512-token
   `disaggregation_num_reserved_decode_tokens` floor, which is the regime the admission
   reserve fix in `1533b88` addresses — without it this sweep can deadlock the decode loop.
