@@ -112,6 +112,27 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
+            # Per-batch build, moved off the scheduler thread (issue 323).
+            # sampling_metadata may be pre-built by a non-overlap caller; the
+            # rest is always built here now.
+            if sampling_metadata is None:
+                sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                    model_worker_batch,
+                    0,
+                    self.mesh,
+                    self.worker.model_config.vocab_size,
+                )
+            if forward_metadata is None:
+                forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
+                    model_worker_batch
+                )
+            if self.worker.server_args.enable_lora:
+                self.worker.prepare_lora_batch(model_worker_batch)
+            if getattr(model_worker_batch, "forward_batch", None) is None:
+                model_worker_batch.forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.worker.get_model_runner()
+                )
+
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
@@ -195,33 +216,28 @@ class ModelWorkerClient:
             penalizer_orchestrator=None,
         )
 
-        if sampling_metadata is None:
-            sampling_metadata = SamplingMetadata.from_model_worker_batch(
-                model_worker_batch,
-                0,
-                self.mesh,
-                self.worker.model_config.vocab_size,
-            )
-
-        forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
-            model_worker_batch
-        )
-
-        # Prepare LoRA batch if LoRA is enabled
-        if self.worker.server_args.enable_lora:
-            self.worker.prepare_lora_batch(model_worker_batch)
-
-        model_worker_batch.forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.worker.get_model_runner()
-        )
-
-        # Push a new batch to the queue (JAX handles synchronization automatically)
+        # The expensive per-batch build -- SamplingMetadata, attention
+        # forward_metadata, LoRA prep, and ForwardBatch.init_new (the input
+        # device_puts) -- used to run here on the scheduler thread while the
+        # forward thread sat idle. It is the ~2.8ms "run_batch" segment in
+        # PD-DECODE-LOOP-PROFILE. Defer it to forward_thread_func_ so this call
+        # is a cheap enqueue and the build overlaps the forward thread's
+        # otherwise-idle resolve window (issue 323). It stays SPMD-safe because
+        # the decode loop still drains (resolve_last_batch_result) before any
+        # process_allgather, so the build never runs concurrently with a
+        # collective -- only inside the wait for the previous forward pass.
+        #
+        # sampling_info / cur_sampling_info stay on this thread: the decode loop
+        # reads cur_sampling_info right after run_batch to fire
+        # sampling_info_done, and moving it would race that handshake. A caller
+        # that pre-builds sampling_metadata (non-overlap paths) is still honored
+        # -- forward_thread_func_ only builds what arrives as None.
         self.input_queue.put(
             (
                 model_worker_batch,
                 self.future_token_ids_ct,
                 sampling_metadata,
-                forward_metadata,
+                None,
             )
         )
 
