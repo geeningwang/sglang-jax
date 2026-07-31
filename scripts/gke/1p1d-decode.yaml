@@ -122,6 +122,7 @@ spec:
             --disaggregation-bootstrap-url "http://mimo-p-0.mimo-p-svc:8998" \
             --enable-request-time-stats-logging \
             --disaggregation-decode-loop-profile-seconds "${PROFILE_SECONDS}" \
+            --disaggregation-decode-reap-interval "${REAP_INTERVAL:-1}" \
             >> "${SLOG}" 2>&1 &
           SRV=$!
           echo "$(ts) server launched pid=${SRV}"
@@ -255,6 +256,11 @@ spec:
           value: "0.84"
         - name: LOOP_PROFILE_SECONDS
           value: "10"
+          # Run the KV-reap cross-host allgather every Nth decode tick. 1 =
+          # every tick (unchanged). Set to 2 for the issue-323 reap-amortize
+          # validation run; leave at 1 for a clean baseline.
+        - name: REAP_INTERVAL
+          value: "1"
         ports:
         - containerPort: 10000
           name: http
