@@ -288,6 +288,17 @@ class ServerArgs:
     # Excess requests stay in the prealloc queue and retry next tick
     # (deferral, never abort). 0 disables the cap (unbounded).
     disaggregation_max_inflight_transfers: int = 8
+    # Run the decode KV-transfer reap collective (_reap_completed_transfers ->
+    # process_allgather) once every this many decode ticks instead of every
+    # tick. That collective is a cross-host allgather costing ~1.5 ms/tick
+    # (~6% of TPOT) and does not need per-tick granularity (issue 323). The
+    # gate is a deterministic per-host tick counter, so every host skips/runs
+    # the collective on the same ticks and it stays in SPMD lockstep -- the
+    # same lockstep the current every-tick reap already relies on. 1 (default)
+    # preserves current behavior. Higher values lower steady-state TPOT at the
+    # cost of up to (interval-1) extra ticks of first-token latency for a
+    # request whose transfer just completed (it waits for the next reap tick).
+    disaggregation_decode_reap_interval: int = 1
 
     def __post_init__(self):
         # Set missing default values
@@ -1491,6 +1502,18 @@ class ServerArgs:
             "bounds that transient HBM so a burst of concurrent requests does "
             "not OOM decode. Excess requests defer (FIFO requeue), never abort. "
             "0 disables the cap (unbounded).",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-reap-interval",
+            type=int,
+            default=ServerArgs.disaggregation_decode_reap_interval,
+            help="Run the decode KV-transfer reap collective once every this "
+            "many decode ticks instead of every tick. The reap is a cross-host "
+            "SPMD collective (~1.5 ms/tick, ~6%% of TPOT); gating it on a "
+            "deterministic tick counter keeps all hosts in lockstep. 1 "
+            "(default) = every tick. Higher values lower steady-state TPOT at "
+            "the cost of up to (interval-1) ticks of extra first-token latency "
+            "for a request whose transfer just completed.",
         )
         parser.add_argument(
             "--disaggregation-shared-secret",

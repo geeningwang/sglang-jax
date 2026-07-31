@@ -159,7 +159,9 @@ class ModelWorkerClient:
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
-    def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
+    def resolve_last_batch_result(
+        self, launch_done: threading.Event | None = None, watchdog=None
+    ):
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
@@ -168,8 +170,18 @@ class ModelWorkerClient:
         parallel, then materializes them. This lets the four arrays we need
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
+
+        ``watchdog`` (the decode loop's EventLoopWatchdog, or None) splits the
+        segment in two: the ``output_queue.get()`` above closes the caller's
+        ``resolve_result`` phase (pure forward-pass/TPU wait), and everything
+        after it is reattributed to ``resolve_d2h`` (the device-to-host copies).
+        This answers whether the ~21 ms tick is compute-bound or PCIe-bound
+        (issue 323). Called on the scheduler thread that owns the watchdog, so
+        beating here is thread-safe; a None watchdog makes it a no-op.
         """
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        if watchdog is not None:
+            watchdog.beat("resolve_d2h")
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
             jax.copy_to_host_async(logits_output.next_token_logprobs)

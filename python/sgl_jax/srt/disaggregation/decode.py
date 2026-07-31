@@ -277,7 +277,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             wd.beat("admit_prealloc")
             self._admit_decode_prealloc()
-            self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
+            if self._reap_due():
+                self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
 
             wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
@@ -331,7 +332,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             wd.beat("admit_prealloc")
             self._admit_decode_prealloc()
-            self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
+            if self._reap_due():
+                self._reap_completed_transfers()  # beats reap_allgather/reap_writeback
 
             wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
@@ -537,6 +539,26 @@ class SchedulerDisaggregationDecodeMixin:
 
         self._admit_decode_prealloc()
         self._reap_completed_transfers()
+
+    def _reap_due(self: Scheduler) -> bool:
+        """Whether to run the KV-transfer reap collective this tick.
+
+        :meth:`_reap_completed_transfers` runs a cross-host SPMD collective
+        (~1.5 ms/tick). ``--disaggregation-decode-reap-interval`` lets it run
+        once every N ticks instead of every tick to reclaim that time (issue
+        323). The decision is a plain per-host tick counter: every host reaches
+        this call the same number of times (the existing every-tick reap already
+        proves the loop is lockstep, or that collective would itself desync), so
+        the modulo is identical on every host and the collective stays
+        synchronized. interval <= 1 is the unconditional every-tick default and
+        never touches the counter.
+        """
+
+        interval = getattr(self.server_args, "disaggregation_decode_reap_interval", 1)
+        if interval <= 1:
+            return True
+        self._decode_reap_tick = getattr(self, "_decode_reap_tick", 0) + 1
+        return (self._decode_reap_tick % interval) == 0
 
     def _reap_completed_transfers(self: Scheduler) -> None:
         """Install KV for completed transfers and enqueue them for decode.

@@ -393,20 +393,23 @@ class SchedulerOutputProcessorMixin:
             if is_spec_decode:
                 next_token_logprobs = None
             else:
-                # Split the decode loop's process_batch_result beat in two.
-                # resolve_last_batch_result is output_queue.get() + the D2H
-                # copies, i.e. the segment that reflects TPU/forward-thread
-                # wait; everything after it in this method is host-side CPU
-                # post-processing. Beating around it lets PD-DECODE-LOOP-PROFILE
-                # attribute the ~79% to wait vs CPU instead of lumping both into
-                # one "process_batch_result" phase. Same "split the segment"
-                # move as 2349aa1; pure observability, guarded so it is a no-op
-                # off the disagg decode path (base scheduler has no watchdog).
+                # Split the decode loop's process_batch_result beat in three.
+                # resolve_last_batch_result is output_queue.get() (forward/TPU
+                # wait) + the D2H copies; everything after it in this method is
+                # host-side CPU post-processing. Beating around it -- and passing
+                # the watchdog in so it beats once more between the get() and the
+                # copies -- lets PD-DECODE-LOOP-PROFILE separate the ~21 ms into
+                # resolve_result (pure forward-pass wait), resolve_d2h (PCIe
+                # copies), and pbr_cpu_tail (CPU). That tells us whether the tick
+                # is compute-bound or copy-bound (issue 323). Same "split the
+                # segment" move as 2349aa1; pure observability, guarded so it is
+                # a no-op off the disagg decode path (base scheduler has no
+                # watchdog).
                 wd = getattr(self, "disagg_decode_watchdog", None)
                 if wd is not None:
                     wd.beat("resolve_result")
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self.tp_worker.resolve_last_batch_result(launch_done, watchdog=wd)
                 )
                 if wd is not None:
                     wd.beat("pbr_cpu_tail")
