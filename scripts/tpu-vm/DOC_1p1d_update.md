@@ -20,7 +20,7 @@
 
 2. In `_extract_req_kv`, after computing full-pool `page_indices`, detect `SWAKVPool` and compute separate `swa_page_indices` by mapping full-pool token indices through `full_to_swa_index_mapping` and dividing by `page_size`. Replace the bulk gather with a per-layer loop that selects `swa_page_indices` for SWA layers and `page_indices` for full-attention layers (prefill side).
 
-**Commits:** 607351f, a1d8cecb (gap 1); pending (gap 2)
+**Commits:** 607351f, a1d8cecb (gap 1); 428a82c5 (gap 2)
 
 **Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) for the detailed code walkthrough.
 
