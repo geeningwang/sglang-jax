@@ -1,4 +1,4 @@
-# 1P1D Multi-Host TPU Fixes (since d3ac424)
+# PD Multi-Host TPU Fixes (since d3ac424)
 
 **Base commit:** d3ac42493745dcf4d9e141ef0a2a351029d7cc25 (primatrix upstream, single-host v7x)
 **Branch:** mimo-tpu7-stage3
@@ -46,6 +46,19 @@
 
 **Analysis:** See [DOC_spmd_race_analysis.md](DOC_spmd_race_analysis.md) for the full race mechanism, related code pieces, and alternative fix options considered.
 
+## 4. DP>1 SWA index remapping in `_write_kv_to_pool`
+
+**Problem:** In `_write_kv_to_pool` (decode side), when `full_to_swa_index_mapping` is a list (DP>1), the code incorrectly assumed `loc_np` contains concatenated data for all `dp_size` ranks and looped `for rank in range(dp_size)`, slicing `loc_np` into per-rank segments. In reality, `loc_np` is single-rank data allocated for one `dp_rank` — the loop was indexing out of bounds or into the wrong rank's mapping.
+
+**Fix:** Select the single rank's mapping via `mapping[int(getattr(req, "dp_rank", 0) or 0)]` before computing `swa_loc_np`, eliminating the per-rank loop entirely. This matches the pattern in three other SWA mapping sites:
+- `_extract_req_kv` (prefill.py:731-732)
+- Raiden decode path (decode.py:833-834)
+- `_swa_page_ids_for_chunk` (prefill.py:577-578)
+
+**Status:** Tested with dp_size=1 in both 1P1D and 1P2D configurations — correct output confirmed. NOT runtime-tested with dp_size>1 (would require v6e-32 with tp=16, dp=2 = 32 devices).
+
+**Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) Change 6 for the before/after code diff.
+
 ---
 
-Issue 1 (SWAKVPool) affects any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had this fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod), so intra-pod multi-host coordination was never invoked — PD cross-pod transfer itself worked fine in both setups.
+Issues 1 and 4 (SWAKVPool) affect any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had the gap 1 fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod), so intra-pod multi-host coordination was never invoked — PD cross-pod transfer itself worked fine in both setups.

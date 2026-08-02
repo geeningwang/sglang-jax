@@ -1,4 +1,4 @@
-# 1P1D Disaggregated Inference — Environment Reference
+# PD Disaggregated Inference — Environment Reference
 
 **Last updated:** 2026-08-02
 **Branch:** mimo-tpu7-stage3
@@ -11,7 +11,8 @@
 | Role    | TPU VM          | Zone        | Type   | Workers | IPs (internal)                                      |
 |---------|-----------------|-------------|--------|---------|-----------------------------------------------------|
 | Prefill | jingnw-node     | us-east5-a  | v6e-16 | 4       | w0: 10.202.0.135, w1: 10.202.0.41, w2: 10.202.0.13, w3: 10.202.0.123 |
-| Decode  | jingnw-node2    | us-east5-a  | v6e-16 | 4       | w0: 10.202.0.162, w1: 10.202.15.208, w2: 10.202.15.205, w3: 10.202.15.226 |
+| Decode1 | jingnw-node2    | us-east5-a  | v6e-16 | 4       | w0: 10.202.0.162, w1: 10.202.15.208, w2: 10.202.15.205, w3: 10.202.15.226 |
+| Decode2 | jingnw-node3    | us-east5-b  | v6e-16 | 4       | w0: 10.202.15.228, w1: 10.202.15.231, w2: 10.202.0.184, w3: 10.202.15.229 |
 
 Each v6e-16 has 4 hosts × 4 chips × 1 TensorCore = 16 JAX devices.
 
@@ -129,7 +130,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   </dev/null >/tmp/prefill_server.log 2>&1 &
 ```
 
-### Decode (jingnw-node2, all 4 workers)
+### Decode1 (jingnw-node2, all 4 workers)
 
 ```bash
 nohup python3.12 -m sgl_jax.launch_server \
@@ -149,10 +150,31 @@ nohup python3.12 -m sgl_jax.launch_server \
   </dev/null >/tmp/decode_server.log 2>&1 &
 ```
 
+### Decode2 (jingnw-node3, all 4 workers)
+
+```bash
+nohup python3.12 -m sgl_jax.launch_server \
+  --model-path /tmp/flash-model --trust-remote-code \
+  --enable-sequence-parallel --tp-size 16 --dp-size 1 --ep-size 16 \
+  --moe-backend fused_v2 --nnodes 4 --node-rank $WORKER_ID \
+  --dist-init-addr 10.202.15.228:8088 --host 0.0.0.0 --port 10001 \
+  --page-size 256 --context-length 262144 --disable-radix-cache \
+  --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
+  --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
+  --skip-server-warmup --log-level info --decode-log-interval 1 \
+  --max-running-requests 256 --dp-schedule-policy round_robin \
+  --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
+  --precompile-token-paddings 4096 \
+  --disaggregation-mode decode \
+  --disaggregation-bootstrap-url http://10.202.0.135:8998 \
+  </dev/null >/tmp/decode_server.log 2>&1 &
+```
+
 **Note:** `--disable-overlap-schedule` is no longer needed. The SPMD race in the overlap decode event loop was fixed in commit 3c301255 by reordering the loop to drain the forward thread before `process_allgather`.
 
 ### Router (jingnw-node w0 only)
 
+For 1P1D (single decode):
 ```bash
 nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   --pd-disaggregation --mini-lb \
@@ -162,6 +184,19 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   </dev/null >/tmp/router.log 2>&1 &
 ```
 
+For 1P2D (two decode servers):
+```bash
+nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
+  --pd-disaggregation --mini-lb \
+  --prefill http://10.202.0.135:10000 8998 \
+  --decode http://10.202.0.162:10001 \
+  --decode http://10.202.15.228:10001 \
+  --host 0.0.0.0 --port 30000 \
+  </dev/null >/tmp/router.log 2>&1 &
+```
+
+The `--decode` flag accepts multiple values (`nargs=1, action="append"`). The router's `mini_lb` randomly selects one decode server per request.
+
 ---
 
 ## Port Assignments
@@ -170,10 +205,12 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
 |-----------------|-------|------------|
 | Bootstrap       | 8998  | jingnw-node w0 |
 | Prefill server  | 10000 | jingnw-node (all workers) |
-| Decode server   | 10001 | jingnw-node2 (all workers) |
+| Decode1 server  | 10001 | jingnw-node2 (all workers) |
+| Decode2 server  | 10001 | jingnw-node3 (all workers) |
 | Router          | 30000 | jingnw-node w0 |
-| JAX coordinator (prefill) | 8088 | jingnw-node w0 |
-| JAX coordinator (decode)  | 8088 | jingnw-node2 w0 |
+| JAX coordinator (prefill)  | 8088 | jingnw-node w0 |
+| JAX coordinator (decode1)  | 8088 | jingnw-node2 w0 |
+| JAX coordinator (decode2)  | 8088 | jingnw-node3 w0 |
 
 ---
 
@@ -181,8 +218,9 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
 
 1. **Bootstrap** on jingnw-node w0 — must be up before prefill/decode register
 2. **Prefill** on all 4 jingnw-node workers simultaneously — registers with bootstrap
-3. **Decode** on all 4 jingnw-node2 workers simultaneously — registers with bootstrap, queries prefill peers
-4. **Router** on jingnw-node w0 — waits for both prefill and decode to be healthy
+3. **Decode1** on all 4 jingnw-node2 workers simultaneously — registers with bootstrap, queries prefill peers
+4. **Decode2** on all 4 jingnw-node3 workers simultaneously (for 1P2D) — same as Decode1
+5. **Router** on jingnw-node w0 — waits for prefill and all decode servers to be healthy
 
 ---
 

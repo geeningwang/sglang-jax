@@ -300,6 +300,69 @@ Without the fix, the reversed allocation would cause SWA layers to gather from w
 
 ---
 
+## Change 6: Fix DP>1 SWA index remapping in `_write_kv_to_pool`
+
+**File**: `python/sgl_jax/srt/disaggregation/decode.py`  
+**Method**: `_write_kv_to_pool()` (SWA location remapping block, lines ~1048-1056)
+
+### The bug
+
+When `full_to_swa_index_mapping` is a list (DP>1, one mapping array per rank), the code assumed `loc_np` was **concatenated** data for all `dp_size` ranks and looped over each rank, slicing `loc_np` into segments:
+
+```python
+if isinstance(mapping, list):
+    tokens_per_rank = len(loc_np) // kv_pool.dp_size
+    for rank in range(kv_pool.dp_size):
+        s = rank * tokens_per_rank
+        e = s + tokens_per_rank
+        rank_valid = valid[s:e]
+        swa_loc_np[s:e][rank_valid] = np.asarray(
+            mapping[rank]
+        )[loc_np[s:e][rank_valid]]
+```
+
+In reality, `loc_np` is **single-rank** data — it contains token indices for one `dp_rank` only, allocated by `alloc_token_slots()` for the specific rank. The loop would apply the wrong rank's mapping to the single-rank data.
+
+### The fix
+
+Select the correct rank's mapping before computing `swa_loc_np`:
+
+```python
+if mapping is not None:
+    if isinstance(mapping, list):
+        mapping = mapping[int(getattr(req, "dp_rank", 0) or 0)]
+    swa_loc_np = np.full_like(loc_np, -1)
+    valid = loc_np >= 0
+    swa_loc_np[valid] = np.asarray(mapping)[loc_np[valid]]
+    swa_loc = jax.device_put(jnp.asarray(swa_loc_np), loc_sharding)
+```
+
+This matches the identical pattern in three other SWA mapping sites:
+- `_extract_req_kv` (prefill.py:731-732)
+- Raiden decode path (decode.py:833-834)
+- `_swa_page_ids_for_chunk` (prefill.py:577-578)
+
+### Status
+
+Verified by code inspection and tested with dp_size=1 in both 1P1D and 1P2D. The DP>1 code path (dp_size>1) has NOT been runtime-tested — would require v6e-32 (tp=16 × dp=2 = 32 devices).
+
+---
+
+### Verification: 1P2D end-to-end test
+
+After applying the DP>1 fix (Change 6), tested with a 1P2D setup: 1 prefill cluster (jingnw-node) + 2 decode clusters (jingnw-node2, jingnw-node3), all v6e-16. The router randomly selects one decode server per request via `mini_lb`.
+
+4 test requests sent through the router:
+
+1. Input: `What is the speed of light?` → Output: `The speed of light in vacuum is commonly denoted by the letter c, and is exactly 299,792,458 meters per second...`
+2. Input: `Write a Python function to compute factorial:` → Output: `Here is a Python function to compute the factorial of a non-negative integer...`
+3. Input: `翻译成英文：今天天气真好` → Output: `，我们去公园玩吧。The weather is so nice today. Let's go to the park to play.`
+4. Input: `List the first 5 prime numbers:` → Output: `2, 1, 3, 11, 13...`
+
+Decode1 (jingnw-node2) handled 1 request, Decode2 (jingnw-node3) handled 3 requests. Both decode servers produced correct output through the full prefill→transfer→decode pipeline.
+
+---
+
 ## What this commit does NOT fix
 
 The commit fixes the `AttributeError` crashes so that the disaggregation code can correctly extract KV from `SWAKVPool` on the prefill side and write it back on the decode side.
