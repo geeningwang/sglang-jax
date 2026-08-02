@@ -203,6 +203,92 @@ The `else` branch (regular `KVPool`) is the original code, unchanged.
 
 ---
 
+## Change 5: Fix SWA page-index remapping in `_extract_req_kv` (prefill gather)
+
+**File**: `python/sgl_jax/srt/disaggregation/prefill.py`  
+**Method**: `_extract_req_kv()` (the prefill-side method that gathers KV from the device pool for JaxTransfer)
+
+### The bug
+
+`_extract_req_kv` computes `page_indices` from `req_to_token`:
+
+```python
+page_id_source = req_to_token[
+    req.req_pool_idx,
+    : num_pages * page_size : page_size,
+]
+page_ids = np.asarray(page_id_source) // page_size
+page_indices = jax.device_put(page_ids, idx_sharding)
+```
+
+`req_to_token` stores **full-pool** token indices. Dividing by `page_size` gives full-pool page IDs. Then it gathers **all** layer buffers using the same `page_indices`:
+
+```python
+layer_buffers = [kv_pool.get_kv_buffer(layer_id) for layer_id in ...]
+layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
+```
+
+For full-attention layers, `get_kv_buffer` returns `full_kv_pool.kv_buffer[...]`, which is indexed by full-pool page IDs — correct. For SWA layers, `get_kv_buffer` returns `swa_kv_pool.kv_buffer[...]`, which has a **different, smaller** index space (`size_swa` pages, not `size`). Full-pool page IDs index the wrong pages.
+
+The Raiden transfer path (`_raiden_handoff_chunk`) avoids this by calling `_extract_swa_block_ids_for_chunk`, which maps full-pool token indices through `full_to_swa_index_mapping` to produce correct SWA page IDs. The JaxTransfer path (`_extract_req_kv`) had no equivalent remapping.
+
+### The fix
+
+After computing full-pool `page_indices`, check for `SWAKVPool` and build a second set of indices:
+
+```python
+from sgl_jax.srt.mem_cache.memory_pool import SWAKVPool
+
+swa_page_indices = None
+is_swa_pool = isinstance(kv_pool, SWAKVPool)
+if is_swa_pool:
+    mapping = kv_pool.full_to_swa_index_mapping
+    if isinstance(mapping, list):
+        mapping = mapping[int(getattr(req, "dp_rank", 0) or 0)]
+    if mapping is not None:
+        full_token_ids = np.asarray(page_id_source)
+        swa_page_ids = np.asarray(mapping)[full_token_ids] // page_size
+        if pad_len > 0:
+            swa_page_ids = np.concatenate(
+                [swa_page_ids, np.zeros(pad_len, dtype=swa_page_ids.dtype)]
+            )
+        swa_page_indices = jax.device_put(swa_page_ids, idx_sharding)
+```
+
+**How it works**: `page_id_source` contains one full-pool token index per page (at stride `page_size`). `full_to_swa_index_mapping[full_token_idx]` returns the SWA-pool token index. Dividing by `page_size` gives the SWA-pool page ID. For tokens outside the sliding window, the mapping returns index 0 (sentinel page), which is safe — the decode side also remaps via the same mapping and only writes valid window positions.
+
+For `dp_size > 1`, `full_to_swa_index_mapping` is a list of per-rank numpy arrays; the correct one is selected via `req.dp_rank`.
+
+Then replace the bulk `_jit_gather_all_layers` call with a per-layer loop:
+
+```python
+layer_kvs = []
+for layer_id in range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num):
+    buf = kv_pool.get_kv_buffer(layer_id)
+    if swa_page_indices is not None and kv_pool.layers_mapping[layer_id][1]:
+        idx = swa_page_indices
+    else:
+        idx = page_indices
+    layer_kvs.append(_jit_gather_one_layer(buf, idx, gather_out_sharding))
+```
+
+`kv_pool.layers_mapping[layer_id]` returns `(sub_pool_layer_id, is_swa)`. When `is_swa` is `True`, the gather uses `swa_page_indices` to index into the SWA sub-pool buffer; otherwise it uses the original `page_indices` for the full sub-pool.
+
+### Consistency with the decode side
+
+The decode side (`_write_kv_to_pool`, Change 3 above) already correctly remaps `loc` to `swa_loc` for SWA layers using the same `full_to_swa_index_mapping`. With this fix, the prefill gather and decode write use matching index spaces for each sub-pool:
+
+| Layer type | Prefill gather indices | Decode write indices |
+|------------|----------------------|---------------------|
+| Full attention | `page_indices` (full-pool page IDs) | `loc` (full-pool token indices) |
+| SWA | `swa_page_indices` (SWA-pool page IDs) | `swa_loc` (SWA-pool token indices) |
+
+### Impact on non-SWA models
+
+None. For regular `MHATokenToKVPool`, `isinstance(kv_pool, SWAKVPool)` is `False`, `swa_page_indices` stays `None`, and all layers use `page_indices` — identical to the original code path.
+
+---
+
 ## What this commit does NOT fix
 
 The commit fixes the `AttributeError` crashes so that the disaggregation code can correctly extract KV from `SWAKVPool` on the prefill side and write it back on the decode side.

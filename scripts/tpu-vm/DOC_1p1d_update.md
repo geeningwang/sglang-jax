@@ -8,11 +8,21 @@
 
 ## 1. SWAKVPool not supported in JaxTransfer disaggregation
 
-**Problem:** MiMo-V2-Flash uses hybrid attention (full + sliding-window), so its KV cache is managed by `SWAKVPool` instead of `MHATokenToKVPool`. The disaggregation code directly accessed `kv_pool.kv_buffer`, `kv_pool.layer_num`, etc. — attributes that exist on `MHATokenToKVPool` but not `SWAKVPool`. Result: `AttributeError` crash on both prefill and decode.
+**Problem:** MiMo-V2-Flash uses hybrid attention (full + sliding-window), so its KV cache is managed by `SWAKVPool` instead of `MHATokenToKVPool`. `SWAKVPool` wraps two independent sub-pools (`full_kv_pool` and `swa_kv_pool`) with different sizes and index spaces, connected by `full_to_swa_index_mapping`. The disaggregation code had two gaps:
 
-**Fix:** Added property accessors (`layer_num`, `start_layer`, `kv_sharding`, `dtype`, `attention_data_partition_axis`) to `SWAKVPool`, and rewrote `_write_kv_to_pool` to dispatch per-layer writes to the correct sub-pool (`full_kv_pool` vs `swa_kv_pool`) with SWA index remapping.
+1. **Missing API surface:** The code directly accessed `kv_pool.kv_buffer`, `kv_pool.layer_num`, etc. — attributes that exist on `MHATokenToKVPool` but not `SWAKVPool`. Result: `AttributeError` crash on both prefill and decode.
 
-**Commits:** 607351f, a1d8cecb
+2. **Missing page-index remapping on prefill gather:** The JaxTransfer extraction path (`_extract_req_kv`) computes `page_indices` from `req_to_token` (full-pool token indices) and uses the same indices to gather from all layers, including SWA layers. For SWA layers, `get_kv_buffer` returns the `swa_kv_pool` buffer, but full-pool page IDs are meaningless in the SWA pool — they address wrong pages or go out-of-bounds. The Raiden path handles this correctly via `_extract_swa_block_ids_for_chunk`, but the JaxTransfer path had no equivalent remapping.
+
+**Fix:**
+
+1. Added property accessors (`layer_num`, `start_layer`, `kv_sharding`, `dtype`, `attention_data_partition_axis`) to `SWAKVPool`, and rewrote `_write_kv_to_pool` to dispatch per-layer writes to the correct sub-pool with SWA index remapping (decode side).
+
+2. In `_extract_req_kv`, after computing full-pool `page_indices`, detect `SWAKVPool` and compute separate `swa_page_indices` by mapping full-pool token indices through `full_to_swa_index_mapping` and dividing by `page_size`. Replace the bulk gather with a per-layer loop that selects `swa_page_indices` for SWA layers and `page_indices` for full-attention layers (prefill side).
+
+**Commits:** 607351f, a1d8cecb (gap 1); pending (gap 2)
+
+**Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) for the detailed code walkthrough.
 
 ## 2. process_allgather int64→int32 room ID truncation
 
