@@ -22,7 +22,9 @@
 
 **Commits:** 607351f, a1d8cecb (gap 1); 428a82c5 (gap 2)
 
-**Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) for the detailed code walkthrough.
+**Verified:** Tested by temporarily reversing the full-pool allocation order (`pages_per_rank` down to `1`) so that full-pool and SWA-pool page IDs no longer coincide. The 1P1D stack produced correct output with the fix, confirming the remapping is necessary and working.
+
+**Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) for the detailed code walkthrough and test results.
 
 ## 2. process_allgather int64→int32 room ID truncation
 

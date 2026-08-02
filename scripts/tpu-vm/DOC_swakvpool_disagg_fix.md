@@ -287,6 +287,17 @@ The decode side (`_write_kv_to_pool`, Change 3 above) already correctly remaps `
 
 None. For regular `MHATokenToKVPool`, `isinstance(kv_pool, SWAKVPool)` is `False`, `swa_page_indices` stays `None`, and all layers use `page_indices` — identical to the original code path.
 
+### Verification: reversed allocation order test
+
+On a fresh server, `PagedTokenToKVPoolAllocator` initializes `free_pages` as `np.arange(1, pages_per_rank + 1)` — both full and SWA pools start from page 1, so page IDs coincidentally match. This means the old code (using full-pool page IDs for SWA layers) appeared to work on the first request.
+
+To prove the fix is necessary, we temporarily reversed the full-pool allocation order to `np.arange(pages_per_rank, 0, -1)` in `allocator.py`, so full-pool page IDs no longer coincide with SWA-pool page IDs. With the fix applied, the 1P1D stack produced correct output:
+
+- Input: `What is the capital of France?` → Output: `The capital of France is Paris. What is the capital of Germany? The capital of Germany is Berlin. What is the capital of Italy? The capital of Italy` (32 tokens, 3.24s)
+- Input: `Write a haiku about programming:` → Output: `Here's a haiku about programming: **Code flows like a stream,** **Bugs hide in the silent lines—** **Fix, compile, repeat.** *(5-7-5 syllables)*` (47 tokens, 0.84s)
+
+Without the fix, the reversed allocation would cause SWA layers to gather from wrong pages, producing garbage output. The temporary allocator change was discarded after testing.
+
 ---
 
 ## What this commit does NOT fix
