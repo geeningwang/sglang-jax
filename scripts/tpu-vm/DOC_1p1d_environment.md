@@ -1,6 +1,6 @@
 # 1P1D Disaggregated Inference — Environment Reference
 
-**Last updated:** 2026-07-16
+**Last updated:** 2026-08-02
 **Branch:** mimo-tpu7-stage3
 **Model:** MiMo-V2-Flash (292GB, 156 files including 145 safetensors)
 
@@ -10,8 +10,8 @@
 
 | Role    | TPU VM          | Zone        | Type   | Workers | IPs (internal)                                      |
 |---------|-----------------|-------------|--------|---------|-----------------------------------------------------|
-| Prefill | jingnw-node     | us-east5-b  | v6e-16 | 4       | w0: 10.202.0.68, w1: 10.202.0.26, w2: 10.202.0.12, w3: 10.202.0.43 |
-| Decode  | jingnw-node2    | us-east5-b  | v6e-16 | 4       | w0: 10.202.0.116, w1: 10.202.15.208, w2: 10.202.0.185, w3: 10.202.0.168 |
+| Prefill | jingnw-node     | us-east5-a  | v6e-16 | 4       | w0: 10.202.0.135, w1: 10.202.0.41, w2: 10.202.0.13, w3: 10.202.0.123 |
+| Decode  | jingnw-node2    | us-east5-a  | v6e-16 | 4       | w0: 10.202.0.162, w1: 10.202.15.208, w2: 10.202.15.205, w3: 10.202.15.226 |
 
 Each v6e-16 has 4 hosts × 4 chips × 1 TensorCore = 16 JAX devices.
 
@@ -116,7 +116,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
   --enable-sequence-parallel --tp-size 16 --dp-size 1 --ep-size 16 \
   --moe-backend fused_v2 --nnodes 4 --node-rank $WORKER_ID \
-  --dist-init-addr 10.202.0.68:8088 --host 0.0.0.0 --port 10000 \
+  --dist-init-addr 10.202.0.135:8088 --host 0.0.0.0 --port 10000 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
@@ -125,7 +125,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
   --disaggregation-mode prefill \
-  --disaggregation-bootstrap-url http://10.202.0.68:8998 \
+  --disaggregation-bootstrap-url http://10.202.0.135:8998 \
   </dev/null >/tmp/prefill_server.log 2>&1 &
 ```
 
@@ -136,7 +136,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
   --enable-sequence-parallel --tp-size 16 --dp-size 1 --ep-size 16 \
   --moe-backend fused_v2 --nnodes 4 --node-rank $WORKER_ID \
-  --dist-init-addr 10.202.0.116:8088 --host 0.0.0.0 --port 10001 \
+  --dist-init-addr 10.202.0.162:8088 --host 0.0.0.0 --port 10001 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
@@ -145,7 +145,7 @@ nohup python3.12 -m sgl_jax.launch_server \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
   --disaggregation-mode decode \
-  --disaggregation-bootstrap-url http://10.202.0.68:8998 \
+  --disaggregation-bootstrap-url http://10.202.0.135:8998 \
   </dev/null >/tmp/decode_server.log 2>&1 &
 ```
 
@@ -156,8 +156,8 @@ nohup python3.12 -m sgl_jax.launch_server \
 ```bash
 nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   --pd-disaggregation --mini-lb \
-  --prefill http://10.202.0.68:10000 8998 \
-  --decode http://10.202.0.116:10001 \
+  --prefill http://10.202.0.135:10000 8998 \
+  --decode http://10.202.0.162:10001 \
   --host 0.0.0.0 --port 30000 \
   </dev/null >/tmp/router.log 2>&1 &
 ```
