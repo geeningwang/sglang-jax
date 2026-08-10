@@ -2,7 +2,7 @@
 
 **Base commit:** d3ac42493745dcf4d9e141ef0a2a351029d7cc25 (primatrix upstream, single-host v7x)
 **Branch:** mimo-tpu7-stage3
-**Target:** Multi-host TPU v6e-16 (4 workers per VM)
+**Target:** Multi-host TPU v6e-16/v6e-32 (4–8 workers per VM)
 
 ---
 
@@ -59,6 +59,26 @@
 
 **Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) Change 6 for the before/after code diff.
 
+## 5. `synced_terminal_rooms` threshold too high for dp_size>1
+
+**Problem:** `synced_terminal_rooms` (decode side) requires `len(sts) >= nproc` — all JAX processes must report SUCCESS before a transfer is considered complete. With `dp_size=2`, each request is handled by only one DP rank (half the processes). Only `nproc // dp_size` processes ever report for a given room, so the threshold is never met. Result: transfers succeed on every individual process but are never acknowledged as complete → 0 output tokens.
+
+**Fix:** Added `dp_size: int = 1` parameter to `synced_terminal_rooms`. Compute `nproc_per_dp = nproc // max(dp_size, 1)` and use that as the success threshold. Pass `dp_size=self.dp_size` from the call site in `_drain_transfer_queue_synced` (decode.py).
+
+**Files:** `python/sgl_jax/srt/disaggregation/common/multihost_sync.py`, `python/sgl_jax/srt/disaggregation/decode.py`
+
+**Verified:** End-to-end dp_size=2 symmetric test on v6e-32 (8 hosts, mesh (2,16)) — request completed with correct output. Regression-tested with dp_size=1 — no change in behavior (threshold reduces to nproc).
+
+## 6. `local_kv_spec_for_pool` shape divisor wrong for non-trivial mesh
+
+**Problem:** `local_kv_spec_for_pool` (prefill.py) computes the local shard shape by dividing the global shape's sharded dimension by `jax.process_count()`. This is only correct when every process holds one device on the sharded axis. With mesh `(2, 16)` and 8 processes, the tensor axis has 16 devices (2 per host), but the code divides by 8 — producing a local shape that's 2× too small and doesn't match the actual per-process data.
+
+**Fix:** Compute the divisor from the mesh: find how many devices sit on the sharded axis (`ndev_on_axis`), divide by `jax.local_device_count()` to get `nproc_on_axis`, and use that as the divisor. With mesh `(2, 16)` and 4 local devices: `ndev_on_axis=16`, `nproc_on_axis=4`, which gives the correct local shape.
+
+**File:** `python/sgl_jax/srt/disaggregation/prefill.py`
+
+**Verified:** Same end-to-end test as Issue 5. Regression-tested with dp_size=1 — formula reduces to `nproc_on_axis = nproc` (identical to original).
+
 ---
 
-Issues 1 and 4 (SWAKVPool) affect any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had the gap 1 fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod), so intra-pod multi-host coordination was never invoked — PD cross-pod transfer itself worked fine in both setups.
+Issues 1 and 4 (SWAKVPool) affect any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had the gap 1 fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. Issues 5 and 6 are specific to **dp_size>1** configurations where the mesh shape differs from the simple `(1, ndevices)` layout. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod, dp_size=1), so neither multi-host coordination nor dp_size>1 code paths were exercised.
