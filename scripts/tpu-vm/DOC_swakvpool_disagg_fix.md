@@ -344,7 +344,7 @@ This matches the identical pattern in three other SWA mapping sites:
 
 ### Status
 
-Verified by code inspection and tested with dp_size=1 in both 1P1D and 1P2D. The DP>1 code path (dp_size>1) has NOT been runtime-tested — would require v6e-32 (tp=16 × dp=2 = 32 devices).
+Verified by code inspection and tested with dp_size=1 in both 1P1D and 1P2D. Runtime-verified with dp_size=2 on v6e-32 (8 hosts, mesh (2,16), 32 devices per VM) on 2026-08-12 — correct output through the full 1P1D disaggregated pipeline.
 
 ---
 

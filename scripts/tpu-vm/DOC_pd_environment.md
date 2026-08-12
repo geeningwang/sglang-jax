@@ -1,6 +1,6 @@
 # PD Disaggregated Inference — Environment Reference
 
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-12
 **Branch:** mimo-tpu7-stage3
 **Model:** MiMo-V2-Flash (292GB, 156 files including 145 safetensors)
 
@@ -247,7 +247,10 @@ These VMs cannot reach the internet. All code updates and package installations 
 Using `kill -9` on JAX processes can corrupt TPU state, causing `E0200: RuntimeUnexpectedCoreHalt` on next run. Fix: reboot the VM to reset TPU state, then re-provision.
 
 ### Never use pkill on TPU VMs
-`pkill -f` pattern-matches the SSH command itself and kills the SSH session. Use `kill` with specific PIDs instead.
+`pkill -f` pattern-matches the SSH command itself and kills the SSH session. Use `kill` with specific PIDs instead. When run inside `gcloud compute tpus tpu-vm ssh --command`, the killed SSH session causes gcloud to retry, re-running the entire command — which can spawn duplicate server processes.
+
+### Use SIGINT (kill -2) to stop JAX servers
+JAX server processes may ignore SIGTERM (`kill`). Use `kill -2` (SIGINT) instead — it triggers clean shutdown. Do NOT use `kill -9` (see E0200 issue above).
 
 ### Missing gcsfs causes E0200 SPMD desync
 Without `gcsfs`, the GCS-backed XLA compilation cache silently fails to read. Each worker recompiles from scratch, and non-deterministic XLA compilation produces different programs on different workers → `E0200`. Fix: `uv pip install --system gcsfs`.
@@ -267,8 +270,42 @@ curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMeta
 ### Process index mapping
 JAX assigns `process_index` independently per cluster. GCE worker 0 is NOT necessarily `jax.process_index() == 0`. The mapping depends on which worker reaches the coordinator first. Use server logs to determine the current mapping.
 
+### E0100 OOM during KV extraction with large inputs (dp_size=2)
+With `--mem-fraction-static 0.84` and `dp_size=2` on v6e-32, KV extraction in `_extract_req_kv` (prefill.py) can hit `E0100: RuntimeBufferAllocationFailure` when processing long-input requests (e.g. 16384 tokens). The `jnp.stack(layer_kvs)` call attempts to allocate ~768MB per request but only ~389MB remains free. Single short requests (e.g. "What is 2+2?") work fine. The OOM triggers at high concurrency or with long inputs. Once OOM errors occur, the prefill server may stop processing new requests — requires a full server restart to recover. Potential mitigations: reduce `--mem-fraction-static`, reduce input length, or modify KV extraction to stream layers instead of stacking.
+
 ### (Latent) No native timeout on `link.pull()`
 `link.pull()` has no timeout parameter. If the prefill crashes after bootstrap publish but before `await_pull`, the pull blocks forever. The reaper flips a state flag but cannot interrupt the native C call.
 
 ### (Latent) Link caching with no reconnection
 `wrapper.py` caches one link per `remote_addr`. If a link becomes stale (prefill restarts, network partition), all subsequent pulls to that address hang.
+
+---
+
+## Quick Smoke Test
+
+After all servers and the router are healthy, verify with a simple request:
+
+```bash
+curl -s http://localhost:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "What is 2+2?", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
+```
+
+Expected: JSON response with `"text": "2 + 2 = 4"` (or similar), `finish_reason.type: "stop"`, and non-zero `completion_tokens`. First request includes XLA compilation and may take ~26s.
+
+---
+
+## Verification History
+
+### dp_size=2 symmetric on v6e-32 (2026-08-12)
+
+| Property | Value |
+|----------|-------|
+| Branch | `mimo-tpu7-stage3` (commit 71658835) |
+| Prefill VM | jingnw-node (v6e-32, asia-northeast1-b) |
+| Decode VM | jingnw-node2 (v6e-32, asia-northeast1-b) |
+| Mesh | `(2, 16)` — dp_size=2, attention_tp_size=16 |
+| Test | `curl` "What is 2+2?" → router (port 30000) |
+| Result | **PASS** — correct output "2 + 2 = 4", 8 completion tokens, stop finish |
+| E2E latency | 26.2s (first request, includes XLA compilation) |
+| Note | `bench_serving` with 16384-token inputs at concurrency ≥4 triggers E0100 OOM in KV extraction (see Known Issues). Short requests work correctly. |

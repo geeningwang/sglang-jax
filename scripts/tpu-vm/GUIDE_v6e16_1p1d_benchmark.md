@@ -462,3 +462,30 @@ a 2× improvement in throughput-per-chip.
 TTFT/ITL metrics require `--pd-separated` mode for meaningful comparison.
 
 NonPD baseline results: [GUIDE_v6e16_nonpd_benchmark.md](GUIDE_v6e16_nonpd_benchmark.md#4-benchmark-results)
+
+---
+
+## 5. Adapting for v6e-32 with dp_size=2
+
+This guide targets v6e-16 with dp_size=1 (mesh `(1, 16)`). For v6e-32 with dp_size=2, the following changes apply:
+
+| Parameter | v6e-16 (this guide) | v6e-32 dp_size=2 |
+|---|---|---|
+| `--tp-size` | 16 | 32 |
+| `--dp-size` | 1 | 2 |
+| `--ep-size` | 16 | 32 |
+| `--nnodes` | 4 | 8 |
+| Mesh shape | `(1, 16)` | `(2, 16)` |
+| `attention_tp_size` | 16 | 16 |
+| Workers per VM | 4 | 8 |
+| JAX devices per VM | 16 | 32 |
+
+Server launch commands and the router command are the same; only the flags above change. See [DOC_pd_environment.md](DOC_pd_environment.md) for the full v6e-32 server launch commands.
+
+### Known limitation: E0100 OOM with long inputs
+
+With `--mem-fraction-static 0.84` and dp_size=2 on v6e-32, `bench_serving` with `--random-input-len 16384` triggers `E0100: RuntimeBufferAllocationFailure` during KV extraction (`jnp.stack(layer_kvs)` in `_extract_req_kv`). The allocation requires ~768MB per request but only ~389MB is free. Short requests (e.g. "What is 2+2?") work correctly. See [DOC_pd_environment.md](DOC_pd_environment.md#e0100-oom-during-kv-extraction-with-large-inputs-dp_size2) for details.
+
+### Verified (2026-08-12)
+
+Simple request test passed on v6e-32 dp_size=2 (branch `mimo-tpu7-stage3`, commit 71658835). Output: "2 + 2 = 4", correct stop finish, 26.2s E2E latency (first request with XLA compilation).

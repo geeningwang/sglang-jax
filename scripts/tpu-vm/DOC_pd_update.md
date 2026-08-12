@@ -55,7 +55,7 @@
 - Raiden decode path (decode.py:833-834)
 - `_swa_page_ids_for_chunk` (prefill.py:577-578)
 
-**Status:** Tested with dp_size=1 in both 1P1D and 1P2D configurations — correct output confirmed. NOT runtime-tested with dp_size>1 (would require v6e-32 with tp=16, dp=2 = 32 devices).
+**Status:** Tested with dp_size=1 in both 1P1D and 1P2D configurations — correct output confirmed. Runtime-verified with dp_size=2 on v6e-32 (8 hosts, mesh (2,16), 32 devices per VM) — correct output on 2026-08-12.
 
 **Analysis:** See [DOC_swakvpool_disagg_fix.md](DOC_swakvpool_disagg_fix.md) Change 6 for the before/after code diff.
 
@@ -82,3 +82,5 @@
 ---
 
 Issues 1 and 4 (SWAKVPool) affect any setup using MiMo-V2-Flash with PD disaggregation — the upstream likely already had the gap 1 fix in their remote commit `c6105f1`; ours was porting it to this branch. Issues 2 and 3 are specific to **multi-process-per-pod** setups (v6e-16 with 4 JAX processes per pod) where workers must coordinate via `process_allgather` in `synced_terminal_rooms`. Issues 5 and 6 are specific to **dp_size>1** configurations where the mesh shape differs from the simple `(1, ndevices)` layout. The upstream benchmarks used v7x 2x2x2 (single JAX process per pod, dp_size=1), so neither multi-host coordination nor dp_size>1 code paths were exercised.
+
+All six issues have been verified end-to-end on v6e-32 with dp_size=2 (mesh (2,16), 8 hosts per VM, 32 devices per VM) as of 2026-08-12. Short-input requests produce correct output through the full 1P1D disaggregated pipeline. Note: long-input requests (16K+ tokens) can trigger E0100 OOM during KV extraction due to the `jnp.stack(layer_kvs)` allocation — see [DOC_pd_environment.md](DOC_pd_environment.md#e0100-oom-during-kv-extraction-with-large-inputs-dp_size2).
