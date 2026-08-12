@@ -69,6 +69,24 @@ gsutil cp gs://jingnw-mimo-v2-flash-us-central1/staging/patch.tar.gz /tmp/patch.
 tar xzf /tmp/patch.tar.gz --overwrite -C /tmp/sglang-jax/python
 ```
 
+### Offline provisioning (jingnw-node3 pattern)
+
+When provisioning a new offline VM from scratch using GCS-staged artifacts:
+
+1. Install Miniconda from GCS-staged installer
+2. Install sglang-jax editable from GCS-staged repo tarball (`--no-deps`)
+3. Install JAX/jaxlib/numpy from GCS-staged pip wheels (`--no-index --find-links`)
+4. Install pathwaysutils from GCS-staged source (see below)
+5. Copy missing Python packages from a working node via GCS tarballs:
+   - `soundfile` (including `_soundfile.py`, `_soundfile_data/` with `libsndfile_x86_64.so`)
+   - `pybase64` (no cp312 wheel in pip-wheels; copy installed package from working node)
+   - Correct versions of `transformers`, `huggingface_hub`, `safetensors`, `flax`
+   - Other packages: `orjson`, `markupsafe`, `uvicorn`
+6. Mount NFS model weights
+7. Install nfs-common from GCS-staged debs (`nfs-debs.tar.gz`)
+
+GCS staging bucket: `gs://jingnw-mimo-v2-flash-us-central1/staging/`
+
 ### Installing pathwaysutils (offline VMs)
 
 `pathwaysutils` is not pre-installed on standard TPU VMs but is required by `scheduler.py` (top-level import). Since these VMs have no internet, install from a GCS-staged copy of the source:
@@ -136,9 +154,13 @@ WORKER_ID=$(curl -s -H "Metadata-Flavor: Google" \
 
 When launching via `gcloud compute tpus tpu-vm ssh`, use `nohup ... </dev/null >/tmp/<log> 2>&1 &` to fully detach from SSH.
 
-### Mesh configuration (dp_size=2)
+### Mesh configuration
 
-With `--tp-size 32 --dp-size 2 --ep-size 32`, the mesh is `(2, 16)` with axes `("data", "tensor")`. Each DP rank spans 16 devices (4 hosts). `attention_tp_size = tp_size // dp_size = 16`.
+With `--dp-size 1`: mesh is `(1, 32)`, `attention_tp_size = 32`. All 32 devices form a single DP rank.
+
+With `--dp-size 2`: mesh is `(2, 16)` with axes `("data", "tensor")`. Each DP rank spans 16 devices (4 hosts). `attention_tp_size = tp_size // dp_size = 16`.
+
+**Current configuration:** dp_size=1 (see dp_rank=1 garbled output issue under Known Issues for why dp_size=2 is not used).
 
 ### Bootstrap (jingnw-node w0 only)
 
@@ -155,14 +177,14 @@ Must start **after** bootstrap is healthy (`curl http://localhost:8998/list_pref
 ```bash
 nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
-  --enable-sequence-parallel --tp-size 32 --dp-size 2 --ep-size 32 \
+  --enable-sequence-parallel --tp-size 32 --dp-size 1 --ep-size 32 \
   --moe-backend fused_v2 --nnodes 8 --node-rank $WORKER_ID \
   --dist-init-addr <jingnw-node-w0-ip>:8088 --host 0.0.0.0 --port 10000 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
   --skip-server-warmup --log-level info --decode-log-interval 1 \
-  --max-running-requests 256 --dp-schedule-policy round_robin \
+  --max-running-requests 256 \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
   --disaggregation-mode prefill \
@@ -170,19 +192,23 @@ nohup python3.12 -m sgl_jax.launch_server \
   </dev/null >/tmp/prefill_server.log 2>&1 &
 ```
 
-### Decode (jingnw-node2, all 8 workers)
+For dp_size=2, add `--dp-size 2` (instead of 1) and `--dp-schedule-policy round_robin`.
+
+### Decode (each decode cluster, all 8 workers)
+
+Same command for each decode cluster — only `--dist-init-addr` changes (must point to that cluster's own w0 IP).
 
 ```bash
 nohup python3.12 -m sgl_jax.launch_server \
   --model-path /tmp/flash-model --trust-remote-code \
-  --enable-sequence-parallel --tp-size 32 --dp-size 2 --ep-size 32 \
+  --enable-sequence-parallel --tp-size 32 --dp-size 1 --ep-size 32 \
   --moe-backend fused_v2 --nnodes 8 --node-rank $WORKER_ID \
-  --dist-init-addr <jingnw-node2-w0-ip>:8088 --host 0.0.0.0 --port 10001 \
+  --dist-init-addr <this-cluster-w0-ip>:8088 --host 0.0.0.0 --port 10001 \
   --page-size 256 --context-length 262144 --disable-radix-cache \
   --chunked-prefill-size 2048 --max-prefill-tokens 16384 \
   --dtype bfloat16 --mem-fraction-static 0.84 --swa-full-tokens-ratio 0.2 \
   --skip-server-warmup --log-level info --decode-log-interval 1 \
-  --max-running-requests 256 --dp-schedule-policy round_robin \
+  --max-running-requests 256 \
   --precompile-bs-paddings 1 4 8 16 32 64 128 256 \
   --precompile-token-paddings 4096 \
   --disaggregation-mode decode \
@@ -190,10 +216,13 @@ nohup python3.12 -m sgl_jax.launch_server \
   </dev/null >/tmp/decode_server.log 2>&1 &
 ```
 
+For dp_size=2, add `--dp-size 2` (instead of 1) and `--dp-schedule-policy round_robin`.
+
 **Note:** `--disable-overlap-schedule` is no longer needed. The SPMD race in the overlap decode event loop was fixed in commit 3c301255.
 
 ### Router (jingnw-node w0 only)
 
+For 1P1D (1 decode cluster):
 ```bash
 nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   --pd-disaggregation --mini-lb \
@@ -202,6 +231,19 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
   --host 0.0.0.0 --port 30000 \
   </dev/null >/tmp/router.log 2>&1 &
 ```
+
+For 1P2D (2 decode clusters):
+```bash
+nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
+  --pd-disaggregation --mini-lb \
+  --prefill http://<jingnw-node-w0-ip>:10000 8998 \
+  --decode http://<jingnw-node2-w0-ip>:10001 \
+  --decode http://<jingnw-node3-w0-ip>:10001 \
+  --host 0.0.0.0 --port 30000 \
+  </dev/null >/tmp/router.log 2>&1 &
+```
+
+The `--decode` flag supports `action="append"` — add one `--decode` per decode cluster.
 
 ---
 
@@ -216,6 +258,8 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
 | JAX coordinator (prefill)  | 8088 | jingnw-node w0 |
 | JAX coordinator (decode)   | 8088 | jingnw-node2 w0 |
 
+For 1P2D, add additional decode clusters on port 10001 with their own JAX coordinator on 8088.
+
 ---
 
 ## Startup Order
@@ -224,6 +268,8 @@ nohup python3.12 -u -m sgl_jax.srt.disaggregation.launch_router \
 2. **Prefill** on all 8 jingnw-node workers simultaneously — registers with bootstrap
 3. **Decode** on all 8 jingnw-node2 workers simultaneously — registers with bootstrap, queries prefill peers
 4. **Router** on jingnw-node w0 — waits for prefill and decode servers to be healthy
+
+For 1P2D, additional decode clusters can start in parallel with decode #1 (step 3).
 
 ---
 
@@ -273,6 +319,9 @@ JAX assigns `process_index` independently per cluster. GCE worker 0 is NOT neces
 ### E0100 OOM during KV extraction with large inputs (dp_size=2)
 With `--mem-fraction-static 0.84` and `dp_size=2` on v6e-32, KV extraction in `_extract_req_kv` (prefill.py) can hit `E0100: RuntimeBufferAllocationFailure` when processing long-input requests (e.g. 16384 tokens). The `jnp.stack(layer_kvs)` call attempts to allocate ~768MB per request but only ~389MB remains free. Single short requests (e.g. "What is 2+2?") work fine. The OOM triggers at high concurrency or with long inputs. Once OOM errors occur, the prefill server may stop processing new requests — requires a full server restart to recover. Potential mitigations: reduce `--mem-fraction-static`, reduce input length, or modify KV extraction to stream layers instead of stacking.
 
+### dp_rank=1 produces garbled output (dp_size=2)
+With `--dp-size 2` on v6e-32, requests routed to dp_rank=0 produce correct output, but requests routed to dp_rank=1 consistently produce garbled/nonsensical text (e.g. "\\OptionsResolver- Data-Integrity: 1.0.0.0" for "What is 2+2?"). The issue is reproducible across both 1P1D and 1P2D configurations and across different decode clusters (code verified identical via md5sum). The root cause is not yet identified — could be in prefill dp_rank=1 computation, KV transfer for dp_rank=1, or decode dp_rank=1 processing. With `--dp-schedule-policy round_robin`, approximately half of requests hit dp_rank=1 and produce wrong output.
+
 ### (Latent) No native timeout on `link.pull()`
 `link.pull()` has no timeout parameter. If the prefill crashes after bootstrap publish but before `await_pull`, the pull blocks forever. The reaper flips a state flag but cannot interrupt the native C call.
 
@@ -291,13 +340,40 @@ curl -s http://localhost:30000/generate \
   -d '{"text": "What is 2+2?", "sampling_params": {"max_new_tokens": 64, "temperature": 0}}'
 ```
 
-Expected: JSON response with `"text": "2 + 2 = 4"` (or similar), `finish_reason.type: "stop"`, and non-zero `completion_tokens`. First request includes XLA compilation and may take ~26s.
+Expected: JSON response with `"text": "2 + 2 = 4"` (or similar), `finish_reason.type: "stop"`, and non-zero `completion_tokens`. First request includes XLA compilation and may take ~25s.
 
 ---
 
 ## Verification History
 
-### dp_size=2 symmetric on v6e-32 (2026-08-12)
+### 1P1D dp_size=1 on v6e-32 (2026-08-12)
+
+| Property | Value |
+|----------|-------|
+| Branch | `mimo-tpu7-stage3` (commit 71658835) |
+| Prefill VM | jingnw-node (v6e-32, asia-northeast1-b) |
+| Decode VM | jingnw-node2 (v6e-32, asia-northeast1-b) |
+| Mesh | `(1, 32)` — dp_size=1, attention_tp_size=32 |
+| Test | `curl` "What is 2+2?" + "What is the capital of France?" × 4 → router (port 30000) |
+| Result | **PASS** — all requests correct: "2 + 2 = 4", "The capital of France is **Paris**." |
+| E2E latency | 25.1s (first request, includes XLA compilation); sub-second warm |
+| Note | No dp_rank issue — dp_size=1 has only dp_rank=0. All requests consistent. |
+
+### 1P2D dp_size=2 on v6e-32 (2026-08-12)
+
+| Property | Value |
+|----------|-------|
+| Branch | `mimo-tpu7-stage3` (commit 71658835) |
+| Prefill VM | jingnw-node (v6e-32, asia-northeast1-b) |
+| Decode #1 VM | jingnw-node2 (v6e-32, asia-northeast1-b) |
+| Decode #2 VM | jingnw-node3 (v6e-32, asia-northeast1-b) |
+| Mesh | `(2, 16)` — dp_size=2, attention_tp_size=16 |
+| Test | `curl` "What is 2+2?" × 4 → router (port 30000) |
+| Result | **PARTIAL** — dp_rank=0 requests: correct output "2 + 2 = 4". dp_rank=1 requests: garbled output (see Known Issues). |
+| E2E latency | 26.7s (first request, includes XLA compilation); ~0.3s warm (dp_rank=0) |
+| Note | dp_rank=1 garbled output is a pre-existing issue also present in 1P1D — not caused by 1P2D routing. Code is identical across all 3 clusters (md5sum verified). |
+
+### 1P1D dp_size=2 symmetric on v6e-32 (2026-08-12)
 
 | Property | Value |
 |----------|-------|
@@ -308,4 +384,4 @@ Expected: JSON response with `"text": "2 + 2 = 4"` (or similar), `finish_reason.
 | Test | `curl` "What is 2+2?" → router (port 30000) |
 | Result | **PASS** — correct output "2 + 2 = 4", 8 completion tokens, stop finish |
 | E2E latency | 26.2s (first request, includes XLA compilation) |
-| Note | `bench_serving` with 16384-token inputs at concurrency ≥4 triggers E0100 OOM in KV extraction (see Known Issues). Short requests work correctly. |
+| Note | `bench_serving` with 16384-token inputs at concurrency ≥4 triggers E0100 OOM in KV extraction (see Known Issues). Short requests work correctly. Only dp_rank=0 tested; dp_rank=1 garbled output discovered later in 1P2D testing. |
